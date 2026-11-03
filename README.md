@@ -103,11 +103,12 @@ fig, heat = vc.clustermap(df, palette = 'aura', title = 'Glycan abundance by tis
 
 | | |
 |---|---|
-| **Plots** | `plot`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `stem`, `hlines`, `arrow`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, and `vc.clustermap` |
-| **Markers** | `o`, `s`, `D`, `^`, `v`, `X`, `P`, and `*`, all with the palette's effects |
+| **Plots** | `plot`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `stem`, `hlines`, `vlines`, `arrow`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, `axvspan`, `image`, and `vc.clustermap` |
+| **Markers** | `o`, `s`, `D`, `^`, `v`, `>`, `<`, `X`, `P`, and `*`, all with the palette's effects |
 | **Annotation** | `text`, `annotate`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text |
 | **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, and the page grows for anything that needs it |
-| **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG |
+| **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window |
+| **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, for placing things yourself or answering a mouse |
 | **Display** | `fig.show()` works inline in Jupyter and slate, and in the system's image viewer from a terminal, with CI and coding agents kept silent |
 | **SVG hooks** | `gid` on `arrow` and `scatter` names elements for hover text and scripting |
 | **State** | None hidden: a figure is an object, with no current figure and nothing to close |

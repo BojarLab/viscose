@@ -220,8 +220,10 @@ palettes = {p.name: p for p in (LUMEN, COUTURE, POSTER, AURA)}
 _default = ['lumen', False]
 
 
-def get_palette(name = None):
-    """A palette by name or instance; None gives the current default."""
+def get_palette(name = None, default = None):
+    """A palette by name or instance; None gives the current default. A library with a palette of its own passes it as
+    `default`, which gives way only to a palette chosen with set_palette, not to another library's default_palette."""
+    name = default if name is None and not _default[1] else name
     if isinstance(name, Palette):
         return name
     key = _default[0] if name is None else name

@@ -215,6 +215,138 @@ def test_nans_are_skipped():
     assert fig.to_png(72)[:4] == b'\x89PNG' and fig2.to_png(72)[:4] == b'\x89PNG'
 
 
+def test_vlines_span_and_image_land_where_the_data_says():
+    fig = vc.Figure(4, 3, 'poster')
+    ax = fig.add_axes([0.2, 0.2, 0.7, 0.7])
+    ax.vlines([1.0, 3.0], 0.0, [2.0, 4.0], color = ['#FF0000', '#0000FF'], lw = 2.0)
+    ax.axvspan(1.5, 2.5, color = '#00FF00', alpha = 1.0)
+    # A black square of 20 points, one row of it white, so that its orientation shows
+    square = np.zeros((10, 10, 4), np.uint8)
+    square[..., 3] = 255
+    square[0] = 255
+    ax.image(square, 3.5, 2.0, 20.0, 20.0)
+    ax.set_xlim(0, 4)
+    ax.set_ylim(0, 4)
+    fig.layout()
+    px = fig.to_rgba(72.0)
+    assert px.shape == (216, 288, 4) and (px[..., 3] == 255).all()
+    at = lambda x, y: tuple(px[int(216 - ax.page(x, y)[1]), int(ax.page(x, y)[0]), :3])
+    assert at(1.0, 1.0)[0] > 200 and at(1.0, 1.0)[2] < 50 and at(3.0, 3.0)[2] > 200 and at(1.0, 3.0) == (255, 255, 255)
+    assert at(2.0, 2.0)[1] > 200 and at(2.0, 2.0)[0] < 50
+    cx, cy = ax.page(3.5, 2.0)
+    assert tuple(px[int(216 - cy), int(cx), :3]) == (0, 0, 0)
+    assert tuple(px[int(216 - cy - 9), int(cx), :3]) == (255, 255, 255)
+    # All formats take them, also an image without alpha
+    ax.image(np.zeros((4, 4, 3), np.uint8), 0.5, 0.5, 8.0, 8.0)
+    assert fig.to_pdf().startswith(b'%PDF') and '<image' in fig.to_svg()
+
+
+def test_display_list_is_the_page_without_its_shadow():
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'aura')
+    ax.plot([0.0, 1.0], [0.0, 1.0], label = 'a line')
+    ops = fig.display_list()
+    assert ops and all('kind' in op and 'ctm' in op for op in ops) and not any(op['kind'] == 'image' for op in ops)
+    assert any(op['kind'] == 'text' for op in ops) and any(op['kind'] == 'path' and op['stroke'] for op in ops)
+    # Without a layout of its own it keeps what the last one settled
+    ax.set_xlim(0.0, 0.5)
+    assert fig.display_list(layout = False)
+    assert ax.xlim != (0.0, 0.5) and fig.layout() and ax.xlim == (0.0, 0.5)
+
+
+def test_page_and_data_are_each_others_reverse():
+    for scale in ('linear', 'log'):
+        fig, ax = vc.subplots(figsize = (5, 4), palette = 'poster')
+        ax.plot([1.0, 100.0], [1.0, 100.0]).set_xscale(scale).set_yscale(scale)
+        fig.layout()
+        assert np.allclose(ax.data(*ax.page(np.array([2.0, 50.0]), np.array([3.0, 40.0]))), ([2.0, 50.0], [3.0, 40.0]))
+
+
+def test_what_leaves_the_axes_goes_with_its_position():
+    fig = vc.Figure(4, 3, 'poster')
+    ax = fig.add_axes([0.2, 0.2, 0.7, 0.4])
+    ax.plot([1.0, 1.0], [1.1, 1.3], color = '#FF0000', lw = 3.0, clip = False, y_fraction = True)
+    ax.annotate('peak', (3.0, 2.0), clip = True)
+    ax.image(np.zeros((4, 4, 4), np.uint8) + 255, 3.0, 1.2, 10.0, 10.0, y_fraction = True)
+    ax.set_xlim(0, 4)
+    ax.set_ylim(0, 4)
+    ops = fig._canvas().ops
+    assert sum(op['kind'] == 'image' for op in ops) == 1
+    assert any(op['kind'] == 'text' and 'peak' in op['text'] for op in ops)
+    # Above the axes while in view
+    px = fig.to_rgba(72.0)
+    cx, cy = ax.page(1.0, 0.0)
+    above = px[int(216 - ax.rect[1] - 1.2 * ax.rect[3]), int(cx)]
+    assert above[0] > 200 > above[1]
+    ax.set_xlim(1.5, 2.5)
+    ops = fig._canvas().ops
+    assert not any(op['kind'] == 'image' for op in ops)
+    assert not any(op['kind'] == 'text' and 'peak' in op['text'] for op in ops)
+    assert not any(op['kind'] == 'path' and op['stroke'] and tuple(op['stroke_rgb']) == (1.0, 0.0, 0.0) for op in ops)
+
+
+def test_offset_moves_a_line_in_points():
+    fig = vc.Figure(4, 3, 'poster')
+    ax = fig.add_axes([0.2, 0.2, 0.7, 0.7])
+    ax.plot([2.0, 2.0], [2.0, 2.0], color = '#FF0000', lw = 3.0, offset = [(0.0, 0.0), (0.0, 30.0)])
+    ax.set_xlim(0, 4)
+    ax.set_ylim(0, 4)
+    px = fig.to_rgba(72.0)
+    cx, cy = ax.page(2.0, 2.0)
+    assert px[int(216 - cy - 15), int(cx), 1] < 100 and px[int(216 - cy - 40), int(cx), 1] > 200
+
+
+def test_ticks_set_by_hand_follow_narrowed_limits():
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'poster')
+    ax.plot([0.0, 100.0], [0.0, 100.0])
+    ax.set_yticks([0, 25, 50, 75, 100], ['a', 'b', 'c', 'd', 'e'])
+    ax.set_ylim(30, 80)
+    fig.layout()
+    assert ax.yticks == [50, 75] and ax.ylabels == ['c', 'd']
+
+
+def test_one_axis_keeps_one_notation():
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'poster')
+    ax.plot([0.0, 1.0], [0.0, 3e5])
+    fig.layout()
+    assert all('10^' in s or s == '0' for s in ax.ylabels)
+    assert fmt(80000.0) == '80000' and fmt(80000.0, True) == '8×10^{4}' and fmt(0.0, True) == '0'
+
+
+def test_colorbar_of_one_value_and_of_counts():
+    fig = vc.Figure(4, 3, 'poster')
+    ax = fig.add_axes([0.1, 0.2, 0.6, 0.7])
+    ax.scatter([1.0, 2.0], [1.0, 2.0], c = [2.0, 2.0])
+    ax.colorbar('Runs', integer = True)
+    assert fig.to_rgba(72.0).shape[2] == 4
+    fig = vc.Figure(4, 3, 'poster')
+    ax = fig.add_axes([0.1, 0.2, 0.6, 0.7])
+    ax.scatter([1.0, 2.0], [1.0, 2.0], c = [1.0, 2.0])
+    ax.colorbar('Runs', integer = True)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.layout()
+    assert [op['text'] for op in fig._canvas().ops if op['kind'] == 'text' and op['text'] != 'Runs'] == ['1', '2']
+
+
+def test_sideways_markers_and_a_library_palette():
+    fig = vc.Figure(4, 3, 'poster')
+    ax = fig.add_axes([0.1, 0.2, 0.8, 0.7])
+    ax.scatter([1.0], [1.0], marker = '>')
+    ax.scatter([2.0], [1.0], marker = '<')
+    assert fig.to_png(72.0).startswith(b'\x89PNG')
+    # A library's own palette wins over another library's default, and gives way to the user's choice
+    from viscose.palettes import _default
+    saved = list(_default)
+    try:
+        _default[:] = ['lumen', False]
+        vc.default_palette('aura')
+        assert vc.get_palette(None, 'poster').name == 'poster' and vc.get_palette('couture', 'poster').name == 'couture'
+        vc.set_palette('lumen')
+        assert vc.get_palette(None, 'poster').name == 'lumen'
+    finally:
+        _default[:] = saved
+
+
 def test_text_runs_and_measure():
     assert runs('log_{2} x') == [('log', 0.0, 1.0), ('2', -0.22, 0.7), (' x', 0.0, 1.0)]
     assert runs('10^{3}')[1] == ('3', 0.38, 0.7)

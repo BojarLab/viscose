@@ -162,6 +162,16 @@ class Figure:
     def _head(self):
         return 66.0 if self._title and self._subtitle else (46.0 if self._title else 10.0)
 
+    def set_size(self, width, height):
+        """A new size in inches, for a figure that follows a window."""
+        self._base = self.width, self.height = width * 72.0, height * 72.0
+        return self
+
+    def layout(self):
+        """Settle limits, ticks, and positions now, for placing things by `Axes.page`; saving does this by itself."""
+        self._layout()
+        return self
+
     def _layout(self):
         """Fit each axes into its grid cell, leaving exactly the room its labels need."""
         for ax in self.axes:
@@ -270,8 +280,7 @@ class Figure:
                   ctm = ((x1 - x0) / sc, 0.0, 0.0, (y1 - y0) / sc, x0 / sc, (h - y1) / sc))
         return op
 
-    def to_png(self, dpi = 300.0, background = 'white'):
-        """PNG bytes; background None keeps the page transparent."""
+    def _raster_canvas(self, dpi):
         self._layout()
         # The shadow and the page share nothing once laid out, and numpy and zlib release the GIL for most of their work
         with ThreadPoolExecutor(1) as pool:
@@ -280,7 +289,25 @@ class Figure:
             op = shadow.result()
         if op is not None:
             c.ops.insert(0, op)
-        return c.to_png(dpi / 72.0, dpi / 72.0, (1.0, 1.0, 1.0) if background == 'white' else background)
+        return c
+
+    def to_png(self, dpi = 300.0, background = 'white'):
+        """PNG bytes; background None keeps the page transparent."""
+        return self._raster_canvas(dpi).to_png(dpi / 72.0, dpi / 72.0,
+                                               (1.0, 1.0, 1.0) if background == 'white' else background)
+
+    def to_rgba(self, dpi = 144.0, background = 'white'):
+        """The page as an array of shape (rows, columns, 4) of 8-bit RGBA, first row at the top, for showing it in a
+        window without encoding a PNG; background None keeps the page transparent."""
+        page = raster.render(self._raster_canvas(dpi).ops, self.width, self.height, dpi / 72.0, dpi / 72.0,
+                             (1.0, 1.0, 1.0) if background == 'white' else background)
+        return page if page.shape[2] == 4 else np.dstack([page, np.full(page.shape[:2], 255, np.uint8)])
+
+    def display_list(self, layout = True):
+        """The page as glycorender's display list, each op in page points with its own state, for a window that paints
+        with a painter of its own, which is much faster at high resolution; a palette's soft shadow is not part of it.
+        layout = False takes the page as `layout` last settled it."""
+        return self._canvas(layout = layout).ops
 
     def to_pdf(self):
         """PDF bytes, with marks and text as vector; only a blurred shadow and very large heatmaps are images."""

@@ -17,7 +17,9 @@ MARKERS = {'o': None,
            'v': [(-1.05, .8), (0, -1.15), (1.05, .8)],
            'P': _CROSS,
            '*': [(math.sin(i * math.pi / 5) * (1.25 if i % 2 == 0 else .55),
-                  math.cos(i * math.pi / 5) * (1.25 if i % 2 == 0 else .55)) for i in range(10, 0, -1)]}
+                  math.cos(i * math.pi / 5) * (1.25 if i % 2 == 0 else .55)) for i in range(10, 0, -1)],
+           '>': [(-.8, -1.05), (1.15, 0), (-.8, 1.05)],
+           '<': [(.8, 1.05), (-1.15, 0), (.8, -1.05)]}
 # From this many discs on, a raster output stamps them instead of tracing each one's curves, this many at a time: a
 # smaller batch finds more of its pixels opaque already, a larger one costs less around them
 STAMP_MIN, STAMP_BATCH = 50, 100
