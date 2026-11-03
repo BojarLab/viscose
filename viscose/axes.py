@@ -43,6 +43,25 @@ def _check_cmap(cmap):
         raise ValueError(f"cmap has to be 'diverging' or 'sequential', got {cmap!r}: a palette brings these two scales")
 
 
+def _check_scale(scale):
+    """Any other name would quietly draw a linear axis."""
+    if scale not in ('linear', 'log'):
+        raise ValueError(f"An axis scale has to be 'linear' or 'log', got {scale!r}")
+
+
+def _check_limits(lo, hi):
+    """Limits as floats; a NaN or an infinity would otherwise only fail once the figure is saved."""
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise ValueError(f'Axis limits have to be finite, got {lo} and {hi}')
+    return float(lo), float(hi)
+
+
+def _check_lengths(x, y):
+    """Different lengths would otherwise only fail once the figure is saved."""
+    if x.shape != y.shape:
+        raise ValueError(f'x and y have to be of the same length, got {x.size} and {y.size} values')
+
+
 class Axes:
     def __init__(self, figure, pal):
         self.figure, self.pal = figure, pal
@@ -96,6 +115,7 @@ class Axes:
         """A line, with markers at its points if `marker` is True or a marker name."""
         x, y = (np.arange(len(x)), x) if y is None else (x, y)
         x, y = self._pos(x, 'x'), self._pos(y, 'y')
+        _check_lengths(x, y)
         rgb = self._next_color(color)
         self._add('line', z, x = x, y = y, rgb = rgb, lw = lw, alpha = alpha, dash = dash)
         if marker:
@@ -114,6 +134,7 @@ class Axes:
         call
         `colorbar` to show it. `colors` and `markers` are lists or {value: name} dicts. `edge` is (color, width)."""
         x, y = self._pos(x, 'x'), self._pos(y, 'y')
+        _check_lengths(x, y)
         edge = None if edge is None else (self.pal.color(edge[0]), edge[1])
         if hue is not None and _numeric(hue) and len(np.unique(hue)) > 8:
             c, hue = hue, None
@@ -295,6 +316,8 @@ class Axes:
         labels are thinned unless show_all, which can also be a pair for the x and y axes."""
         _check_cmap(cmap)
         m = np.asarray(data, dtype = float)
+        if not m.size:
+            raise ValueError('A heatmap needs at least one cell')
         self.show_all = show_all if isinstance(show_all, tuple) else (show_all, show_all)
         if cmap == 'diverging':
             d = np.nanmax(np.abs(m - center)) if vmin is None and vmax is None else max(
@@ -400,11 +423,11 @@ class Axes:
         return self
 
     def set_xlim(self, lo, hi):
-        self._xlim = (float(lo), float(hi))
+        self._xlim = _check_limits(lo, hi)
         return self
 
     def set_ylim(self, lo, hi):
-        self._ylim = (float(lo), float(hi))
+        self._ylim = _check_limits(lo, hi)
         return self
 
     def set_xticks(self, ticks, labels = None, rotation = 0.0):
@@ -419,10 +442,12 @@ class Axes:
         return self
 
     def set_xscale(self, s):
+        _check_scale(s)
         self._xscale = s
         return self
 
     def set_yscale(self, s):
+        _check_scale(s)
         self._yscale = s
         return self
 
@@ -510,18 +535,22 @@ class Axes:
                 a['_ha'], a['_dx'] = a['ha'], a['dx']
         for axis, fixed, scale, margin in (('x', self._xlim, self._xscale, self._xmargin),
                                            ('y', self._ylim, self._yscale, self._ymargin)):
-            if fixed is not None:
-                setattr(self, axis + 'lim', fixed)
-                continue
             lo, hi, sticky = self._extent(axis)
             if scale == 'log':
                 lo, hi = max(lo, 1e-12), max(hi, lo * 10)
                 span = 0.03 * math.log10(hi / lo)
-                setattr(self, axis + 'lim', (10 ** (math.log10(lo) - span), 10 ** (math.log10(hi) + span)))
-                continue
-            pad = (hi - lo) * margin if hi > lo else (abs(lo) * 0.1 or 1.0)
-            setattr(self, axis + 'lim', (lo if any(abs(lo - s) < 1e-12 for s in sticky) else lo - pad,
-                                         hi if any(abs(hi - s) < 1e-12 for s in sticky) else hi + pad))
+                lo, hi = 10 ** (math.log10(lo) - span), 10 ** (math.log10(hi) + span)
+            else:
+                pad = (hi - lo) * margin if hi > lo else (abs(lo) * 0.1 or 1.0)
+                # Bars of no height stick to both ends, and the axis still needs a range
+                lo, hi = (lo if any(abs(lo - s) < 1e-12 for s in sticky) else lo - pad,
+                          hi if hi > lo and any(abs(hi - s) < 1e-12 for s in sticky) else hi + pad)
+            if fixed is not None:
+                # A log axis has no zero or negative end, so such a limit stays automatic
+                lo, hi = [v if v > 0 or scale != 'log' else auto for v, auto in zip(fixed, (lo, hi))]
+                pad = abs(lo) * 0.1 or 1.0
+                lo, hi = (lo - pad, hi + pad) if lo == hi else (lo, hi)
+            setattr(self, axis + 'lim', (lo, hi))
         for axis, ticks, labels, inverted in (('x', self._xticks, self._xtl, self._xinv),
                                               ('y', self._yticks, self._ytl, self._yinv)):
             cats = self._cats[axis]
@@ -731,8 +760,9 @@ class Axes:
 
     def _d_line(self, c, a):
         mask = np.isfinite(a['x']) & np.isfinite(a['y'])
-        marks.line(c, self.pal, self._tx(a['x'][mask]), self._ty(a['y'][mask]), a['rgb'], a['lw'], a['alpha'],
-                   a['dash'])
+        if mask.any():
+            marks.line(c, self.pal, self._tx(a['x'][mask]), self._ty(a['y'][mask]), a['rgb'], a['lw'], a['alpha'],
+                       a['dash'])
 
     def _d_points(self, c, a):
         mask = np.isfinite(a['x']) & np.isfinite(a['y'])

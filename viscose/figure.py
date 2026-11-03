@@ -334,7 +334,7 @@ class Figure:
 
 
 def subplots(nrows = 1, ncols = 1, figsize = (8.0, 8.0), palette = None, width_ratios = None, height_ratios = None):
-    """A figure and its axes, as in matplotlib: one Axes, a list for a single row or column, or a nested list."""
+    """A figure and its axes, as in matplotlib: one Axes, a 1D array for a single row or column, or a 2D array."""
     fig = Figure(figsize[0], figsize[1], palette)
     fig._grid = (nrows, ncols, width_ratios or [1] * ncols, height_ratios or [1] * nrows)
     rows = []
@@ -349,9 +349,8 @@ def subplots(nrows = 1, ncols = 1, figsize = (8.0, 8.0), palette = None, width_r
         rows.append(row)
     if nrows == 1 and ncols == 1:
         return fig, rows[0][0]
-    if nrows == 1 or ncols == 1:
-        return fig, [ax for row in rows for ax in row]
-    return fig, rows
+    grid = np.array(rows, dtype = object)
+    return fig, grid.ravel() if nrows == 1 or ncols == 1 else grid
 
 
 def _given_labels(given, names, n):
@@ -373,7 +372,10 @@ def clustermap(data, xticklabels = None, yticklabels = None, method = 'average',
     and xticklabels and yticklabels can be True for all, False for none, or an integer for every n-th. Returns the
     figure and the heatmap's axes; the figure's row_order and col_order hold the data's rows and columns as drawn,
     first row at the top."""
-    from scipy.cluster.hierarchy import dendrogram, linkage
+    try:
+        from scipy.cluster.hierarchy import dendrogram, linkage
+    except ImportError as e:
+        raise ImportError('clustermap needs scipy: pip install "viscose[cluster]"') from e
     frame = hasattr(data, 'index') and hasattr(data, 'columns')
     m = np.asarray(data, dtype = float)
     x, x_step, x_all = _given_labels(xticklabels, list(data.columns) if frame else None, m.shape[1])

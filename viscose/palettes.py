@@ -44,7 +44,8 @@ CSS = {'aliceblue': '#F0F8FF', 'antiquewhite': '#FAEBD7', 'aqua': '#00FFFF', 'aq
 
 
 def _hex(c):
-    c = c.lstrip('#')
+    # The short form only counts with its #, so that a three-letter typo stays an unknown color
+    c = c[1] * 2 + c[2] * 2 + c[3] * 2 if len(c) == 4 and c[0] == '#' else c.lstrip('#')
     return tuple(int(c[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
 
 

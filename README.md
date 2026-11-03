@@ -6,8 +6,8 @@ Pick a palette. It brings its own colors, type, axes, and special effects.</p>
 <p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/hero.png" alt="Ridgeline plots in all four palettes, above an embedding, a clustermap, a volcano plot, and a line and bar figure" width="100%"></p>
 
 ```bash
-pip install viscose            # numpy and glycorender are all it needs
-pip install viscose[cluster]   # adds scipy for clustermaps
+pip install viscose              # numpy and glycorender are all it needs
+pip install "viscose[cluster]"   # adds scipy for clustermaps
 ```
 
 ## One word changes everything
@@ -119,7 +119,7 @@ matplotlib and seaborn, and its files can be far smaller. At 300 dpi, in Poster:
 
 | | matplotlib and seaborn | viscose |
 |---|---|---|
-| Dependencies | Nine extra packages, 42.5 MB | numpy and glycorender, with 0.06 MB of its own code |
+| Dependencies | Nine extra packages, 42.5 MB | numpy and glycorender, with 0.11 MB of its own code |
 | Clustermap, 300 x 100, PDF | 1.57 s, 587 kB | **0.02 s, 79 kB** |
 | Clustermap, 300 x 100, SVG | 1.40 s, 5,943 kB | **0.02 s, 182 kB** |
 | Clustermap, 26 x 16, PDF | 0.11 s, 22 kB | **0.01 s**, 26 kB |

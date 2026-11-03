@@ -862,6 +862,71 @@ def test_shadow_does_not_wrap_around_the_page():
     assert arr[:10].min() == 255
 
 
+@pytest.mark.parametrize('build', [lambda ax: ax.plot([], []), lambda ax: ax.hist([]),
+                                   lambda ax: ax.bar([1, 2], [0, 0]), lambda ax: ax.plot([1, np.nan], [np.nan, 1]),
+                                   lambda ax: ax.plot([1, 2]).set_xlim(5, 5), lambda ax: ax.plot([1, 2]).set_ylim(0, 0),
+                                   lambda ax: ax.plot([1, 10]).set_yscale('log').set_ylim(0, 10),
+                                   lambda ax: ax.plot([1, 10]).set_xscale('log').set_xlim(-1, 0)])
+def test_data_or_limits_without_a_range_still_draw(tmp_path, build):
+    for ext in ('png', 'pdf', 'svg'):
+        fig, ax = vc.subplots(figsize = (3, 2))
+        build(ax)
+        fig.save(tmp_path / f'a.{ext}', dpi = 50)
+        for lim in (ax.xlim, ax.ylim):
+            assert np.isfinite(lim).all() and lim[0] != lim[1]
+
+
+def test_bars_of_no_height_stand_on_the_axis():
+    fig, ax = vc.subplots()
+    ax.bar([1, 2], [0, 0])
+    fig._canvas()
+    assert ax.ylim == (0.0, 1.0)
+
+
+def test_log_limit_keeps_the_end_that_is_valid():
+    fig, ax = vc.subplots()
+    ax.plot([1, 10]).set_yscale('log').set_ylim(0, 100)
+    fig._canvas()
+    assert 0 < ax.ylim[0] < 1 and ax.ylim[1] == 100
+
+
+def test_bad_input_fails_where_it_is_given():
+    _, ax = vc.subplots()
+    for call, message in ((lambda: ax.plot([1, 2, 3], [1, 2]), 'same length'),
+                          (lambda: ax.scatter([1, 2, 3], [1, 2]), 'same length'),
+                          (lambda: ax.set_xscale('symlog'), 'linear'), (lambda: ax.set_yscale('symlog'), 'linear'),
+                          (lambda: ax.set_xlim(np.nan, 1), 'finite'), (lambda: ax.set_ylim(0, np.inf), 'finite'),
+                          (lambda: ax.heatmap(np.zeros((0, 0))), 'one cell')):
+        with pytest.raises(ValueError, match = message):
+            call()
+
+
+def test_short_hex_colors():
+    pal = get_palette('aura')
+    assert pal.color('#abc') == pal.color('#AABBCC')
+    with pytest.raises(ValueError, match = 'Unknown color'):
+        pal.color('bad')
+
+
+def test_clustermap_says_how_to_get_scipy():
+    with patch.dict(sys.modules, {'scipy.cluster.hierarchy': None}):
+        with pytest.raises(ImportError, match = r'viscose\[cluster\]'):
+            vc.clustermap(np.eye(3))
+
+
+def test_subplots_returns_axes_as_matplotlib_does():
+    assert isinstance(vc.subplots()[1], vc.Axes)
+    for shape in ((1, 3), (3, 1)):
+        fig, line = vc.subplots(*shape)
+        assert line.shape == (3,) and list(line) == fig.axes and isinstance(line[2], vc.Axes)
+    fig, grid = vc.subplots(2, 3)
+    assert grid.shape == (2, 3) and grid[0, 1] is grid[0][1] is fig.axes[1]
+    assert list(grid.flat) == list(grid.ravel()) == fig.axes
+    _, (left, right) = vc.subplots(1, 2)
+    left.plot([1, 2])
+    right.plot([1, 2])
+
+
 def test_marker_forms_in_pdf():
     rng = np.random.default_rng(0)
     x, y = rng.normal(size = 500), rng.normal(size = 500)
