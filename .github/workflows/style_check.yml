@@ -1,0 +1,23 @@
+name: Coding Standard
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: pip install pycodestyle
+      - name: Check style
+        run: python .github/scripts/check_style.py viscose tests examples benchmarks .github/scripts

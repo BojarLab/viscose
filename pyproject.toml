@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "viscose"
+version = "0.1.0"
+description = "Scientific plots that are pieces of art: palettes with their own special effects, drawn without matplotlib"
+readme = "README.md"
+authors = [
+    {name = "Daniel Bojar", email = "daniel.bojar@gu.se"}
+]
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+keywords = ["plotting", "visualization", "figures", "palettes", "glycowork"]
+dependencies = ["numpy", "glycorender>=0.5.4"]
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+cluster = ["scipy"]
+dev = ["pytest", "scipy", "pandas"]
+
+[project.urls]
+"Homepage" = "https://github.com/BojarLab/viscose"
+"Bug Tracker" = "https://github.com/BojarLab/viscose/issues"
+
+[tool.setuptools]
+packages = ["viscose"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
