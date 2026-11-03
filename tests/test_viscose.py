@@ -1,12 +1,13 @@
 import re
 import sys
+import warnings
 from io import BytesIO
 from unittest.mock import patch
 import numpy as np
 import pytest
 import viscose as vc
 from viscose import marks
-from viscose.axes import fmt, nice_ticks
+from viscose.axes import fmt, nice_ticks, tick_labels
 from viscose.palettes import get_palette, ramp
 from viscose.text import runs, width
 from glycorender import pdfwrite, raster
@@ -347,6 +348,111 @@ def test_sideways_markers_and_a_library_palette():
         _default[:] = saved
 
 
+def test_boxplot_shows_quartiles_whiskers_and_fliers():
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'lumen')
+    ax.boxplot({'a': [1, 2, 3, 4, 5, 100], 'b': [2.0, np.nan, 2.0], 'c': []})
+    box = next(a for a in ax.artists if a['kind'] == 'box')
+    low, q1, median, q3, high, out = box['stats'][0]
+    assert (low, q1, median, q3, high) == (1, 2.25, 3.5, 4.75, 5) and list(out) == [100]
+    assert box['stats'][1][:5] == (2, 2, 2, 2, 2) and box['stats'][2] is None
+    fig.layout()
+    assert ax.xlabels == ['a', 'b', 'c'] and ax.get_ylim()[1] > 100
+    assert pixels(fig).shape
+
+
+def test_boxplot_without_fliers_leaves_them_out_of_the_limits():
+    fig, ax = vc.subplots(figsize = (5, 4))
+    ax.boxplot([[1, 2, 3, 4, 5, 100]], fliers = False)
+    assert ax.get_ylim()[1] < 10
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_boxplot_in_every_palette(name, tmp_path):
+    fig, ax = vc.subplots(figsize = (5, 4), palette = name)
+    ax.boxplot([[1, 2, 3, 4, 9], [2, 3, 4, 5, 6]], labels = ['a', 'b'], colors = ['a3', 'b1'])
+    for suffix in ('png', 'pdf', 'svg'):
+        assert fig.save(tmp_path / f'box.{suffix}').stat().st_size > 0
+
+
+def test_contour_lines_follow_their_level():
+    grid = np.linspace(-2, 2, 41)
+    xx, yy = np.meshgrid(grid, grid)
+    fig, ax = vc.subplots(figsize = (4, 4))
+    ax.contour(grid, grid, xx ** 2 + yy ** 2, levels = [1.0], color = 'a1')
+    lines = next(a for a in ax.artists if a['kind'] == 'contour')['lines']
+    assert len(lines) == 1
+    xs, ys = lines[0]
+    # A closed circle of radius one, walked in one go
+    assert (xs[0], ys[0]) == (xs[-1], ys[-1]) and len(xs) > 30
+    assert np.allclose(np.hypot(xs, ys), 1.0, atol = 0.01)
+    assert pixels(fig).shape
+
+
+def test_contour_levels_saddles_gaps_and_shape():
+    grid = np.linspace(-1, 1, 5)
+    xx, yy = np.meshgrid(grid, grid)
+    fig, ax = vc.subplots(figsize = (4, 4))
+    saddle = xx * yy + 0.01
+    saddle[0, 0] = np.nan
+    ax.contour(grid, grid, saddle, levels = 3)
+    ax.contour(grid, grid, np.ones_like(xx), levels = [5.0])
+    assert [len(a['lines']) > 0 for a in ax.artists if a['kind'] == 'contour'] == [True, False]
+    assert pixels(fig).shape
+    with pytest.raises(ValueError, match = 'one row per y'):
+        ax.contour(grid, grid[:-1], xx)
+
+
+def test_heatmap_annotations_read_over_their_cells():
+    fig, ax = vc.subplots(figsize = (4, 4), palette = 'aura')
+    ax.heatmap([[1.0, 0.0], [np.nan, -0.5]], annot = True, fmt = '.1f', vmin = -1, vmax = 1)
+    written = {a['s']: a for a in ax.artists if a['kind'] == 'text'}
+    assert sorted(written) == ['-0.5', '0.0', '1.0']
+    assert written['1.0']['rgb'] == (1.0, 1.0, 1.0) and written['0.0']['rgb'] == ax.pal.color('ink')
+    assert (written['1.0']['x'], written['1.0']['y']) == (0.5, 1.5)
+    assert pixels(fig).shape
+
+
+def test_reversed_sequential_scale_starts_dark():
+    pal = get_palette('aura')
+    assert np.allclose(pal.sequential_r(0.0), pal.color('a0')) and np.allclose(pal.sequential_r(1.0), pal.color('a3'))
+    fig, ax = vc.subplots(figsize = (4, 4))
+    ax.heatmap([[0.0, 1.0]], cmap = 'sequential_r', colorbar = True)
+    assert pixels(fig).shape
+    with pytest.raises(ValueError, match = 'sequential_r'):
+        ax.heatmap([[0.0]], cmap = 'magma')
+
+
+def test_set_tick_size_and_labels_that_must_all_show_make_room():
+    labels = [f'atom {i}' for i in range(100)]
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.heatmap(np.eye(100), labels, labels, show_all = True, cmap = 'sequential').set_tick_size(6.0)
+    assert ax._tick_sizes() == (6.0, 6.0)
+    fig.layout()
+    assert len(ax.xticks) == len(ax.yticks) == 100
+    assert ax.rect[2] / 100 >= 6.0 and ax.rect[3] / 100 >= 6.0
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.heatmap(np.eye(100), labels, labels, cmap = 'sequential')
+    fig.layout()
+    assert len(ax.yticks) < 100 and (fig.width, fig.height) < (4 * 72.0 * 3 + 1, 3 * 72.0 * 3 + 1)
+
+
+def test_dendrogram_links_take_their_colors_and_keep_their_labels():
+    icoord, dcoord = [[5, 5, 15, 15], [25, 25, 35, 35], [10, 10, 30, 30]], [[0, 1, 1, 0], [0, 2, 2, 0], [1, 3, 3, 2]]
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.dendrogram(icoord, dcoord, n = 4, labels = list('abcd'), scale = True, colors = ['a1', 'b1', 'muted'],
+                  show_all = True)
+    lines = [op for op in fig.display_list() if op['kind'] == 'path' and op['stroke']]
+    drawn = {tuple(round(v, 3) for v in op['stroke_rgb']) for op in lines}
+    assert {tuple(round(v, 3) for v in ax.pal.color(k)) for k in ('a1', 'b1', 'muted')} <= drawn
+    assert ax.xlabels == list('abcd')
+
+
+def test_small_ticks_keep_one_notation():
+    assert tick_labels([0.0008, 0.001, 0.0012]) == ['8×10^{-4}', '10^{-3}', '1.2×10^{-3}']
+    assert tick_labels([0, 0.5, 1]) == ['0', '0.5', '1']
+    assert tick_labels([0, 0.0005]) == ['0', '5×10^{-4}']
+
+
 def test_text_runs_and_measure():
     assert runs('log_{2} x') == [('log', 0.0, 1.0), ('2', -0.22, 0.7), (' x', 0.0, 1.0)]
     assert runs('10^{3}')[1] == ('3', 0.38, 0.7)
@@ -414,7 +520,7 @@ def test_colliding_tick_labels_turn_and_then_thin():
     fig, ax = vc.subplots(figsize = (6, 4), palette = 'lumen')
     ax.bar([f'a long category {i}' for i in range(12)], range(12))
     fig._layout()
-    assert ax._xrot == 90.0 and len(ax.xlabels) == 12
+    assert ax.xrot == 90.0 and len(ax.xlabels) == 12
     fig, ax = vc.subplots(figsize = (6, 4), palette = 'poster')
     ax.heatmap(np.zeros((200, 4)), list('abcd'), [f'row{i}' for i in range(200)])
     fig._layout()
@@ -1073,3 +1179,438 @@ def test_varied_sizes_in_pdf_are_paths():
     fig, ax = vc.subplots(palette = 'poster')
     ax.scatter(np.arange(100.0), np.arange(100.0), s = np.arange(100.0) + 5.0)
     assert b'/Subtype /Form' not in fig.to_pdf()
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_scalars_and_missing_values_draw_in_every_format(name):
+    calls = [lambda ax: ax.bar(1, 2), lambda ax: ax.barh(1, 2), lambda ax: ax.stem(1, 2), lambda ax: ax.scatter(1, 2),
+             lambda ax: ax.fill_between([], [], []), lambda ax: ax.bar([0, 1, 2], [1, np.nan, 2]),
+             lambda ax: ax.barh([0, 1, 2], [1, np.inf, 2]), lambda ax: ax.fill_between([0, 1, 2, 3], [1, np.nan, 2, 3]),
+             lambda ax: ax.stem([0, 1, 2], [1, np.nan, 2]), lambda ax: ax.errorbar([0, 1, 2], [1, np.nan, 2], .1),
+             lambda ax: ax.hlines([0, np.nan], [0, 0], 1), lambda ax: ax.vlines([0, np.nan], [0, 0], 1),
+             lambda ax: ax.ridgeline(np.arange(4.0), [[0, 1, np.nan, 0], [0, 0, 0, 0]], ['a', 'b']),
+             lambda ax: ax.arrow(0, 0, np.nan, 1), lambda ax: ax.axhline(np.nan), lambda ax: ax.axvline(np.nan),
+             lambda ax: ax.axvspan(np.nan, 1), lambda ax: ax.axhspan(np.nan, 1), lambda ax: ax.text(np.nan, 1, 'a'),
+             lambda ax: ax.annotate('a', (1, np.nan)), lambda ax: ax.scatter([0, 1], [0, 1], c = [np.nan, np.nan]),
+             lambda ax: ax.contour(np.arange(3.0), np.arange(3.0), np.full((3, 3), np.nan)),
+             lambda ax: ax.heatmap(np.full((3, 3), np.nan), colorbar = True),
+             lambda ax: ax.boxplot([[0.0, 10.0]], whis = 0), lambda ax: ax.scatter([0, 1], [0, 1], s = -1.0)]
+    for call in calls:
+        fig, ax = vc.subplots(figsize = (3, 2), palette = name)
+        call(ax)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            assert fig.to_png(36.0)[:4] == b'\x89PNG' and fig.to_pdf()[:4] == b'%PDF' and '<svg' in fig.to_svg()
+
+
+def test_a_nan_breaks_a_line_and_a_band():
+    fig, ax = vc.subplots(palette = 'poster')
+    ax.plot([0, 1, 2, 3, 4, 5], [1, 2, np.nan, 3, 2, 1])
+    ax.fill_between([0, 1, 2, 3], [1, np.nan, 2, 3])
+    c = fig._canvas()
+    lines = [op for op in c.ops if op['kind'] == 'path' and op['stroke'] and op.get('mark')]
+    assert sum(len([s for s in op['path'] if s[0] == 'm']) for op in lines) == 2
+    bands = [op for op in c.ops if op['kind'] == 'path' and op['fill'] and op.get('mark')]
+    assert len(bands) == 1
+
+
+def test_ticks_on_tiny_and_crowded_ranges_stay_apart():
+    assert nice_ticks(1e-12, 5e-12)[:2] == pytest.approx([1e-12, 2e-12], rel = 1e-6)
+    assert nice_ticks(0, 0.3) == [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3]
+    labels = tick_labels([1234567.0, 1234568.0, 1234569.0])
+    assert len(set(labels)) == 3
+    assert fmt(999900.0) == '10^{6}' and fmt(-999900.0) == '-10^{6}'
+    assert len(set(tick_labels([1000.001, 1000.002]))) == 2
+    fig, ax = vc.subplots(figsize = (3, 2))
+    ax.plot([0, 1, 2], [1e-12, 3e-12, 5e-12])
+    ax.set_xticks([0.5, 0.5, 1.0], ['a', 'b', 'c'], 90)
+    ax.set_yticks([1e-12, 1e-12])
+    assert fig.to_png(36.0)[:4] == b'\x89PNG'
+
+
+def test_log_axes_leave_out_what_they_cannot_show():
+    fig, ax = vc.subplots()
+    ax.bar([0, 1, 2], [1, 10, 100])
+    ax.set_yscale('log')
+    ax._limits()
+    assert 0.5 < ax.ylim[0] < 1.0 and ax.yticks == [1.0, 10.0, 100.0]
+    fig, ax = vc.subplots()
+    ax.plot([0, 1, 2], [2, 3, 4])
+    ax.set_yscale('log')
+    ax._limits()
+    assert ax.ylim[1] < 5.0 and len(ax.yticks) >= 2
+    fig, ax = vc.subplots()
+    ax.plot([0, 1], [-1, -2])
+    ax.set_yscale('log')
+    ax._limits()
+    assert ax.ylim[0] < 1.0 and 10.0 < ax.ylim[1] < 20.0
+    # A bar's gradient runs from the bottom of the axes, not from far below the page
+    fig, ax = vc.subplots(palette = 'lumen')
+    ax.bar([0], [100])
+    ax.bar([1], [1])
+    ax.set_yscale('log')
+    ops = fig._canvas().ops
+    assert all(y > 0 for op in ops if op['kind'] == 'path' and op.get('mark') for s in op['path'] for y in s[2::2])
+
+
+def test_a_mapped_color_survives_style_and_size():
+    rng = np.random.default_rng(0)
+    x, y, z = rng.normal(size = 40), rng.normal(size = 40), rng.normal(size = 40)
+    fig, ax = vc.subplots(palette = 'poster')
+    ax.scatter(x, y, hue = z, size = rng.uniform(1, 9, 40))
+    assert len({a['rgb'] for a in ax.artists}) > 5 and sum(len(a['x']) for a in ax.artists) == 40
+    fig, ax = vc.subplots(palette = 'poster')
+    ax.scatter(x, y, c = z, style = ['a', 'b'] * 20, legend = False)
+    assert sum(len(a['x']) for a in ax.artists) == 40 and {a['marker'] for a in ax.artists} == {'o', 'X'}
+    assert ax._legend_opts is None
+
+
+def test_a_marker_holds_without_a_style():
+    fig, ax = vc.subplots()
+    ax.scatter([0, 1], [0, 1], hue = ['a', 'b'], marker = 's')
+    assert {a['marker'] for a in ax.artists} == {'s'}
+
+
+def test_hist_bars_take_the_width_of_their_bins():
+    fig, ax = vc.subplots()
+    ax.hist([0.5, 1.5, 3.0, 10.0], bins = [0, 1, 2, 5, 20])
+    assert ax.artists[0]['w'] == pytest.approx(np.array([1, 1, 3, 15]) * 0.94)
+    fig, ax = vc.subplots()
+    ax.bar([0, 1, 3], [1, 2, 3], width = [0.5, 1, 2])
+    assert fig.to_png(36.0)[:4] == b'\x89PNG'
+
+
+def test_needle_tops_stay_clear_of_neighbors():
+    def top_span(**kw):
+        fig, ax = vc.subplots(palette = 'couture')
+        ax.bar([0, 1, 2], [1, 2, 3], **kw)
+        tops = [op for op in fig._canvas().ops if op['kind'] == 'path' and op['stroke'] and op.get('mark')]
+        return (tops[1]['path'][1][1] - tops[1]['path'][0][1]) / float(ax._tx(1) - ax._tx(0))
+    assert top_span() == pytest.approx(0.25 * 2.4)
+    assert top_span(width = 1.0) == pytest.approx(1.0)
+
+
+def test_negative_bars_keep_their_base_at_zero():
+    fig, ax = vc.subplots(palette = 'lumen')
+    ax.bar([0], [-1.0])
+    ax.bar([1], [1.0])
+    down, up = [op['fill_grad'][1] for op in fig._canvas().ops if op.get('fill_grad') and op.get('mark')]
+    assert down[1] > down[3] and up[1] < up[3]
+
+
+@pytest.mark.parametrize('cells', [(3, 3), (60, 60)])
+def test_heatmap_follows_its_limits(cells):
+    m = np.arange(float(cells[0] * cells[1])).reshape(cells)
+    def drawn(change):
+        fig, ax = vc.subplots(figsize = (3, 3), palette = 'couture')
+        ax.heatmap(m, cmap = 'sequential')
+        change(ax)
+        ax.off()
+        return pixels(fig), fig, ax
+    plain, fig, ax = drawn(lambda ax: None)
+    flipped, fig, ax = drawn(lambda ax: ax.invert_yaxis())
+    x0, y0, w, h = ax.rect
+    upper, lower = int(fig.height - y0 - h * 0.75), int(fig.height - y0 - h * 0.25)
+    col = int(x0 + w / 2)
+    assert plain[upper, col].sum() > plain[lower, col].sum()
+    assert flipped[upper, col].sum() < flipped[lower, col].sum()
+
+
+def test_annotated_heatmap_shows_the_cells_in_view():
+    fig, ax = vc.subplots(figsize = (3, 3))
+    ax.heatmap(np.arange(9.0).reshape(3, 3), annot = True, fmt = '.0f')
+    ax.set_xlim(1, 2)
+    fig.layout()
+    assert len([a for a in ax.artists if a['kind'] == 'text' and a['clip']]) == 9
+    with patch('viscose.text.draw', wraps = vc.text.draw) as draw:
+        fig._canvas()
+    shown = [call.args[3] for call in draw.call_args_list]
+    assert '1' in shown and '4' in shown and '7' in shown and '0' not in shown and '8' not in shown
+
+
+def test_turned_labels_turn_back_when_there_is_room():
+    fig, ax = vc.subplots(figsize = (2, 2))
+    ax.bar(['a long category', 'another long one'], [1, 2])
+    fig.layout()
+    assert ax.xrot == 90.0 and ax._xrot == 0.0
+    fig.set_size(12, 2).layout()
+    assert ax.xrot == 0.0
+
+
+def test_saving_twice_gives_the_same_file():
+    for name in NAMES:
+        fig, ax = vc.subplots(figsize = (3, 2), palette = name)
+        ax.bar(['a long category', 'another long one', 'and a third'], [1, 2, 3], label = 'bars')
+        ax.annotate('a very long annotation at the edge', (2, 3))
+        ax.legend('below')
+        # Gradients take their ids from a counter across the process
+        first = re.sub(r'grad\d+', 'grad', fig.to_svg())
+        fig.to_png(36.0)
+        ax.get_xlim()
+        assert re.sub(r'grad\d+', 'grad', fig.to_svg()) == first
+
+
+def test_get_xlim_leaves_a_settled_page_alone():
+    fig, ax = vc.subplots(figsize = (2, 2))
+    ax.bar([str(i) * 6 for i in range(30)], np.arange(30.0))
+    fig.layout()
+    settled = list(ax.xticks)
+    ax.get_xlim()
+    assert ax.xticks == settled
+
+
+def test_room_on_the_right_is_shared_in_order():
+    rng = np.random.default_rng(0)
+    fig, ax = vc.subplots(figsize = (6, 4), palette = 'lumen')
+    ax.scatter(rng.normal(size = 30), rng.normal(size = 30), hue = rng.normal(size = 30), size = rng.uniform(1, 9, 30))
+    ax.colorbar('Score')
+    fig.layout()
+    x0, _, w, _ = ax.rect
+    with patch('viscose.marks.polygon', wraps = marks.polygon) as bar:
+        fig._canvas()
+    legend_right = x0 + w + 16.0 + ax._legend_grid()[1][0]
+    bars = [min(call.args[1]) for call in bar.call_args_list if len(call.args) > 5 and call.args[5] is not None]
+    assert max(bars) >= legend_right and max(bars) < fig.width
+
+
+def test_axis_names_clear_a_spine_without_tick_labels():
+    fig, ax = vc.subplots(figsize = (3, 2), palette = 'couture')
+    ax.plot([0, 1])
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    fig.layout()
+    with patch('viscose.text.draw', wraps = vc.text.draw) as draw:
+        fig._canvas()
+    spots = {call.args[3]: (call.args[1], call.args[2]) for call in draw.call_args_list}
+    x0, y0, _, _ = ax.rect
+    off = fig.pal.spine_offset
+    assert spots['X'][1] < y0 - off and spots['X'][1] > 8 and spots['Y'][0] < x0 - off and spots['Y'][0] > 6
+
+
+def test_several_lines_take_their_room():
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.plot([0, 1])
+    margins = ax._limits() or ax._margins()
+    ax.set_xlabel('one\ntwo')
+    ax.set_ylabel('one\ntwo')
+    ax.set_title('one\ntwo')
+    grown = ax._margins()
+    assert grown[0] > margins[0] and grown[2] > margins[2] and grown[3] > margins[3]
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.bar(['a\nb', 'c\nd'], [1, 2])
+    ax._limits()
+    assert ax._xtick_height() > 2 * ax._tick_sizes()[0]
+    # A block of lines sits where va says, as a whole
+    with patch('viscose.text.draw', wraps = vc.text.draw) as draw:
+        canvas = pdfwrite.Canvas(BytesIO(), pagesize = (100, 100))
+        vc.text.draw(canvas, 50, 50, 'a\nb\nc', 10, (0, 0, 0), va = 'center')
+    ys = [call.args[2] for call in draw.call_args_list if call.args[3] in 'abc']
+    assert ys[1] == pytest.approx(50) and ys[0] > 50 > ys[2]
+
+
+def test_long_axis_names_shrink_then_grow_the_page():
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.plot([0, 1])
+    ax.set_xlabel('A name that is a little too long for this small figure, as they can be')
+    fig.layout()
+    with patch('viscose.text.draw', wraps = vc.text.draw) as draw:
+        fig._canvas()
+    size = next(call.args[4] for call in draw.call_args_list if call.args[3].startswith('A name'))
+    assert size < fig.pal.label_size
+    assert width(ax.xlabel, size) <= fig.width
+    fig, ax = vc.subplots(figsize = (2, 2))
+    ax.plot([0, 1])
+    ax.set_ylabel('A name that would not fit this figure even at the smallest size that can be read')
+    fig.layout()
+    assert fig.height > 2 * 72.0
+
+
+def test_mistakes_fail_at_the_call_with_a_clear_message():
+    fig, ax = vc.subplots()
+    with pytest.raises(ValueError, match = 'marker'):
+        ax.scatter([0], [0], marker = 'x')
+    with pytest.raises(ValueError, match = 'marker'):
+        ax.plot([0, 1], marker = 'x')
+    with pytest.raises(ValueError, match = 'marker'):
+        ax.scatter([0], [0], style = ['a'], markers = ['x'])
+    with pytest.raises(ValueError, match = 'legend'):
+        ax.legend('center')
+    with pytest.raises(ValueError, match = 'colorbar'):
+        ax.colorbar(loc = 'left')
+    with pytest.raises(ValueError, match = 'one label each'):
+        ax.set_xticks([0, 1], ['a'])
+    with pytest.raises(ValueError, match = 'rows and columns'):
+        ax.heatmap([1.0, 2.0])
+    with pytest.raises(ValueError, match = 'one label each'):
+        ax.heatmap(np.eye(2), xticklabels = ['a'])
+    with pytest.raises(ValueError, match = 'same length'):
+        ax.stem([0, 1], [1])
+    with pytest.raises(ValueError, match = 'Unknown color'):
+        fig.pal.color('a9')
+    with pytest.raises(ValueError, match = 'bar'):
+        vc.Palette('typo', ['#000000'] * 4, ['#000000'] * 4, '#000000', '#000000', '#000000', bar = 'neddle')
+    with pytest.raises(ValueError, match = 'four shades'):
+        vc.Palette('short', ['#000000'] * 3, ['#000000'] * 4, '#000000', '#000000', '#000000')
+    fig, ax = vc.subplots()
+    ax.plot([0, 1])
+    ax.colorbar()
+    with pytest.raises(ValueError, match = 'color scale'):
+        fig.to_svg()
+
+
+def test_color_none_draws_nothing():
+    for name in NAMES:
+        fig, ax = vc.subplots(figsize = (3, 2), palette = name)
+        ax.bar([0, 1], [1, 2], color = ['a1', 'none'], label = 'kept')
+        ax.scatter([0, 1], [0, 1], color = 'none', label = 'gone')
+        ax.vlines([0, 1], 0, 1, color = ['none', 'a1'])
+        ax.legend()
+        assert fig.to_png(36.0)[:4] == b'\x89PNG' and [s[0] for s in ax.legend_items] == ['kept']
+
+
+def test_arrays_of_objects_are_numbers():
+    fig, ax = vc.subplots()
+    ax.plot(np.array([1, 2, 3], dtype = object), np.array([1.5, 2.5, 3.5], dtype = object))
+    ax._limits()
+    assert not ax._cats['x'] and not ax._cats['y'] and ax.artists[0]['x'].dtype == float
+
+
+def test_image_takes_gray_and_floats():
+    fig, ax = vc.subplots(figsize = (2, 2))
+    ax.plot([0, 1], [0, 1])
+    ax.image(np.array([[0.0, 1.0], [1.0, 0.0]]), 0.5, 0.5, 20, 20)
+    ax.image(np.array([[0, 255], [255, 0]], dtype = np.uint8), 0.5, 0.5, 20, 20)
+    assert ax.artists[-1]['rgb'] == ax.artists[-2]['rgb'] == bytes([0, 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 0])
+
+
+def test_asymmetric_errors_and_horizontal_spans():
+    fig, ax = vc.subplots()
+    ax.errorbar([0, 1], [1, 2], [[0.1, 0.2], [0.3, 0.4]])
+    ax.axhspan(5, 6, label = 'band')
+    ax._limits()
+    assert ax.artists[0]['lo'] == pytest.approx([0.9, 1.8]) and ax.artists[0]['hi'] == pytest.approx([1.3, 2.4])
+    assert ax.ylim[1] > 6.0 and ax.legend_items[0][0] == 'band'
+
+
+def test_clustermap_of_little_or_missing_data():
+    pytest.importorskip('scipy')
+    for shape in ((1, 4), (4, 1), (1, 1)):
+        fig, heat = vc.clustermap(np.arange(float(np.prod(shape))).reshape(shape), palette = 'couture')
+        assert fig.to_png(36.0)[:4] == b'\x89PNG'
+    gappy = np.eye(3)
+    gappy[0, 1] = np.nan
+    with pytest.raises(ValueError, match = 'finite'):
+        vc.clustermap(gappy)
+    fig, heat = vc.clustermap(gappy, row_cluster = False, col_cluster = False)
+    assert fig.to_png(36.0)[:4] == b'\x89PNG'
+
+
+def test_any_background_color():
+    fig, ax = vc.subplots(figsize = (1, 1))
+    assert fig.to_rgba(72.0, background = '#000000')[0, 0, :3].tolist() == [0, 0, 0]
+    assert fig.to_rgba(72.0, background = (1.0, 1.0, 1.0))[0, 0, :3].tolist() == [255, 255, 255]
+    assert fig.to_rgba(72.0, background = None)[0, 0, 3] == 0
+    assert fig.pal.groups(2, 0) == fig.pal.groups(2)
+
+
+def test_a_page_of_any_color():
+    dark = vc.Palette('night', ['#F7C6B8', '#EC5B3F', '#B53D25', '#7A2A1A'],
+                      ['#C2CFF7', '#3E63DD', '#2F4CB0', '#223576'], '#E8EAF0', '#8C92A3', '#5C6273', point = 'cut',
+                      ridge = 'deep', paper = '#171A21')
+    assert dark.css('paper') == '#171A21' and vc.palette('aura').css('paper') == '#FFFFFF'
+    assert dark.on('#FFFFFF') == 'black' and dark.on('#000000') == 'white' and vc.palette('aura').on('#FFFFFF') == 'ink'
+    assert np.allclose(dark.diverging(0.5), dark.color('paper'))
+    rng = np.random.default_rng(0)
+    fig, axes = vc.subplots(1, 3, figsize = (8, 3), palette = dark)
+    axes[0].scatter(rng.normal(size = 60), rng.normal(size = 60), s = 30, label = 'points')
+    axes[0].annotate('a name', (0.0, 0.0))
+    axes[0].legend('upper right')
+    axes[1].ridgeline(np.linspace(0, 1, 40), [np.sin(np.linspace(0, 3, 40))] * 3)
+    axes[2].heatmap(rng.normal(size = (4, 4)), annot = True)
+    px = fig.to_rgba(72.0)
+    assert px[0, 0, :3].tolist() == [0x17, 0x1A, 0x21]
+    # A white ring, ridge, or halo would be the brightest thing on such a page
+    assert not (px[..., :3] > 250).all(axis = 2).any()
+    assert fig.to_rgba(72.0, background = None)[0, 0, 3] == 0
+    assert fig.to_png(72.0)[:4] == b'\x89PNG'
+    assert 'fill="#171A21"' in fig.to_svg()
+    # The page's color lies under everything in a PDF, whose page is otherwise white
+    with patch.object(marks, 'polygon', wraps = marks.polygon) as drawn:
+        fig.to_pdf()
+    assert any(isinstance(c.args[1], list) and c.args[1] == [0.0, fig.width, fig.width, 0.0]
+               and c.args[3] == dark.color('paper') for c in drawn.call_args_list)
+    # A soft shadow over a dark page shows as a glow, and fails in no format
+    glow = vc.Palette('glow', dark.a, dark.b, dark.ink, dark.muted, dark.faint, shadow = 0.5, paper = dark.paper)
+    fig, ax = vc.subplots(figsize = (2, 2), palette = glow)
+    ax.bar([0, 1], [1, 2])
+    assert fig.to_png(72.0)[:4] == b'\x89PNG' and fig.to_pdf()[:4] == b'%PDF' and '<svg' in fig.to_svg()
+
+
+@pytest.mark.parametrize('n, dpi', [(10, 72.0), (200, 72.0), (200, None)])
+def test_hollow_rings(n, dpi):
+    rng = np.random.default_rng(0)
+    for name in NAMES:
+        fig, ax = vc.subplots(figsize = (2, 2), palette = name)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.scatter(rng.uniform(0.1, 0.9, n), rng.uniform(0.1, 0.9, n), s = 400 if n == 10 else 40, color = 'none',
+                   edge = ('#FF0000', 1.5), label = 'none in the legend')
+        ax.scatter([0.5], [0.5], s = 900, color = 'none', edge = ('#0000FF', 1.0), z = 9)
+        assert not ax.legend_items
+        px = fig.to_rgba(144.0 if dpi else 72.0)
+        r, g, b = (px[..., k].astype(int) for k in range(3))
+        assert ((r > 200) & (g < 80) & (b < 80)).any() and ((b > 200) & (g < 80) & (r < 80)).any()
+        assert fig.to_pdf()[:4] == b'%PDF' and '<svg' in fig.to_svg()
+    fig, ax = vc.subplots(figsize = (2, 2), palette = 'poster')
+    ax.scatter([0, 1], [0, 1], s = 900, color = 'none', edge = ('#0000FF', 1.0))
+    ax.set_xlim(-1, 2)
+    ax.set_ylim(-1, 2)
+    fig.layout()
+    x, y = ax.page(0.0, 0.0)
+    assert fig.to_rgba(72.0)[int(fig.height - y), int(x), :3].tolist() == [255, 255, 255]
+    # Color 'none' without an edge still draws nothing
+    fig, ax = vc.subplots(figsize = (2, 2), palette = 'poster')
+    ax.scatter([0, 1], [0, 1], s = 900, color = 'none')
+    assert (fig.to_rgba(72.0)[..., :3] > 200).mean() > 0.9
+
+
+@pytest.mark.parametrize('scale', [1e-4, 1.0, 1e6])
+def test_a_histogram_fills_its_axis_at_any_scale(scale):
+    rng = np.random.default_rng(0)
+    fig, ax = vc.subplots(figsize = (3, 3))
+    ax.hist(rng.uniform(0.0, 1.0, 500) * scale, bins = 20)
+    lo, hi = ax.get_xlim()
+    assert -0.1 * scale < lo < 0.0 and 1.0 * scale < hi < 1.1 * scale
+
+
+def test_script_characters_are_runs():
+    assert runs('log₂ CPM') == runs('log_{2} CPM') == [('log', 0.0, 1.0), ('2', -0.22, 0.7), (' CPM', 0.0, 1.0)]
+    assert runs('10⁻³') == [('10', 0.0, 1.0), ('-', 0.38, 0.7), ('3', 0.38, 0.7)]
+    assert width('log₂ CPM', 10.0) == width('log_{2} CPM', 10.0)
+    # Which the fonts have no glyphs for, so without this they would draw as boxes
+    fig, ax = vc.subplots(figsize = (2, 2))
+    ax.set_ylabel('log₂ CPM')
+    ax.plot([0, 1], [0, 1])
+    fig.layout()
+    assert fig.to_rgba(72.0)[0, 0, 3] == 255
+
+
+def test_a_page_held_to_a_window_never_grows():
+    def busy(fig, ax):
+        ax.bar(['a very long category name indeed', 'another very long category name'], [1, 2])
+        ax.set_ylabel('a very long axis name for a page this small')
+        ax.annotate('a very long annotation that fits on neither side of its point', (0.5, 1.5))
+        fig.suptitle('A title that is far wider than the page it sits on')
+    fig, ax = vc.subplots(figsize = (2, 1.2))
+    busy(fig, ax)
+    fig.layout()
+    assert fig.width > 2 * 72.0
+    fig.set_size(2, 1.2).layout()
+    assert (fig.width, fig.height) == (2 * 72.0, 1.2 * 72.0)
+    assert fig.to_rgba(100.0).shape[:2] == (round(1.2 * 100.0), round(2 * 100.0))
+    # Saving it twice stays the same, and so does a later size
+    assert fig.to_png(72.0) == fig.to_png(72.0)
+    fig.set_size(3, 2).layout()
+    assert (fig.width, fig.height) == (3 * 72.0, 2 * 72.0)

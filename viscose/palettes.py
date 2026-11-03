@@ -68,9 +68,10 @@ def ramp(colors, t):
 class Palette:
     """Two hues in four shades each (dark to pale), with text colors and effect settings.
 
-    `point` is flat, ring, cut or sphere. `bar` is flat, deep (gradient from the dark base), soft (gradient from the
-    pale base) or needle. `ridge` is flat, deep, soft or tint. `shadow` is the strength of a soft shadow that every
-    mark casts in its own color. `caps` sets axis names in small spaced capitals.
+    `point` is flat, ring, cut, or sphere. `bar` is flat, deep (gradient from the dark base), soft (gradient from the
+    pale base), or needle. `ridge` is flat, deep, or tint. `shadow` is the strength of a soft shadow that every mark
+    casts in its own color. `caps` sets axis names in small spaced capitals. `paper` is the page's color, for a dark
+    page with a light `ink`, where shades run from the strongest against the page to the faintest.
     """
     name: str
     a: list
@@ -111,25 +112,37 @@ class Palette:
     subtitle_bold: bool = False
     subtitle_color: str = ''
     text_bold: bool = False
+    paper: str = '#FFFFFF'
     extra: dict = field(default_factory = dict)
 
+    def __post_init__(self):
+        # A misspelled effect would otherwise quietly draw the flat one
+        for setting, allowed in (('point', ('flat', 'ring', 'cut', 'sphere')),
+                                 ('bar', ('flat', 'deep', 'soft', 'needle')), ('ridge', ('flat', 'deep', 'tint'))):
+            if getattr(self, setting) not in allowed:
+                raise ValueError(f"A palette's {setting} has to be one of {', '.join(allowed)}, "
+                                 f'got {getattr(self, setting)!r}')
+        if len(self.a) != 4 or len(self.b) != 4:
+            raise ValueError('A palette has two hues of four shades each, from dark to pale')
+
     def color(self, c):
-        """An RGB triple from a palette name (a0 to b3, ink, muted, faint), a hex string, a CSS name or a tuple."""
+        """An RGB triple from a palette name (a0 to b3, ink, muted, faint, paper), a hex string, a CSS name or a
+        tuple."""
         if c is None or isinstance(c, (tuple, list, np.ndarray)):
             return None if c is None else tuple(float(v) for v in c[:3])
         if c in NAMED:
             return None if NAMED[c] is None else _hex(NAMED[c])
-        if len(c) == 2 and c[0] in 'ab' and c[1].isdigit():
+        if len(c) == 2 and c[0] in 'ab' and c[1] in '0123':
             return _hex(getattr(self, c[0])[int(c[1])])
-        if c in ('ink', 'muted', 'faint'):
+        if c in ('ink', 'muted', 'faint', 'paper'):
             return _hex(getattr(self, c))
         if c.lower() in CSS:
             return _hex(CSS[c.lower()])
         try:
             return _hex(c)
         except ValueError:
-            raise ValueError(f'Unknown color {c!r}: use a palette name (a0 to b3, ink, muted, faint), hex, '
-                             'or a CSS name')
+            raise ValueError(f'Unknown color {c!r}: use a palette name (a0 to b3, ink, muted, faint, paper), '
+                             'hex, or a CSS name')
 
     def css(self, c):
         """A color as '#RRGGBB', for writing it into HTML or SVG by hand."""
@@ -154,23 +167,34 @@ class Palette:
         return order[:n] if n <= len(order) else order + self.colors(n)[len(order):]
 
     def groups(self, *sizes):
-        """Colors for categories grouped by hue, such as groups(3, 2): three shades of one hue, two of the other."""
+        """Colors for categories grouped by hue, such as groups(3, 2): three shades of one hue and two of the other."""
         if len(sizes) > 2:
             raise ValueError('A palette has two hues, so at most two groups')
         out = []
         for hue, n in zip((self.a, self.b), sizes):
             if n > 4:
                 raise ValueError('A hue holds four shades')
-            out += [_hex(hue[i]) for i in {1: [1], 2: [1, 2], 3: [0, 1, 2], 4: [0, 1, 2, 3]}[n]]
+            out += [_hex(hue[i]) for i in {0: [], 1: [1], 2: [1, 2], 3: [0, 1, 2], 4: [0, 1, 2, 3]}[n]]
         return out
 
     def sequential(self, t):
         """Magnitude scale from pale to dark in the main hue, at t in [0, 1]."""
         return ramp([self.a[3], self.a[2], self.a[1], self.a[0]], t)
 
+    def sequential_r(self, t):
+        """The magnitude scale from dark to pale, for values that matter most when low, such as distances."""
+        return self.sequential(1.0 - np.asarray(t, dtype = float))
+
     def diverging(self, t):
-        """Two-pole scale through white: 0 is the dark second hue, 0.5 is white, 1 is the dark main hue."""
-        return ramp([self.b[0], self.b[1], self.b[3], '#FFFFFF', self.a[3], self.a[1], self.a[0]], t)
+        """Two-pole scale through the page's color: 0 is the second hue at its strongest, 0.5 is the page, 1 is the main
+        hue at its strongest."""
+        return ramp([self.b[0], self.b[1], self.b[3], self.paper, self.a[3], self.a[1], self.a[0]], t)
+
+    def on(self, c):
+        """Whichever of white or a dark text color reads better over a color, by its luminance: the palette's ink, or
+        black where a dark page makes its ink light."""
+        light = lambda v: np.dot(self.color(v), (0.2126, 0.7152, 0.0722)) >= 0.5
+        return 'white' if not light(c) else 'black' if light('ink') else 'ink'
 
     def shades(self, c):
         """The (dark, mid, light) neighbors of a color: its own hue's shades if it is in the palette, else mixes."""

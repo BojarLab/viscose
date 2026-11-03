@@ -8,6 +8,9 @@ from glycorender.pdfwrite import TTFont, pdfmetrics
 
 CAP_HEIGHT = 0.72
 _RUN = re.compile(r'[_^]\{[^}]*\}|[^_^]+|[_^]')
+# Sub- and superscript characters, which fonts mostly lack, as runs of their own
+_SCRIPTS = str.maketrans({**{c: f'_{{{v}}}' for c, v in zip('₀₁₂₃₄₅₆₇₈₉₊₋', '0123456789+-')},
+                          **{c: f'^{{{v}}}' for c, v in zip('⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻', '0123456789+-')}})
 
 
 def fonts():
@@ -28,9 +31,9 @@ def fonts():
 
 
 def runs(text):
-    """Split 'log_{2} x' into (text, rise, scale) pieces."""
+    """Split 'log_{2} x' or 'log₂ x' into (text, rise, scale) pieces."""
     out = []
-    for piece in _RUN.findall(str(text)):
+    for piece in _RUN.findall(str(text).translate(_SCRIPTS)):
         if piece[0] in '_^' and len(piece) > 2:
             out.append((piece[2:-1], -0.22 if piece[0] == '_' else 0.38, 0.7))
         else:
@@ -39,7 +42,7 @@ def runs(text):
 
 
 def spaced(pal, text):
-    """A palette's treatment of axis names: capitals with their tracking, where the palette asks for them."""
+    """A palette's treatment of axis names: capitals, where the palette asks for them."""
     return str(text).upper() if pal.caps else str(text)
 
 
@@ -77,18 +80,18 @@ def outline(c, ttf, text, x, y, size):
 
 
 def draw(c, x, y, text, size, color, bold = False, ha = 'left', va = 'baseline', rotation = 0.0, tracking = 0.0,
-         halo = 0.0,
-         halo_color = (1.0, 1.0, 1.0)):
-    """Draw text at (x, y) in page points; several lines run downward from it."""
+         halo = 0.0, halo_color = (1.0, 1.0, 1.0)):
+    """Draw text at (x, y) in page points; several lines run downward as one block that `va` places."""
     text = str(text)
     if not text:
         return
     if '\n' in text:
-        for i, part in enumerate(text.split('\n')):
-            drop = i * size * 1.25
+        parts = text.split('\n')
+        lift = {'center': 0.5, 'bottom': 1.0}.get(va, 0.0) * (len(parts) - 1)
+        for i, part in enumerate(parts):
+            drop = (i - lift) * size * 1.25
             draw(c, x + drop * math.sin(math.radians(rotation)), y - drop * math.cos(math.radians(rotation)), part,
-                 size, color, bold, ha, va,
-                 rotation, tracking, halo, halo_color)
+                 size, color, bold, ha, va, rotation, tracking, halo, halo_color)
         return
     name = fonts()[1 if bold else 0]
     w = width(text, size, bold, tracking)
@@ -99,7 +102,7 @@ def draw(c, x, y, text, size, color, bold = False, ha = 'left', va = 'baseline',
     if rotation:
         c.rotate(rotation)
     pen = dx
-    pieces = [(t, rise, k) for t, rise, k in runs(text)]
+    pieces = runs(text)
     if halo:
         c.saveState()
         c.setStrokeColorRGB(*halo_color, alpha = 1.0)

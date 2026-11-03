@@ -9,8 +9,8 @@ from io import BytesIO
 from pathlib import Path
 import numpy as np
 from glycorender import pdfwrite, raster
-from . import text
-from .axes import Axes
+from . import marks, text
+from .axes import Axes, LABEL_MIN
 from .palettes import get_palette
 
 
@@ -50,7 +50,7 @@ def show_png(png, viewer = True):
 
 def _shadow_layer(ops, width, height, dpi, strength):
     """The marks, blurred and moved, as a straight-alpha RGBA array whose color over white multiplies like the
-    marks'."""
+    marks', and which over a dark page shows as a glow."""
     sc = dpi / 72.0
     img = raster.render(ops, width, height, sc, sc, None).astype(np.float32) / 255.0
     alpha = img[..., 3]
@@ -91,8 +91,7 @@ def _hex(rgb):
 
 def _label_groups(c, ops, height):
     """Labels as matplotlib writes text: a comment naming them, then one group whose transform starts at their position
-    in
-    page coordinates. glycowork's annotate_figure swaps such groups for glycan drawings."""
+    in page coordinates. glycowork's annotate_figure swaps such groups for glycan drawings."""
     groups = {}
     for op in ops:
         groups.setdefault(op['label'], []).append(op)
@@ -145,7 +144,7 @@ class Figure:
         self._base = (self.width, self.height)
         self.axes = []
         self._title, self._subtitle = '', ''
-        self._grid = None
+        self._grid, self._held = None, False
 
     def suptitle(self, title, subtitle = ''):
         """The figure's title in the palette's manner, with an optional line under it."""
@@ -155,16 +154,22 @@ class Figure:
     def add_axes(self, rect):
         """Axes at a fixed (left, bottom, width, height) rectangle in figure fractions."""
         ax = Axes(self, self.pal)
-        ax._fixed = rect
+        ax._fixed = tuple(rect)
         self.axes.append(ax)
         return ax
 
     def _head(self):
-        return 66.0 if self._title and self._subtitle else (46.0 if self._title else 10.0)
+        pal = self.pal
+        if not self._title:
+            return 10.0
+        room = 46.0 + 1.25 * pal.title_size * self._title.count('\n')
+        return room + 20.0 + 1.25 * pal.subtitle_size * self._subtitle.count('\n') if self._subtitle else room
 
     def set_size(self, width, height):
-        """A new size in inches, for a figure that follows a window."""
+        """A new size in inches, for a figure that follows a window: the page keeps exactly this size from now on, and
+        labels that would otherwise widen it turn, thin out, or squeeze the plot."""
         self._base = self.width, self.height = width * 72.0, height * 72.0
+        self._held = True
         return self
 
     def layout(self):
@@ -184,11 +189,10 @@ class Figure:
 
     def _place(self):
         """Rectangles for all axes. Labels that would take most of a cell, or run off the page, widen the figure instead
-        of
-        squeezing the plot, as matplotlib's bbox_inches = 'tight' does."""
+        of squeezing the plot, as matplotlib's bbox_inches = 'tight' does."""
         pad, gap, head = 16.0, 10.0, self._head()
         self.width, self.height = self._base
-        if self._title:
+        if self._title and not self._held:
             pal = self.pal
             self.width = max(self.width, 32.0 + pad + max(text.width(self._title, pal.title_size, pal.title_bold),
                                                           text.width(self._subtitle, pal.subtitle_size)))
@@ -196,32 +200,46 @@ class Figure:
             nrows, ncols, wr, hr = self._grid
             extra = np.zeros((ncols, 2))
             for ax in self.axes:
-                if getattr(ax, '_fixed', None) is None:
+                if ax._fixed is None and not self._held:
                     l, r, b, t = ax._margins()
                     row, col = ax._cell
                     extra[col] = np.maximum(extra[col], ax._over)
                     grow_w = (l + r) / PLOT_SHARE_MARGINS / (wr[col] / sum(wr)) + 2 * pad + gap * (ncols - 1)
                     grow_h = (b + t) / PLOT_SHARE_MARGINS / (hr[row] / sum(hr)) + pad + head + gap * (nrows - 1)
+                    # Axis names that would still not fit at their smallest
+                    name_w, name_h = ax._axis_name_widths(LABEL_MIN)
+                    grow_w = max(grow_w, (name_w + l + r) / (wr[col] / sum(wr)) + 2 * pad + gap * (ncols - 1))
+                    grow_h = max(grow_h, (name_h + b + t) / (hr[row] / sum(hr)) + pad + head + gap * (nrows - 1))
                     self.width = min(max(self.width, grow_w), self._base[0] * 3)
                     self.height = min(max(self.height, grow_h), self._base[1] * 3)
+                    # Labels that must all show get the room they need, however much that is
+                    sx, sy = ax._tick_sizes()
+                    if ax.show_all[0] and ax.xrot:
+                        need = len(ax.xticks) * sx * 1.05 + l + r
+                        self.width = max(self.width, need / (wr[col] / sum(wr)) + 2 * pad + gap * (ncols - 1))
+                    if ax.show_all[1]:
+                        need = len(ax.yticks) * sy * 1.05 + b + t
+                        self.height = max(self.height, need / (hr[row] / sum(hr)) + pad + head + gap * (nrows - 1))
             total_w = self.width - 2 * pad - gap * (ncols - 1)
             total_h = self.height - pad - head - gap * (nrows - 1)
             cw, ch = np.asarray(wr, float) / sum(wr) * total_w, np.asarray(hr, float) / sum(hr) * total_h
             self.width += extra.sum()
         for ax in self.axes:
             l, r, b, t = ax._margins()
-            if getattr(ax, '_fixed', None) is not None:
+            if ax._fixed is not None:
                 fx, fy, fw, fh = ax._fixed
                 ax.rect = (fx * self.width, fy * self.height, fw * self.width, fh * self.height)
+                ax._room = (0.0, 0.0, self.width, self.height)
             else:
                 row, col = ax._cell
                 cx = pad + sum(cw[:col]) + gap * col + extra[:col].sum() + extra[col, 0]
                 cy = pad + sum(ch[row + 1:]) + gap * (nrows - 1 - row)
                 ax.rect = (cx + l, cy + b, max(cw[col] - l - r, 10.0), max(ch[row] - b - t, 10.0))
+                ax._room = (cx, cy, cw[col], ch[row])
                 ax._legend_y = cy + 10.0
         # Dendrograms share their matrix's rows or columns, whatever room its labels took
         for ax in self.axes:
-            for axis, other in getattr(ax, '_align', {}).items():
+            for axis, other in ax._align.items():
                 x, y, w, h = ax.rect
                 ox, oy, ow, oh = other.rect
                 ax.rect = (ox, y, ow, h) if axis == 'x' else (x, oy, w, oh)
@@ -244,6 +262,7 @@ class Figure:
             text.draw(c, 30.0, y, self._title, pal.title_size, pal.color(pal.title_color or pal.ink), pal.title_bold)
             if self._subtitle:
                 caps = pal.extra.get('subtitle_caps')
+                y -= 1.25 * pal.title_size * self._title.count('\n')
                 text.draw(c, 32.0, y - 20.0, self._subtitle.upper() if caps else self._subtitle, pal.subtitle_size,
                           pal.color(pal.subtitle_color or pal.muted), pal.subtitle_bold,
                           tracking = 0.9 if caps else 0.0)
@@ -291,22 +310,22 @@ class Figure:
             c.ops.insert(0, op)
         return c
 
-    def to_png(self, dpi = 300.0, background = 'white'):
-        """PNG bytes; background None keeps the page transparent."""
-        return self._raster_canvas(dpi).to_png(dpi / 72.0, dpi / 72.0,
-                                               (1.0, 1.0, 1.0) if background == 'white' else background)
+    def to_png(self, dpi = 300.0, background = 'paper'):
+        """PNG bytes; background is any color, by default the palette's page, and None keeps the page transparent."""
+        return self._raster_canvas(dpi).to_png(dpi / 72.0, dpi / 72.0, self.pal.color(background))
 
-    def to_rgba(self, dpi = 144.0, background = 'white'):
+    def to_rgba(self, dpi = 144.0, background = 'paper'):
         """The page as an array of shape (rows, columns, 4) of 8-bit RGBA, first row at the top, for showing it in a
-        window without encoding a PNG; background None keeps the page transparent."""
+        window without encoding a PNG; background is any color, by default the palette's page, and None keeps the page
+        transparent."""
         page = raster.render(self._raster_canvas(dpi).ops, self.width, self.height, dpi / 72.0, dpi / 72.0,
-                             (1.0, 1.0, 1.0) if background == 'white' else background)
+                             self.pal.color(background))
         return page if page.shape[2] == 4 else np.dstack([page, np.full(page.shape[:2], 255, np.uint8)])
 
     def display_list(self, layout = True):
         """The page as glycorender's display list, each op in page points with its own state, for a window that paints
-        with a painter of its own, which is much faster at high resolution; a palette's soft shadow is not part of it.
-        layout = False takes the page as `layout` last settled it."""
+        with a painter of its own, which is much faster at high resolution; a palette's soft shadow and its page's color
+        are not part of it. layout = False takes the page as `layout` last settled it."""
         return self._canvas(layout = layout).ops
 
     def to_pdf(self):
@@ -317,11 +336,16 @@ class Figure:
         c.target = target
         if op is not None:
             c.ops.insert(0, op)
+        # A PDF's page is white unless something covers it
+        if self.pal.color('paper') != (1.0, 1.0, 1.0):
+            marks.polygon(c, [0.0, self.width, self.width, 0.0], [0.0, 0.0, self.height, self.height],
+                          self.pal.color('paper'))
+            c.ops.insert(0, c.ops.pop())
         c.save()
         return target.getvalue()
 
     def to_svg(self):
-        """SVG text on a white page, with text as outlines and images embedded."""
+        """SVG text on the palette's page, with text as outlines and images embedded."""
         op = self._shadow_op(SHADOW_DPI)
         c = self._canvas()
         if op is not None:
@@ -329,7 +353,7 @@ class Figure:
         labels = [o for o in c.ops if o.get('label')]
         c.ops = [o for o in c.ops if not o.get('label')]
         svg = _with_ids(c.to_svg(), c.ops)
-        page = '<rect width="%g" height="%g" fill="#FFFFFF" />\n' % (self.width, self.height)
+        page = '<rect width="%g" height="%g" fill="%s" />\n' % (self.width, self.height, self.pal.css('paper'))
         svg = svg.replace('<g transform="matrix(', page + '<g transform="matrix(', 1)
         # Tells slate this is a figure, ahead of the gradients' long <defs> and through annotate_figure. It cannot be a
         # comment, as annotate_figure takes every comment and all that follows up to the next </g> for a label
@@ -337,8 +361,9 @@ class Figure:
         svg = svg[:top] + '<metadata>viscose</metadata>\n' + svg[top:]
         return svg.replace('</svg>', _label_groups(c, labels, self.height) + '\n</svg>') if labels else svg
 
-    def save(self, path, dpi = 300.0, background = 'white'):
-        """Write the file format that the path's suffix names: png, pdf, or svg."""
+    def save(self, path, dpi = 300.0, background = 'paper'):
+        """Write the file format that the path's suffix names: png, pdf, or svg. `dpi` and `background` are for PNG, as
+        PDF and SVG are vector on the palette's page."""
         path = Path(path)
         suffix = path.suffix.lower()
         if suffix == '.png':
@@ -346,7 +371,7 @@ class Figure:
         elif suffix == '.pdf':
             path.write_bytes(self.to_pdf())
         elif suffix == '.svg':
-            path.write_text(self.to_svg(), encoding = 'utf-8')
+            path.write_text(self.to_svg(), encoding = 'utf-8', newline = '\n')
         else:
             raise ValueError(f'Unsupported format {suffix!r}; use .png, .pdf, or .svg')
         return path
@@ -369,7 +394,6 @@ def subplots(nrows = 1, ncols = 1, figsize = (8.0, 8.0), palette = None, width_r
         row = []
         for j in range(ncols):
             ax = Axes(fig, fig.pal)
-            ax._fixed = None
             ax._cell = (r, j)
             fig.axes.append(ax)
             row.append(ax)
@@ -391,10 +415,9 @@ def _given_labels(given, names, n):
 
 
 def clustermap(data, xticklabels = None, yticklabels = None, method = 'average', metric = 'euclidean',
-               cmap = 'diverging',
-               figsize = (8.0, 8.0), palette = None, title = '', subtitle = '', show_all = False, row_linkage = None,
-               col_linkage = None, row_cluster = True, col_cluster = True, vmin = None, vmax = None, center = 0.0,
-               xlabel = '', ylabel = '', colorbar = True, colorbar_label = ''):
+               cmap = 'diverging', figsize = (8.0, 8.0), palette = None, title = '', subtitle = '', show_all = False,
+               row_linkage = None, col_linkage = None, row_cluster = True, col_cluster = True, vmin = None, vmax = None,
+               center = 0.0, xlabel = '', ylabel = '', colorbar = True, colorbar_label = ''):
     """A heatmap with both dendrograms and a color bar, as in seaborn. Needs scipy. A DataFrame brings its own labels,
     and xticklabels and yticklabels can be True for all, False for none, or an integer for every n-th. Returns the
     figure and the heatmap's axes; the figure's row_order and col_order hold the data's rows and columns as drawn,
@@ -407,6 +430,11 @@ def clustermap(data, xticklabels = None, yticklabels = None, method = 'average',
     m = np.asarray(data, dtype = float)
     x, x_step, x_all = _given_labels(xticklabels, list(data.columns) if frame else None, m.shape[1])
     y, y_step, y_all = _given_labels(yticklabels, list(data.index) if frame else None, m.shape[0])
+    # One row or column has nothing to be clustered with
+    row_cluster, col_cluster = row_cluster and m.shape[0] > 1, col_cluster and m.shape[1] > 1
+    if ((row_cluster and row_linkage is None) or (col_cluster and col_linkage is None)) and not np.isfinite(m).all():
+        raise ValueError('Clustering needs finite values: fill in what is missing, pass row_linkage and col_linkage, '
+                         'or set row_cluster and col_cluster to False')
     # Scipy walks the tree recursively, one level per row in the worst case
     limit = sys.getrecursionlimit()
     sys.setrecursionlimit(max(limit, 2 * max(m.shape) + 200))

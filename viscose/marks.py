@@ -206,10 +206,10 @@ def shapes(c, xs, ys, rs, rgb, alpha = 1.0, stroke = None, lw = 0.0, marker = 'o
     c.saveState()
     _style(c, rgb, alpha, stroke, lw, 1.0)
     if form:
-        c.drawMarkers(p, np.round(xs, 2).tolist(), np.round(ys, 2).tolist(), fill = 1,
+        c.drawMarkers(p, np.round(xs, 2).tolist(), np.round(ys, 2).tolist(), fill = 0 if rgb is None else 1,
                       stroke = 1 if stroke is not None else 0)
     else:
-        c.drawPath(p, fill = 1, stroke = 1 if stroke is not None else 0)
+        c.drawPath(p, fill = 0 if rgb is None else 1, stroke = 1 if stroke is not None else 0)
     c.restoreState()
 
 
@@ -275,28 +275,27 @@ def _layers(pal, xs, ys, r, rgb, edge):
     """A group of points in the palette's manner, as (xs, ys, radii, color, stroke, stroke width) from the bottom up."""
     if edge is not None:
         return [(xs, ys, r, rgb, edge[0], edge[1])]
-    white = (1.0, 1.0, 1.0)
     if pal.point == 'sphere':
         dark, base, light = pal.shades(rgb)
         big = r > 2.0
         return [(xs, ys, r * 1.2, dark, None, 0.0), (xs, ys, r, base, None, 0.0),
                 (xs[big] - r[big] * 0.22, ys[big] + r[big] * 0.22, r[big] * 0.5, light, None, 0.0)]
     if pal.point == 'ring':
-        return [(xs, ys, r, rgb, white, 0.35)]
+        return [(xs, ys, r, rgb, pal.color('paper'), 0.35)]
     if pal.point == 'cut':
         # A ring as wide as a small point's radius would eat the point
-        return [(xs, ys, r, rgb, white, min(1.1, 0.25 * float(np.min(r))))]
+        return [(xs, ys, r, rgb, pal.color('paper'), min(1.1, 0.25 * float(np.min(r))))]
     return [(xs, ys, r, rgb, None, 0.0)]
 
 
 def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None):
     """Scatter marks in the palette's manner; `area` is in points squared, as in matplotlib. `edge` is (color,
-    width)."""
+    width), and with `rgb` None it is all that shows."""
     n = len(xs)
     if not n:
         return
     xs, ys = np.asarray(xs, dtype = float), np.asarray(ys, dtype = float)
-    r = np.broadcast_to(np.sqrt(np.asarray(area, dtype = float) * pal.point_scale) / 2.0, xs.shape)
+    r = np.broadcast_to(np.sqrt(np.maximum(np.asarray(area, dtype = float), 0.0) * pal.point_scale) / 2.0, xs.shape)
     # An area of zero draws nothing, though a ring around it would show
     drawn = r > 0.0
     xs, ys, r = xs[drawn], ys[drawn], r[drawn]
@@ -304,8 +303,7 @@ def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None):
     if not n:
         return
     # Later points must cover earlier ones, or one path's rings would all lie over all its fills. Groups do that and
-    # keep
-    # dense plots light; points that look alike when merged need no order.
+    # keep dense plots light; points that look alike when merged need no order.
     step = max(1, n // POINT_GROUPS) if edge is not None or pal.point != 'flat' or alpha < 1.0 else n
     if not (getattr(c, 'stamp_dpi', None) and n >= STAMP_MIN and c.state['clip']
             and (marker == 'o' or len(np.unique(r)) <= SPRITE_SIZES)):
@@ -318,6 +316,7 @@ def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None):
     buf = _stamp_buffer(c, xs, ys, r, marker)
     if buf is None:
         return
+    rgb, alpha = ((0.0, 0.0, 0.0), 0.0) if rgb is None else (rgb, alpha)
     step = min(step, STAMP_BATCH)
     for start in reversed(range(0, n, step)):
         chosen = slice(start, start + step)
@@ -352,13 +351,15 @@ def arrow(c, pal, x0, y0, x1, y1, rgb, lw, alpha = 1.0):
     polygon(c, [x1, bx - uy * half, bx + uy * half], [y1, by + ux * half, by - ux * half], rgb, alpha)
 
 
-def bar(c, pal, x, y, w, h, rgb, horizontal = False, alpha = 1.0):
-    """A bar in the palette's manner; (x, y) is its lower left corner, and the base is at y, or at x if horizontal."""
+def bar(c, pal, x, y, w, h, rgb, horizontal = False, alpha = 1.0, flip = False, reach = 0.7):
+    """A bar in the palette's manner; (x, y) is its lower left corner, and the base is at y, or at x if horizontal, or
+    at the opposite end if `flip`. A needle's top reaches past either side by `reach` bar widths."""
     if w <= 0 or h <= 0:
         return
     dark, base, light = pal.shades(rgb)
     xs, ys = [x, x + w, x + w, x], [y, y, y + h, y + h]
     axis = (x, y, x + w, y) if horizontal else (x, y, x, y + h)
+    axis = (axis[2], axis[3], axis[0], axis[1]) if flip else axis
     if pal.bar == 'deep':
         polygon(c, xs, ys, None, alpha, (axis, (dark, base, light)))
     elif pal.bar == 'soft':
@@ -366,14 +367,32 @@ def bar(c, pal, x, y, w, h, rgb, horizontal = False, alpha = 1.0):
     elif pal.bar == 'needle':
         polygon(c, xs, ys, rgb, alpha)
         if horizontal:
-            polyline(c, [x + w, x + w], [y - h * 0.7, y + h * 1.7], dark, 0.9, alpha, cap = 0)
+            tip = x if flip else x + w
+            polyline(c, [tip, tip], [y - h * reach, y + h * (1 + reach)], dark, 0.9, alpha, cap = 0)
         else:
-            polyline(c, [x - w * 0.7, x + w * 1.7], [y + h, y + h], dark, 0.9, alpha, cap = 0)
+            tip = y if flip else y + h
+            polyline(c, [x - w * reach, x + w * (1 + reach)], [tip, tip], dark, 0.9, alpha, cap = 0)
     else:
         polygon(c, xs, ys, rgb, alpha)
 
 
-def segment(c, pal, x, y, w, h, rgb, gap):
+def box(c, pal, x, w, stats, rgb, alpha = 1.0):
+    """A box plot's whiskers, box in the palette's manner of bars, and median; (x, w) is the box's left edge and width,
+    and `stats` holds the lower whisker, quartile, median, quartile, and upper whisker in page points."""
+    low, q1, median, q3, high = stats
+    lw, mid = max(pal.line_width * 0.5, 0.9), x + w / 2
+    # A shade darker than the box, as a pale one would otherwise leave them hard to see
+    polylines(c, [([mid, mid], [low, q1]), ([mid, mid], [q3, high]), ([mid - w / 4, mid + w / 4], [low, low]),
+                  ([mid - w / 4, mid + w / 4], [high, high])], pal.shades(rgb)[0], lw, alpha, cap = 0)
+    # A needle's wide top would read as part of the data here
+    if pal.bar == 'needle':
+        polygon(c, [x, x + w, x + w, x], [q1, q1, q3, q3], rgb, alpha)
+    else:
+        bar(c, pal, x, q1, w, q3 - q1, rgb, False, alpha)
+    polyline(c, [x, x + w], [median, median], pal.color(pal.on(rgb)), max(lw, 1.4), alpha, cap = 0)
+
+
+def segment(c, pal, x, y, w, h, rgb, gap, alpha = 1.0):
     """One piece of a stacked bar, with a gap to the piece below it."""
     dark, base, light = pal.shades(rgb)
     y0, h0 = y + gap, h - gap
@@ -381,25 +400,26 @@ def segment(c, pal, x, y, w, h, rgb, gap):
         return
     xs, ys = [x, x + w, x + w, x], [y0, y0, y0 + h0, y0 + h0]
     if pal.bar in ('deep', 'soft'):
-        polygon(c, xs, ys, None, 1.0, ((x, y0, x, y0 + h0), (base, light)))
+        polygon(c, xs, ys, None, alpha, ((x, y0, x, y0 + h0), (base, light)))
     else:
-        polygon(c, xs, ys, rgb)
+        polygon(c, xs, ys, rgb, alpha)
 
 
 def ridge(c, pal, xs, base, ys, rgb, top_rgb, peak):
-    """One ridge of a ridgeline, with the page's white behind it so that it hides the ridges at its back."""
+    """One ridge of a ridgeline, with the page's color behind it so that it hides the ridges at its back."""
+    paper = pal.color('paper')
     px = np.r_[xs, xs[::-1]]
     py = np.r_[ys, np.full(len(xs), base)]
     if pal.ridge == 'deep':
-        polygon(c, px, py, (1.0, 1.0, 1.0))
+        polygon(c, px, py, paper)
         polygon(c, px, py, None, 1.0, ((xs[0], base, xs[0], base + peak), (rgb, top_rgb)))
-        polyline(c, xs, ys, (1.0, 1.0, 1.0), pal.ridge_crest)
+        polyline(c, xs, ys, paper, pal.ridge_crest)
     elif pal.ridge == 'tint':
         polygon(c, px, py, top_rgb)
         polyline(c, xs, ys, rgb, pal.ridge_crest)
     else:
         polygon(c, px, py, rgb)
-        polyline(c, xs, ys, (1.0, 1.0, 1.0), pal.ridge_crest)
+        polyline(c, xs, ys, paper, pal.ridge_crest)
 
 
 def heat_cell(c, pal, x, y, w, h, rgb):

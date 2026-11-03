@@ -103,10 +103,10 @@ fig, heat = vc.clustermap(df, palette = 'aura', title = 'Glycan abundance by tis
 
 | | |
 |---|---|
-| **Plots** | `plot`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `stem`, `hlines`, `vlines`, `arrow`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, `axvspan`, `image`, and `vc.clustermap` |
+| **Plots** | `plot`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `boxplot`, `contour`, `stem`, `hlines`, `vlines`, `arrow`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, `axhspan`, `axvspan`, `image`, and `vc.clustermap` |
 | **Markers** | `o`, `s`, `D`, `^`, `v`, `>`, `<`, `X`, `P`, and `*`, all with the palette's effects |
 | **Annotation** | `text`, `annotate`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text |
-| **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, and the page grows for anything that needs it |
+| **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, long axis names shrink, and the page grows for anything that needs it |
 | **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window |
 | **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, for placing things yourself or answering a mouse |
 | **Display** | `fig.show()` works inline in Jupyter and slate, and in the system's image viewer from a terminal, with CI and coding agents kept silent |
@@ -120,13 +120,13 @@ matplotlib and seaborn, and its files can be far smaller. At 300 dpi, in Poster:
 
 | | matplotlib and seaborn | viscose |
 |---|---|---|
-| Dependencies | Nine extra packages, 42.5 MB | numpy and glycorender, with 0.11 MB of its own code |
+| Dependencies | Nine extra packages, 42.5 MB | numpy and glycorender, with 0.15 MB of its own code |
 | Clustermap, 300 x 100, PDF | 1.57 s, 587 kB | **0.02 s, 79 kB** |
 | Clustermap, 300 x 100, SVG | 1.40 s, 5,943 kB | **0.02 s, 182 kB** |
-| Clustermap, 26 x 16, PDF | 0.11 s, 22 kB | **0.01 s**, 26 kB |
+| Clustermap, 26 x 16, PDF | 0.11 s, 22 kB | **0.02 s**, 26 kB |
 | Three lines with a legend, PDF | 0.03 s, 12 kB | **under 0.01 s**, 13 kB |
 | Scatter, 100,000 points, PDF | 0.96 s, 1,524 kB | **0.19 s, 644 kB** |
-| Scatter, 412 points, PNG | 0.18 s, 147 kB | 0.20 s, 180 kB |
+| Scatter, 412 points, PNG | 0.18 s, 147 kB | 0.22 s, 180 kB |
 
 matplotlib's compiled rasterizer is still about twice as fast on most PNGs,
 and the soft shadows of Lumen and Aura add about half a second. To rerun the full comparison, wins and losses alike, use
@@ -136,7 +136,7 @@ and the soft shadows of Lumen and Aura add about half a second. To rerun the ful
 
 `vc.set_palette('aura')` changes the default for every figure. A library that builds on viscose calls `vc.default_palette('aura')`
 instead, which gives way to the choice of whoever uses it. In any palette, refer to its shades as `a0` to `a3` and `b0` to `b3`, dark
-to pale, or as `ink`, `muted`, and `faint`; hex and CSS color names work too. `fig.pal.groups(3, 2)` gives categories grouped by hue,
+to pale, or as `ink`, `muted`, `faint`, and `paper`; hex and CSS color names work too. `fig.pal.groups(3, 2)` gives categories grouped by hue,
 here three shades of one and two of the other, and `fig.pal.contrast(n)` alternates between the hues for categories that have to stand
 apart, as `scatter(hue = ...)` does.
 
@@ -147,6 +147,9 @@ vc.register_palette(vc.Palette('midnight', ['#14213D', '#27477E', '#5C85C5', '#C
                                '#14213D', '#5A6478', '#E6EAF1', point = 'sphere', bar = 'deep', shadow = 0.4))
 fig, ax = vc.subplots(palette = 'midnight')
 ```
+
+A palette's `paper` is the color of its page, white unless you say otherwise, and every format draws on it. For a dark page, give it a light
+`ink` and order its shades from the strongest against the page to the faintest, so that rings, halos, and scales follow.
 
 Century Gothic is used where it is installed, and glycorender's bundled Comfortaa elsewhere.
 
