@@ -768,6 +768,38 @@ def test_a_glycan_label_near_the_edge_keeps_its_side_and_grows_the_page():
     assert abs(x - (float(ax._tx(0.9)) + 5)) < 0.01 and fig.width > 4 * 72
 
 
+def labeled_figure(*labels, shape = (1, 1), column = 0):
+    fig, axes = vc.subplots(*shape, figsize = (4, 3), palette = 'poster')
+    ax = np.ravel(axes)[column]
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    for label, tag in labels:
+        ax.annotate(label, (0.9 if tag else 0.1, 0.5), offset = (5, 0), svg_label = tag)
+    svg = fig.to_svg()
+    bare = re.search(r'<rect width="[\d.]+" height="[\d.]+" fill="[^"]*" data-width-unlabeled="([\d.]+)"', svg)
+    return fig, svg, float(bare.group(1)) if bare else None
+
+
+def test_a_glycan_label_records_what_the_page_needs_without_it():
+    # The plain label is too long for either side of its point, and its point leaves more room on the right
+    glycan, plain = 'Man(a1-3)[Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc' * 2, 'a label that stays ' * 3
+    fig, svg, bare = labeled_figure((glycan, True))
+    assert abs(bare - 4 * 72) < 0.01 and fig.width > 4 * 72
+    # What is left as text says how far it reaches, and slate's mark stays right after the root tag
+    right = float(re.search(r'data-right="([\d.]+)"', svg).group(1))
+    assert abs(right - (float(fig.axes[0]._tx(0.9)) + 5 + width(glycan, 8.6, fig.pal.text_bold))) < 1
+    assert re.search(r'<svg[^>]*>\n<metadata>viscose</metadata>\n', svg)
+    # Another label keeps the room it needs, as much as on a page of its own
+    fig, _, none = labeled_figure((plain, False))
+    assert fig.width > 4 * 72 and none is None
+    assert abs(labeled_figure((glycan, True), (plain, False))[2] - fig.width) < 0.01
+    # Only the last column's growth can go, as an earlier one has a column to its right
+    fig, _, bare = labeled_figure((glycan, True), shape = (1, 2))
+    assert abs(bare - fig.width) < 0.01
+    fig, _, bare = labeled_figure((glycan, True), shape = (1, 2), column = 1)
+    assert abs(bare - 4 * 72) < 0.01 and fig.width > 4 * 72
+
+
 def test_element_ids_wrap_their_paths():
     fig, ax = vc.subplots(figsize = (4, 3), palette = 'lumen')
     ax.arrow(0, 0, 1, 1, gid = 'gwedge0')
@@ -864,6 +896,22 @@ def test_show_opens_no_viewer_in_a_console_run_by_a_tool(monkeypatch, variable):
     figure.show_png(b'png')
     assert len(opened) == 1
     os.remove(opened[0])
+
+
+def test_clearing_the_users_choice_gives_way_to_the_library_again():
+    module = sys.modules['viscose.palettes']
+    before, library = list(module._default), list(module._library)
+    try:
+        module._default[:] = ['lumen', False]
+        vc.default_palette('aura')
+        vc.set_palette('poster')
+        assert vc.subplots()[0].pal.name == 'poster'
+        vc.set_palette(None)
+        assert vc.subplots()[0].pal.name == 'aura'
+        vc.default_palette('couture')
+        assert vc.subplots()[0].pal.name == 'couture'
+    finally:
+        module._default[:], module._library[:] = before, library
 
 
 def test_a_library_default_gives_way_to_the_users_choice():

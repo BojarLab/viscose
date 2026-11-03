@@ -242,6 +242,7 @@ AURA = Palette('aura', ['#5A0F2E', '#A3214E', '#DB4F7A', '#F6BFD0'], ['#0C4A4F',
                tick_color = '#7F5A68', label_color = '#7F5A68', title_color = '#A3214E', subtitle_color = '#7F5A68')
 palettes = {p.name: p for p in (LUMEN, COUTURE, POSTER, AURA)}
 _default = ['lumen', False]
+_library = ['lumen']
 
 
 def get_palette(name = None, default = None):
@@ -260,14 +261,15 @@ palette = get_palette
 
 
 def set_palette(name):
-    """Choose the palette that new figures use."""
-    _default[:] = get_palette(name).name, True
+    """Choose the palette that new figures use; None leaves the choice to a library's default_palette again."""
+    _default[:] = (_library[0], False) if name is None else (get_palette(name).name, True)
 
 
 def default_palette(name):
     """A library's choice of palette: it applies unless the user has called set_palette, before or after."""
+    _library[0] = get_palette(name).name
     if not _default[1]:
-        _default[0] = get_palette(name).name
+        _default[0] = _library[0]
 
 
 def register_palette(pal):

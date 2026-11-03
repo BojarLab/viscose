@@ -134,7 +134,7 @@ and the soft shadows of Lumen and Aura add about half a second. To rerun the ful
 
 ## Make it yours
 
-`vc.set_palette('aura')` changes the default for every figure. A library that builds on viscose calls `vc.default_palette('aura')`
+`vc.set_palette('aura')` changes the default for every figure, and `vc.set_palette(None)` hands the choice back. A library that builds on viscose calls `vc.default_palette('aura')`
 instead, which gives way to the choice of whoever uses it. In any palette, refer to its shades as `a0` to `a3` and `b0` to `b3`, dark
 to pale, or as `ink`, `muted`, `faint`, and `paper`; hex and CSS color names work too. `fig.pal.groups(3, 2)` gives categories grouped by hue,
 here three shades of one and two of the other, and `fig.pal.contrast(n)` alternates between the hues for categories that have to stand

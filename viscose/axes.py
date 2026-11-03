@@ -134,7 +134,7 @@ class Axes:
         self._hidden = set()
         self._xmargin, self._ymargin = 0.05, 0.05
         self._scale, self._cbar = None, None
-        self._over = [0.0, 0.0]
+        self._over, self._over_plain = [0.0, 0.0], -math.inf
         self._ridge_labels = None
         self._fixed, self._cell, self._legend_y, self._align = None, None, None, {}
         self.rect = self._room = (0.0, 0.0, 1.0, 1.0)
@@ -1036,8 +1036,11 @@ class Axes:
                 changed = True
         page = self.figure.width
         over = [0.0, 0.0]
+        # What the right side lacks for all but glycan labels, whose drawings replace them, for Figure._width_unlabeled
+        self._over_plain = -math.inf
         if self.title_text:
             over[1] = self.rect[0] + text.width(self.title_text, self._title_size(), pal.title_bold) - (page - 3.0)
+            self._over_plain = over[1]
         for a in self.artists:
             if a['kind'] != 'text' or a['rotation'] or a['frac'] or a['ha'] == 'center' or not math.isfinite(a['x']):
                 continue
@@ -1056,6 +1059,8 @@ class Axes:
             a['_ha'] = 'left' if use_right else 'right'
             a['_dx'] = a['dx'] if use_right == natural_right else (gap if use_right else -gap)
             over[1 if use_right else 0] = max(over[1 if use_right else 0], over_right if use_right else over_left)
+            if use_right and not a['tag']:
+                self._over_plain = max(self._over_plain, over_right)
         # A page held to a window's size has nowhere to grow
         for side in () if self.figure._held else (0, 1):
             if over[side] > 0.5:

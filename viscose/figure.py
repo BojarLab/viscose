@@ -1,5 +1,6 @@
 """Figure: lays out axes, draws through glycorender's display list and writes PNG, PDF, or SVG."""
 import builtins
+import math
 import os
 import subprocess
 import sys
@@ -91,25 +92,28 @@ def _hex(rgb):
 
 def _label_groups(c, ops, height):
     """Labels as matplotlib writes text: a comment naming them, then one group whose transform starts at their position
-    in page coordinates. glycowork's annotate_figure swaps such groups for glycan drawings."""
+    in page coordinates. glycowork's annotate_figure swaps such groups for glycan drawings, and data-right tells it how
+    far on the page those it leaves as text reach."""
     groups = {}
     for op in ops:
         groups.setdefault(op['label'], []).append(op)
     out = []
     for key, members in groups.items():
         a, b, cc, d, e, f = members[0]['ctm']
-        paths = []
+        paths, right = [], 0.0
         for op in members:
             if op['kind'] == 'path':
+                segments = op['path']
                 paths.append('<path d="%s" fill="none" stroke="%s" stroke-width="%.2f" stroke-linecap="round" '
                              'stroke-linejoin="round" />'
-                             % (_path_data(op['path']), _hex(op['stroke_rgb']), op['line_width']))
+                             % (_path_data(segments), _hex(op['stroke_rgb']), op['line_width']))
             else:
-                glyphs = text.outline(c, op['ttf'], op['text'], op['x'], op['y'], op['size'])
-                paths.append('<path d="%s" fill="%s" />' % (_path_data(glyphs.ops), _hex(op['fill_rgb'])))
+                segments = text.outline(c, op['ttf'], op['text'], op['x'], op['y'], op['size']).ops
+                paths.append('<path d="%s" fill="%s" />' % (_path_data(segments), _hex(op['fill_rgb'])))
+            right = max([right] + [x for s in segments for x in s[1::2]])
         comment = '<!-- %s -->\n' % key[2] if '--' not in key[2] else ''
-        out.append('%s<g transform="translate(%.2f %.2f) matrix(%.6g %.6g %.6g %.6g 0 0)">%s</g>'
-                   % (comment, e, height - f, a, -b, cc, -d, ''.join(paths)))
+        out.append('%s<g transform="translate(%.2f %.2f) matrix(%.6g %.6g %.6g %.6g 0 0)" data-right="%.2f">%s</g>'
+                   % (comment, e, height - f, a, -b, cc, -d, e + a * right, ''.join(paths)))
     return '\n'.join(out)
 
 
@@ -244,6 +248,16 @@ class Figure:
                 ox, oy, ow, oh = other.rect
                 ax.rect = (ox, y, ow, h) if axis == 'x' else (x, oy, w, oh)
 
+    def _width_unlabeled(self):
+        """The width of the settled page without the room glycan labels took on its right. Only the last column's growth
+        can go, as earlier ones have other columns to their right and axes at fixed fractions move with the page."""
+        if self._grid is None or any(ax._fixed is not None for ax in self.axes):
+            return self.width
+        last = [ax for ax in self.axes if ax._cell[1] == self._grid[1] - 1]
+        grown = max([ax._over[1] for ax in last], default = 0.0)
+        needed = max([ax._over_plain for ax in last], default = -math.inf)
+        return min(self.width, max(self.width - grown, self.width + needed))
+
     def _canvas(self, stamp_dpi = None, marker_forms = False, layout = True):
         """Everything drawn onto a fresh display list; `stamp_dpi` names a raster output, where many discs become an
         image, and `marker_forms` a PDF, where markers of one size can be one stored shape."""
@@ -353,7 +367,9 @@ class Figure:
         labels = [o for o in c.ops if o.get('label')]
         c.ops = [o for o in c.ops if not o.get('label')]
         svg = _with_ids(c.to_svg(), c.ops)
-        page = '<rect width="%g" height="%g" fill="%s" />\n' % (self.width, self.height, self.pal.css('paper'))
+        # With glycan labels, the width the page needs without them, down to which annotate_figure can crop it
+        bare = ' data-width-unlabeled="%.2f"' % self._width_unlabeled() if labels else ''
+        page = '<rect width="%g" height="%g" fill="%s"%s />\n' % (self.width, self.height, self.pal.css('paper'), bare)
         svg = svg.replace('<g transform="matrix(', page + '<g transform="matrix(', 1)
         # Tells slate this is a figure, ahead of the gradients' long <defs> and through annotate_figure. It cannot be a
         # comment, as annotate_figure takes every comment and all that follows up to the next </g> for a label
