@@ -147,6 +147,7 @@ class Figure:
         self.width, self.height = width * 72.0, height * 72.0
         self._base = (self.width, self.height)
         self.axes = []
+        self._calls, self._inside = [], 0
         self._title, self._subtitle = '', ''
         self._grid, self._held = None, False
 
@@ -154,6 +155,25 @@ class Figure:
         """The figure's title in the palette's manner, with an optional line under it."""
         self._title, self._subtitle = title, subtitle
         return self
+
+    def in_palette(self, palette):
+        """A new figure in another palette, as if drawn in that one from the start: the plot calls that made this one
+        run again. Shades, `ink`, and `muted` follow the palette, and colors given as hex or by CSS name stay."""
+        fig = Figure(palette = palette)
+        fig._base, fig.width, fig.height = self._base, *self._base
+        fig._title, fig._subtitle, fig._grid, fig._held = self._title, self._subtitle, self._grid, self._held
+        twins = {id(ax): Axes(fig, fig.pal) for ax in self.axes}
+        for ax in self.axes:
+            twin = twins[id(ax)]
+            twin._cell, twin._fixed = ax._cell, ax._fixed
+            twin._align = {axis: twins[id(other)] for axis, other in ax._align.items()}
+            fig.axes.append(twin)
+        swap = lambda v: twins[id(v)] if isinstance(v, Axes) else v
+        for ax, name, args, kwargs in self._calls:
+            getattr(twins[id(ax)], name)(*map(swap, args), **{k: swap(v) for k, v in kwargs.items()})
+        if hasattr(self, 'row_order'):
+            fig.row_order, fig.col_order = self.row_order, self.col_order
+        return fig
 
     def add_axes(self, rect):
         """Axes at a fixed (left, bottom, width, height) rectangle in figure fractions."""
@@ -446,6 +466,9 @@ def clustermap(data, xticklabels = None, yticklabels = None, method = 'average',
     m = np.asarray(data, dtype = float)
     x, x_step, x_all = _given_labels(xticklabels, list(data.columns) if frame else None, m.shape[1])
     y, y_step, y_all = _given_labels(yticklabels, list(data.index) if frame else None, m.shape[0])
+    # Each row's and column's own name, also where its label stays undrawn
+    row_names = list(data.index) if y is None and frame else y
+    column_names = list(data.columns) if x is None and frame else x
     # One row or column has nothing to be clustered with
     row_cluster, col_cluster = row_cluster and m.shape[0] > 1, col_cluster and m.shape[1] > 1
     if ((row_cluster and row_linkage is None) or (col_cluster and col_linkage is None)) and not np.isfinite(m).all():
@@ -468,11 +491,13 @@ def clustermap(data, xticklabels = None, yticklabels = None, method = 'average',
     col_order = cols['leaves'] if col_cluster else list(range(m.shape[1]))
     fig, axes = subplots(2, 2, figsize, palette, width_ratios = [1, 7], height_ratios = [1, 9])
     fig.suptitle(title, subtitle)
+    names = (None if row_names is None else [row_names[i] for i in row_order],
+             None if column_names is None else [column_names[i] for i in col_order])
     heat = axes[1][1].heatmap(m[row_order][:, col_order],
                               None if x is None else [x[i] if j % x_step == 0 else '' for j, i in enumerate(col_order)],
                               None if y is None else [y[i] if j % y_step == 0 else '' for j, i in enumerate(row_order)],
                               cmap = cmap, show_all = (show_all or x_all, show_all or y_all), vmin = vmin, vmax = vmax,
-                              center = center)
+                              center = center, names = names)
     heat.set_xlabel(xlabel)
     heat.set_ylabel(ylabel)
     top = axes[0][1].dendrogram(cols['icoord'], cols['dcoord'], 'top', m.shape[1]) if col_cluster else axes[0][1].off()

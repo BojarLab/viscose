@@ -674,6 +674,97 @@ def test_hue_style_and_size_map_to_color_shape_and_area():
     assert fig.to_png(72)[:4] == b'\x89PNG'
 
 
+def _every_plot(palette):
+    x = np.linspace(0.1, 9, 30)
+    fig, axes = vc.subplots(3, 3, figsize = (12, 11), palette = palette)
+    fig.suptitle('Every plot', 'in one figure')
+    axes[0][0].plot(x, np.sin(x), label = 'sine', marker = True)
+    axes[0][0].axhline(0.5, label = 'half')
+    axes[0][0].legend()
+    axes[0][1].scatter(x, np.cos(x), hue = ['a', 'b', 'c'] * 10, size = x, style = ['p', 'q'] * 15)
+    axes[0][2].bar([1, 2, 3], [3, 1, 2], color = ['a1', '#112233', 'tomato'])
+    axes[1][0].hist(np.sin(x), bins = 8)
+    axes[1][0].fill_between(x[:5], 1, 2)
+    axes[1][1].boxplot({'one': x[:15], 'two': x[15:]})
+    axes[1][1].annotate('a note', (0, 3))
+    axes[1][2].heatmap(np.outer(x[:6], x[:4]), annot = True)
+    axes[2][0].stacked_bar([1, 2], [[1, 2], [3, 4]], labels = ['u', 'v'])
+    axes[2][0].set(xlabel = 'x', ylabel = 'y')
+    axes[2][1].ridgeline(x, [np.sin(x) + 1, np.cos(x) + 1], labels = ['r', 's'])
+    axes[2][2].stem(x[:6], x[:6])
+    axes[2][2].set_yscale('log')
+    axes[2][2].errorbar(x[:6], x[:6], 0.1)
+    return fig
+
+
+def test_a_figure_in_another_palette_equals_one_drawn_in_it():
+    moved, direct = _every_plot('poster').in_palette('couture'), _every_plot('couture')
+    assert moved.pal.name == 'couture'
+    assert moved.to_png(72.0) == direct.to_png(72.0)
+    assert moved.to_pdf() == direct.to_pdf()
+    twice = _every_plot('lumen').in_palette('aura').in_palette('poster')
+    assert twice.to_png(72.0) == _every_plot('poster').to_png(72.0)
+
+
+def test_rendering_records_nothing_and_leaves_the_original_alone():
+    fig = _every_plot('poster')
+    before = fig.to_png(72.0)
+    calls = len(fig._calls)
+    fig.to_svg()
+    fig.in_palette('aura').to_svg()
+    assert len(fig._calls) == calls and fig.pal.name == 'poster' and fig.to_png(72.0) == before
+
+
+def test_a_clustermap_in_another_palette_equals_one_drawn_in_it():
+    pytest.importorskip('scipy')
+    data = np.random.default_rng(1).normal(0, 1, (12, 6))
+    fig, heat = vc.clustermap(data, palette = 'poster', title = 'Map', colorbar_label = 'z')
+    direct = vc.clustermap(data, palette = 'aura', title = 'Map', colorbar_label = 'z')[0]
+    moved = fig.in_palette('aura')
+    assert moved.row_order == fig.row_order and moved.to_png(72.0) == direct.to_png(72.0)
+
+
+def test_a_figure_held_to_a_window_stays_held_in_another_palette():
+    fig, ax = vc.subplots(palette = 'poster')
+    ax.plot([1, 2], [3, 4], label = 'a long name that needs room on the page')
+    fig.set_size(3, 2)
+    moved = fig.in_palette('aura')
+    moved.layout()
+    assert (moved.width, moved.height) == (3 * 72.0, 2 * 72.0)
+
+
+def test_names_follow_their_points_through_the_groups():
+    fig, ax = vc.subplots()
+    ax.scatter([1, 2, 3], [4, 5, 6], hue = ['a', 'b', 'a'], names = ['one', 'two', 'three'])
+    points = [a for a in ax.artists if a['kind'] == 'points']
+    assert [(a['x'].tolist(), a['names'].tolist()) for a in points] == [([1, 3], ['one', 'three']), ([2], ['two'])]
+    plain, axis = vc.subplots()
+    axis.scatter([1, 2], [3, 4], names = ['one', 'two'])
+    assert axis.artists[0]['names'].tolist() == ['one', 'two']
+    plain.to_svg()
+    with pytest.raises(ValueError):
+        axis.scatter([1, 2], [3, 4], names = ['one'])
+
+
+def test_heatmap_cells_know_their_names_also_undrawn():
+    fig, ax = vc.subplots()
+    ax.heatmap(np.eye(2), ['s1', 's2'], ['g1', 'g2'])
+    assert (ax.artists[0]['rows'], ax.artists[0]['columns']) == (['g1', 'g2'], ['s1', 's2'])
+    ax.heatmap(np.eye(2), names = (['g1', 'g2'], None))
+    assert (ax.artists[1]['rows'], ax.artists[1]['columns']) == (['g1', 'g2'], None)
+    with pytest.raises(ValueError):
+        ax.heatmap(np.eye(2), names = (['g1'], None))
+    frame = type('Frame', (), {'columns': list('xyz'), 'index': list('abcd'),
+                               '__array__': lambda self, *a, **k: np.arange(12.0).reshape(4, 3) ** 2})()
+    fig, heat = vc.clustermap(frame, xticklabels = 2, yticklabels = False, palette = 'couture')
+    cells = heat.artists[0]
+    assert cells['rows'] == [frame.index[i] for i in fig.row_order]
+    assert cells['columns'] == [frame.columns[i] for i in fig.col_order]
+    assert not heat._ytl and fig.to_svg()
+    fig, heat = vc.clustermap(np.arange(12.0).reshape(4, 3) ** 2, palette = 'couture')
+    assert heat.artists[0]['rows'] is None and heat.artists[0]['columns'] is None
+
+
 def test_hue_keeps_explicit_colors_and_markers():
     fig, ax = vc.subplots(palette = 'lumen')
     ax.scatter([0, 1], [0, 1], hue = ['up', 'down'], colors = {'up': 'a1', 'down': 'b1'}, style = ['p', 'q'],

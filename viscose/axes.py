@@ -1,4 +1,5 @@
 """Axes: records what to draw, then lays it out and draws it once the figure is rendered."""
+import functools
 import math
 import numbers
 import numpy as np
@@ -194,14 +195,19 @@ class Axes:
     def scatter(self, x, y, s = 30, color = None, c = None, label = None, alpha = 1.0, cmap = 'sequential', vmin = None,
                 vmax = None, z = 3, marker = 'o', edge = None, gid = None, hue = None, style = None, size = None,
                 sizes = (20.0, 160.0), colors = None, markers = None, hue_label = None, style_label = None,
-                size_label = None, legend = 'right'):
+                size_label = None, legend = 'right', names = None):
         """Points, as in seaborn's scatterplot. `hue`, `style`, and `size` hold one value per point and map to color,
         marker shape, and area, with a legend. Numeric `hue` with many values, or `c`, maps through a palette scale;
         call `colorbar` to show it. `colors` and `markers` are lists or {value: name} dicts. `edge` is (color, width),
-        which with color = 'none' draws hollow rings.
+        which with color = 'none' draws hollow rings. `names` holds one label per point, which draws nothing but tells a
+        viewer such as slate what the point under the mouse is.
         """
         x, y = np.atleast_1d(self._pos(x, 'x')), np.atleast_1d(self._pos(y, 'y'))
         _check_lengths(x, y)
+        if names is not None:
+            names = np.atleast_1d(np.asarray(names, dtype = object))
+            if names.shape != x.shape:
+                raise ValueError(f'names has to hold one label per point, got {names.size} for {x.size} points')
         _check_marker(marker)
         edge = None if edge is None else (self.pal.color(edge[0]), edge[1])
         if hue is not None and _numeric(hue) and len(np.unique(hue)) > 8:
@@ -209,7 +215,7 @@ class Axes:
         if hue is None and style is None and size is None and c is None:
             rgb = self._next_color(color)
             self._add('points', z, x = x, y = y, s = s, rgb = rgb, alpha = alpha, marker = marker, edge = edge,
-                      gid = gid)
+                      gid = gid, names = names)
             self._labeled(label, rgb, 'point', marker)
             return self
         n = len(x)
@@ -266,7 +272,8 @@ class Axes:
                 for chosen, rgb in groups:
                     if chosen.any():
                         self._add('points', z, x = x[chosen], y = y[chosen], s = area[chosen], rgb = rgb, alpha = alpha,
-                                  marker = style_marker[st], edge = edge, gid = gid)
+                                  marker = style_marker[st], edge = edge, gid = gid,
+                                  names = None if names is None else names[chosen])
         sections = (hue is not None) + (style is not None) + (size is not None)
         plain = self.pal.color(self.pal.muted) if hue is not None else hue_rgb['']
         if hue is not None:
@@ -512,15 +519,21 @@ class Axes:
 
     def heatmap(self, data, xticklabels = None, yticklabels = None, cmap = 'diverging', vmin = None, vmax = None,
                 center = 0.0, labels_right = True, show_all = False, colorbar = False, colorbar_label = '',
-                annot = False, fmt = '.2f', annot_size = 8.0):
+                annot = False, fmt = '.2f', annot_size = 8.0, names = None):
         """A matrix of cells, first row at the top, where NaN is left empty. `cmap` is diverging, sequential, or
         sequential_r, which puts the darkest color at the lowest value. Too many labels are thinned unless show_all,
         which can also be a pair for the x and y axes; the page grows for those that must all show. `annot` writes each
-        cell's value into it, formatted by `fmt`, in whichever of ink or white reads over the cell."""
+        cell's value into it, formatted by `fmt`, in whichever of ink or white reads over the cell. `names` holds the
+        rows' and the columns' labels as a pair, by default the tick labels, which draws nothing but tells a viewer such
+        as slate what the cell under the mouse is."""
         _check_cmap(cmap)
         m = np.asarray(data, dtype = float)
         if m.ndim != 2 or not m.size:
             raise ValueError(f'A heatmap needs rows and columns of at least one cell, got an array of shape {m.shape}')
+        rows, columns = (yticklabels, xticklabels) if names is None else names
+        for given, n, what in ((rows, m.shape[0], 'row'), (columns, m.shape[1], 'column')):
+            if names is not None and given is not None and len(given) != n:
+                raise ValueError(f'names has to hold one label per {what}, got {len(given)} for {n} {what}s')
         self.show_all = show_all if isinstance(show_all, tuple) else (show_all, show_all)
         known = m[np.isfinite(m)]
         if cmap == 'diverging':
@@ -536,7 +549,8 @@ class Axes:
             t = (m - lo) / (hi - lo if hi > lo else 1.0)
         self._scale = dict(cmap = cmap, lo = float(lo), hi = float(hi))
         rgb = getattr(self.pal, cmap)(t)
-        self._add('heat', 2, m = m, rgb = rgb)
+        self._add('heat', 2, m = m, rgb = rgb, rows = None if rows is None else [str(v) for v in rows],
+                  columns = None if columns is None else [str(v) for v in columns])
         if annot:
             for r, j in np.argwhere(np.isfinite(m)):
                 self.annotate(format(m[r, j], fmt), (j + 0.5, m.shape[0] - r - 0.5), size = annot_size, halo = 0.0,
@@ -1472,3 +1486,26 @@ class Axes:
                 marks.polygon(c, [x, x + 12.0, x + 12.0, x], [y - 4.5, y - 4.5, y + 4.5, y + 4.5], rgb)
             text.draw(c, x + 17.0, y, s, size, pal.color(pal.ink), pal.text_bold, va = 'center', tracking = track,
                       halo = 0.0 if loc in ('right', 'below') else 2.6, halo_color = pal.color('paper'))
+
+
+def _recorded(method):
+    """Notes a call on its figure for Figure.in_palette, as colors, widths, and the like are settled from the palette
+    when a plot method runs. Only the outermost call: what it calls in turn would run again by itself in a replay."""
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        fig = self.figure
+        fig._inside += 1
+        try:
+            result = method(self, *args, **kwargs)
+        finally:
+            fig._inside -= 1
+        if not fig._inside:
+            fig._calls.append((self, method.__name__, args, kwargs))
+        return result
+    return call
+
+
+# All that only asks or converts is left out; a method that fails records nothing, as it changed nothing to replay
+for _name, _method in list(vars(Axes).items()):
+    if callable(_method) and _name[0] != '_' and _name not in ('get_xlim', 'get_ylim', 'page', 'data'):
+        setattr(Axes, _name, _recorded(_method))

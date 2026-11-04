@@ -111,6 +111,8 @@ fig, heat = vc.clustermap(df, palette = 'aura', title = 'Glycan abundance by tis
 | **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, for placing things yourself or answering a mouse |
 | **Display** | `fig.show()` works inline in Jupyter and slate, and in the system's image viewer from a terminal, with CI and coding agents kept silent |
 | **SVG hooks** | `gid` on `arrow` and `scatter` names elements for hover text and scripting |
+| **Names** | `names` on `scatter` labels each point, and on `heatmap` each row and column, which draws nothing but lets slate show what is under the mouse |
+| **Palettes** | `fig.in_palette('aura')` gives the same figure in another palette, exactly as if it had been drawn in that one |
 | **State** | None hidden: a figure is an object, with no current figure and nothing to close |
 
 ## Light and quick
