@@ -45,7 +45,7 @@ jobs:
       - name: Install package and test deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --editable ".[dev,cluster]"
+          python -m pip install --editable ".[dev]"
       - name: Run tests
         run: pytest -q tests
 
@@ -62,7 +62,7 @@ jobs:
       - name: Install package and test deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --editable ".[dev,cluster]"
+          python -m pip install --editable ".[dev]"
           python -m pip install "glycorender==$(sed -n 's/.*"glycorender>=\([0-9.]*\)".*/\1/p' pyproject.toml)"
       - name: Run tests
         run: pytest -q tests

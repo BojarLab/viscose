@@ -7,3 +7,4 @@ gallery/
 examples/features_*.png
 CLAUDE.md
 .claude/*
+.stfolder/*

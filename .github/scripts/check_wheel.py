@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""Check a built distribution: the wheel holds the whole package, and draws from a clean venv away from the checkout.
+"""Check a built distribution: the wheel holds the whole package, and draws from a clean venv away from the checkout,
+clustermaps included, without scipy.
 
 Usage:
   python .github/scripts/check_wheel.py dist
@@ -13,7 +14,9 @@ import zipfile
 from pathlib import Path
 
 SMOKE = """
+import importlib.util
 import viscose as vc
+assert importlib.util.find_spec('scipy') is None, 'scipy is in the venv, so it cannot show that clustermaps need none'
 assert 'site-packages' in vc.__file__ and vc.__version__ != '0.0.0', (vc.__file__, vc.__version__)
 for name in vc.palettes:
     fig, ax = vc.subplots(palette = name)
@@ -21,6 +24,8 @@ for name in vc.palettes:
     ax.bar([0, 1], [1, 2])
     ax.legend()
     assert fig.to_png(72)[:4] == b'\\x89PNG' and fig.to_pdf()[:4] == b'%PDF' and '<svg' in fig.to_svg(), name
+    fig, heat = vc.clustermap([[0.0, 1.0, 2.0], [2.0, 1.0, 0.5], [1.0, 1.5, 3.0]], palette = name)
+    assert fig.to_png(72)[:4] == b'\\x89PNG' and sorted(fig.row_order) == [0, 1, 2], name
 print(f'viscose {vc.__version__} draws all {len(vc.palettes)} palettes from {vc.__file__}')
 """
 dist = Path(sys.argv[1]).resolve()

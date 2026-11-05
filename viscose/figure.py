@@ -22,6 +22,12 @@ SHADOW_DX, SHADOW_DY, SHADOW_BLUR, SHADOW_DPI = 1.2, 5.0, 4.7, 100.0
 PLOT_SHARE_MARGINS = 0.55
 # Coding agents and CI can hold a real console, so a terminal alone does not mean someone wants a window per figure
 NO_VIEWER = ('CLAUDECODE', 'CI', 'PYTEST_CURRENT_TEST', 'VISCOSE_NO_VIEWER')
+# What clustermap clusters by, as scipy names them
+LINKAGES = ('single', 'complete', 'average', 'weighted', 'centroid', 'median', 'ward')
+METRICS = ('euclidean', 'sqeuclidean', 'cityblock', 'chebyshev', 'cosine', 'correlation', 'braycurtis', 'canberra',
+           'jensenshannon')
+# Elements per block of a min-plus product, which keeps each block in the processor's cache
+MINPLUS_BLOCK = 1 << 16
 
 
 def show_png(png, viewer = True):
@@ -450,18 +456,221 @@ def _given_labels(given, names, n):
     return names if given is None else given, 1, False
 
 
+def linkage(data, method = 'average', metric = 'euclidean', optimal_ordering = True):
+    """Hierarchical clustering of the rows of data, joining the closest two clusters each time, in scipy's format: per
+    merge the two clusters (rows by index, then merges by their step plus the number of rows), their distance, and the
+    new size. Methods and metrics are clustermap's. With optimal_ordering, each link's children come in the order that
+    puts neighbors as close as the tree allows, found exactly. Distances and merges are scipy's, apart from the order of
+    exactly tied merges, so the result also goes into scipy's own functions."""
+    m = np.asarray(data, dtype = float)
+    if m.ndim != 2 or len(m) < 2 or not np.isfinite(m).all():
+        raise ValueError('Clustering needs a table of finite values with at least two rows')
+    if method not in LINKAGES:
+        raise ValueError(f"Unknown method '{method}'; use one of {', '.join(LINKAGES)}")
+    if method in ('centroid', 'median', 'ward') and metric != 'euclidean':
+        raise ValueError(f"Method '{method}' needs metric = 'euclidean'")
+    if not callable(metric) and metric not in METRICS:
+        raise ValueError(f"Unknown metric '{metric}'; use one of {', '.join(METRICS)}, or a function of two rows")
+    if metric == 'jensenshannon' and (m < 0).any():
+        raise ValueError('The jensenshannon distance compares abundances, which cannot be negative')
+    n = len(m)
+    if callable(metric):
+        d = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                d[i, j] = d[j, i] = metric(m[i], m[j])
+    elif metric in ('cosine', 'correlation'):
+        u = m - m.mean(1, keepdims = True) if metric == 'correlation' else m
+        with np.errstate(invalid = 'ignore', divide = 'ignore'):
+            u = u / np.sqrt((u * u).sum(1, keepdims = True))
+        d = np.clip(1.0 - u @ u.T, 0.0, 2.0)
+    else:
+        d = np.empty((n, n))
+        p = m / m.sum(1, keepdims = True) if metric == 'jensenshannon' else m
+        # Rows a block at a time, so that their differences take at most about 32 MB
+        block = max(1, 4_000_000 // max(n * m.shape[1], 1))
+        with np.errstate(invalid = 'ignore', divide = 'ignore'):
+            for i in range(0, n, block):
+                a, b = p[i:i + block, None, :], p[None, :, :]
+                if metric in ('euclidean', 'sqeuclidean'):
+                    d[i:i + block] = ((a - b) ** 2).sum(-1)
+                elif metric == 'cityblock':
+                    d[i:i + block] = np.abs(a - b).sum(-1)
+                elif metric == 'chebyshev':
+                    d[i:i + block] = np.abs(a - b).max(-1)
+                elif metric == 'braycurtis':
+                    d[i:i + block] = np.abs(a - b).sum(-1) / np.abs(a + b).sum(-1)
+                elif metric == 'canberra':
+                    d[i:i + block] = np.nan_to_num(np.abs(a - b) / (np.abs(a) + np.abs(b)), nan = 0.0).sum(-1)
+                else:
+                    half = (a + b) / 2
+                    terms = np.where(a > 0, a * np.log(a / half), 0.0) + np.where(b > 0, b * np.log(b / half), 0.0)
+                    d[i:i + block] = np.sqrt(np.maximum(terms.sum(-1) / 2, 0.0))
+        if metric == 'euclidean':
+            np.sqrt(d, out = d)
+    np.fill_diagonal(d, 0.0)
+    if not np.isfinite(d).all():
+        raise ValueError(f'The {metric} distance is undefined between some rows, such as constant ones for correlation '
+                         'or rows of zeros for cosine and jensenshannon')
+    # Centroid, median, and Ward update squared distances
+    squared = method in ('centroid', 'median', 'ward')
+    work = d ** 2 if squared else d.copy()
+    np.fill_diagonal(work, np.inf)
+    size, ids, alive = np.ones(n), np.arange(n), np.ones(n, bool)
+    near = work.argmin(1)
+    best = work[np.arange(n), near]
+    z = np.empty((n - 1, 4))
+    for step in range(n - 1):
+        i = int(best.argmin())
+        i, j = sorted((i, int(near[i])))
+        a, b, dij, ni, nj = work[i], work[j], work[i, j], size[i], size[j]
+        if method == 'single':
+            new = np.minimum(a, b)
+        elif method == 'complete':
+            new = np.maximum(a, b)
+        elif method == 'average':
+            new = (ni * a + nj * b) / (ni + nj)
+        elif method == 'weighted':
+            new = (a + b) / 2
+        elif method == 'centroid':
+            new = (ni * a + nj * b) / (ni + nj) - ni * nj * dij / (ni + nj) ** 2
+        elif method == 'median':
+            new = a / 2 + b / 2 - dij / 4
+        else:
+            new = ((ni + size) * a + (nj + size) * b - size * dij) / (ni + nj + size)
+        z[step] = min(ids[i], ids[j]), max(ids[i], ids[j]), np.sqrt(max(dij, 0.0)) if squared else dij, ni + nj
+        new[i] = new[j] = np.inf
+        work[i], work[:, i], work[j], work[:, j] = new, new, np.inf, np.inf
+        size[i], ids[i], alive[j], best[j] = ni + nj, n + step, False, np.inf
+        # Only rows whose nearest cluster was just merged need a new search; any other can only come closer to it
+        stale = alive & ((near == i) | (near == j))
+        stale[i] = True
+        closer = ~stale & (new < best)
+        near[closer], best[closer] = i, new[closer]
+        rows = np.flatnonzero(stale)
+        near[rows] = work[rows].argmin(1)
+        best[rows] = work[rows, near[rows]]
+    return _optimal_order(z, d) if optimal_ordering else z
+
+
+def _minplus(p, q):
+    """The min-plus product of two matrices, in blocks small enough to stay in the processor's cache."""
+    a, b = p.shape
+    c = q.shape[1]
+    if b <= min(a, c):
+        out, part = p[:, :1] + q[:1], np.empty((a, c))
+        for k in range(1, b):
+            np.minimum(out, np.add(p[:, k:k + 1], q[k:k + 1], out = part), out = out)
+        return out
+    out = np.empty((a, c))
+    if c < a:
+        # Few columns: each reduces along contiguous rows of p plus one column of q
+        qt, rows = np.ascontiguousarray(q.T), max(1, MINPLUS_BLOCK // b)
+        for k in range(c):
+            for i in range(0, a, rows):
+                np.min(p[i:i + rows] + qt[k], axis = 1, out = out[i:i + rows, k])
+        return out
+    cols = min(c, max(1, MINPLUS_BLOCK // b))
+    rows = max(1, MINPLUS_BLOCK // (b * cols))
+    for j in range(0, c, cols):
+        for i in range(0, a, rows):
+            np.min(p[i:i + rows, :, None] + q[:, j:j + cols], axis = 1, out = out[i:i + rows, j:j + cols])
+    return out
+
+
+def _ends(c, s, n, lo, mid, hi, cost):
+    """Where an order of cluster c that starts at leaf s can end, by rank, and at what cost."""
+    if c < n:
+        return np.array([s]), np.zeros(1)
+    if s < mid[c]:
+        return np.arange(mid[c], hi[c]), cost[c][s - lo[c]]
+    return np.arange(lo[c], mid[c]), cost[c][:, s - mid[c]]
+
+
+def _optimal_order(z, d):
+    """Turns links so that neighboring leaves lie as close as the tree allows, by the sum of distances between
+    neighbors, which Bar-Joseph et al. (2001) find exactly in cubic time. Gives z with each link's children in drawing
+    order."""
+    n = len(z) + 1
+    kids = z[:, :2].astype(int)
+    # Leaves in the tree's own order, so that each cluster is one stretch from lo to hi, its first child up to mid
+    seq, stack = [], [2 * n - 2]
+    while stack:
+        c = stack.pop()
+        if c < n:
+            seq.append(c)
+        else:
+            stack += [kids[c - n, 1], kids[c - n, 0]]
+    rank = np.empty(n, int)
+    rank[seq] = np.arange(n)
+    lo, hi = np.empty(2 * n - 1, int), np.empty(2 * n - 1, int)
+    lo[:n], hi[:n] = rank, rank + 1
+    for i, (a, b) in enumerate(kids):
+        lo[n + i], hi[n + i] = lo[a], hi[b]
+    mid = np.concatenate([rank, hi[kids[:, 0]]])
+    near = d[np.ix_(seq, seq)]
+    # Per cluster, the least cost of an order that starts at u in its first child and ends at w in its second
+    cost = {}
+    for i, (a, b) in enumerate(kids):
+        if a < n:
+            part = near[lo[a]:hi[a], lo[b]:hi[b]]
+        else:
+            part = np.vstack([_minplus(cost[a], near[mid[a]:hi[a], lo[b]:hi[b]]),
+                              _minplus(cost[a].T, near[lo[a]:mid[a], lo[b]:hi[b]])])
+        if b >= n:
+            k = mid[b] - lo[b]
+            part = np.hstack([_minplus(part[:, k:], cost[b].T), _minplus(part[:, :k], cost[b])])
+        cost[n + i] = part
+    u, w = np.unravel_index(cost[2 * n - 2].argmin(), cost[2 * n - 2].shape)
+    stack, turn = [(2 * n - 2, lo[-1] + u, mid[-1] + w)], np.zeros(n - 1, bool)
+    while stack:
+        c, s, e = stack.pop()
+        if c < n:
+            continue
+        first, second = kids[c - n]
+        if s >= mid[c]:
+            turn[c - n], first, second = True, second, first
+        xs, cx = _ends(first, s, n, lo, mid, hi, cost)
+        ys, cy = _ends(second, e, n, lo, mid, hi, cost)
+        x, y = np.unravel_index((cx[:, None] + near[np.ix_(xs, ys)] + cy).argmin(), (len(xs), len(ys)))
+        stack += [(first, s, xs[x]), (second, ys[y], e)]
+    z = z.copy()
+    z[turn, :2] = z[turn, 1::-1]
+    return z
+
+
+def _tree(z):
+    """What scipy's dendrogram gives for drawing: the leaves in order, and each link's corners, children first."""
+    z = np.asarray(z, dtype = float)
+    n = len(z) + 1
+    leaves, icoord, dcoord, x, h = [], [], [], {}, {}
+    stack = [(2 * n - 2, False)]
+    while stack:
+        c, done = stack.pop()
+        if c < n:
+            x[c], h[c] = 10.0 * len(leaves) + 5.0, 0.0
+            leaves.append(c)
+        elif done:
+            a, b = int(z[c - n, 0]), int(z[c - n, 1])
+            icoord.append([x[a], x[a], x[b], x[b]])
+            dcoord.append([h[a], z[c - n, 2], z[c - n, 2], h[b]])
+            x[c], h[c] = (x[a] + x[b]) / 2, z[c - n, 2]
+        else:
+            stack += [(c, True), (int(z[c - n, 1]), False), (int(z[c - n, 0]), False)]
+    return {'leaves': leaves, 'icoord': icoord, 'dcoord': dcoord}
+
+
 def clustermap(data, xticklabels = None, yticklabels = None, method = 'average', metric = 'euclidean',
                cmap = 'diverging', figsize = (8.0, 8.0), palette = None, title = '', subtitle = '', show_all = False,
                row_linkage = None, col_linkage = None, row_cluster = True, col_cluster = True, vmin = None, vmax = None,
                center = 0.0, xlabel = '', ylabel = '', colorbar = True, colorbar_label = ''):
-    """A heatmap with both dendrograms and a color bar, as in seaborn. Needs scipy. A DataFrame brings its own labels,
-    and xticklabels and yticklabels can be True for all, False for none, or an integer for every n-th. Returns the
-    figure and the heatmap's axes; the figure's row_order and col_order hold the data's rows and columns as drawn,
-    first row at the top."""
-    try:
-        from scipy.cluster.hierarchy import dendrogram, linkage
-    except ImportError as e:
-        raise ImportError('clustermap needs scipy: pip install "viscose[cluster]"') from e
+    """A heatmap with both dendrograms and a color bar, as in seaborn. A DataFrame brings its own labels, and
+    xticklabels and yticklabels can be True for all, False for none, or an integer for every n-th. Rows and columns are
+    clustered by `method` (single, complete, average, weighted, centroid, median, or ward) on the `metric` distance
+    (euclidean, sqeuclidean, cityblock, chebyshev, cosine, correlation, braycurtis, canberra, jensenshannon, or a
+    function of two rows), and each tree's links turned so that neighbors are as alike as the tree allows. Linkages
+    passed in scipy's format are drawn as they are. Returns the figure and the heatmap's axes; the figure's row_order
+    and col_order hold the data's rows and columns as drawn, first row at the top."""
     frame = hasattr(data, 'index') and hasattr(data, 'columns')
     m = np.asarray(data, dtype = float)
     x, x_step, x_all = _given_labels(xticklabels, list(data.columns) if frame else None, m.shape[1])
@@ -474,19 +683,11 @@ def clustermap(data, xticklabels = None, yticklabels = None, method = 'average',
     if ((row_cluster and row_linkage is None) or (col_cluster and col_linkage is None)) and not np.isfinite(m).all():
         raise ValueError('Clustering needs finite values: fill in what is missing, pass row_linkage and col_linkage, '
                          'or set row_cluster and col_cluster to False')
-    # Scipy walks the tree recursively, one level per row in the worst case
-    limit = sys.getrecursionlimit()
-    sys.setrecursionlimit(max(limit, 2 * max(m.shape) + 200))
-    try:
-        rows = cols = None
-        if row_cluster:
-            rows = dendrogram(linkage(m, method, metric,
-                                      optimal_ordering = True) if row_linkage is None else row_linkage, no_plot = True)
-        if col_cluster:
-            cols = dendrogram(linkage(m.T, method, metric,
-                                      optimal_ordering = True) if col_linkage is None else col_linkage, no_plot = True)
-    finally:
-        sys.setrecursionlimit(limit)
+    rows = cols = None
+    if row_cluster:
+        rows = _tree(linkage(m, method, metric) if row_linkage is None else row_linkage)
+    if col_cluster:
+        cols = _tree(linkage(m.T, method, metric) if col_linkage is None else col_linkage)
     row_order = rows['leaves'][::-1] if row_cluster else list(range(m.shape[0]))
     col_order = cols['leaves'] if col_cluster else list(range(m.shape[1]))
     fig, axes = subplots(2, 2, figsize, palette, width_ratios = [1, 7], height_ratios = [1, 9])

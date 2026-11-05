@@ -126,7 +126,6 @@ def test_labels_leave_room_inside_the_page():
 
 
 def test_clustermap_dendrograms_line_up_with_the_matrix():
-    pytest.importorskip('scipy')
     m = np.random.default_rng(1).normal(size = (6, 4))
     fig, heat = vc.clustermap(m, list('abcd'), list('uvwxyz'), palette = 'couture', title = 'T')
     fig._layout()
@@ -716,7 +715,6 @@ def test_rendering_records_nothing_and_leaves_the_original_alone():
 
 
 def test_a_clustermap_in_another_palette_equals_one_drawn_in_it():
-    pytest.importorskip('scipy')
     data = np.random.default_rng(1).normal(0, 1, (12, 6))
     fig, heat = vc.clustermap(data, palette = 'poster', title = 'Map', colorbar_label = 'z')
     direct = vc.clustermap(data, palette = 'aura', title = 'Map', colorbar_label = 'z')[0]
@@ -804,7 +802,6 @@ def test_a_long_legend_wraps_inside_the_figure():
 
 
 def test_colorbar_on_heatmap_and_in_clustermap_corner():
-    pytest.importorskip('scipy')
     m = np.random.default_rng(1).normal(size = (6, 4))
     fig, ax = vc.subplots(figsize = (5, 4), palette = 'aura')
     ax.heatmap(m, list('abcd'), list('uvwxyz'), colorbar = True, colorbar_label = 'z-score')
@@ -1285,10 +1282,74 @@ def test_short_hex_colors():
         pal.color('bad')
 
 
-def test_clustermap_says_how_to_get_scipy():
-    with patch.dict(sys.modules, {'scipy.cluster.hierarchy': None}):
-        with pytest.raises(ImportError, match = r'viscose\[cluster\]'):
-            vc.clustermap(np.eye(3))
+def test_clustermap_needs_no_scipy():
+    with patch.dict(sys.modules, {'scipy': None, 'scipy.cluster': None, 'scipy.cluster.hierarchy': None}):
+        fig, heat = vc.clustermap(np.random.default_rng(2).normal(size = (6, 4)), palette = 'aura')
+        assert sorted(fig.row_order) == list(range(6)) and fig.to_png(36.0)[:4] == b'\x89PNG'
+
+
+def test_linkage_matches_scipy():
+    pytest.importorskip('scipy')
+    from scipy.cluster.hierarchy import dendrogram, linkage
+    from scipy.spatial.distance import pdist
+    rng = np.random.default_rng(4)
+    m = rng.normal(size = (40, 6))
+    # Canberra gives exactly 1 per coordinate of opposite signs, and so exact ties, which either order may take
+    raw = rng.gamma(1.0, 1.0, (40, 6))
+    for metric in vc.figure.METRICS:
+        data = raw if metric in ('jensenshannon', 'canberra') else m
+        for method in vc.figure.LINKAGES:
+            if method in ('centroid', 'median', 'ward') and metric != 'euclidean':
+                continue
+            ours = vc.linkage(data, method, metric, optimal_ordering = False)
+            theirs = linkage(pdist(data, metric), method)
+            assert np.array_equal(ours[:, [0, 1, 3]], theirs[:, [0, 1, 3]]), (metric, method)
+            assert np.allclose(ours[:, 2], theirs[:, 2], rtol = 1e-12), (metric, method)
+    drawn, theirs = vc.figure._tree(vc.linkage(m)), dendrogram(vc.linkage(m), no_plot = True)
+    assert drawn['leaves'] == theirs['leaves'] and drawn['icoord'] == theirs['icoord']
+    assert np.allclose(drawn['dcoord'], theirs['dcoord'], rtol = 1e-15)
+    rows = lambda u, v: np.abs(u - v).sum()
+    assert np.array_equal(vc.linkage(m[:12], 'complete', rows, False), linkage(m[:12], 'complete', 'cityblock'))
+
+
+def test_optimal_order_is_the_best_the_tree_allows():
+    from itertools import product
+    rng = np.random.default_rng(7)
+    for trial in range(60):
+        n, method = int(rng.integers(3, 10)), vc.figure.LINKAGES[trial % 7]
+        m = rng.normal(size = (n, 3))
+        d = np.sqrt(((m[:, None] - m[None]) ** 2).sum(-1))
+        z = vc.linkage(m, method, optimal_ordering = False)
+        def leaves(turn):
+            turned = z.copy()
+            turned[turn, :2] = turned[turn, 1::-1]
+            return vc.figure._tree(turned)['leaves']
+        cost = lambda order: d[order[:-1], order[1:]].sum()
+        best = min(cost(leaves(np.array(t, bool))) for t in product([False, True], repeat = n - 1))
+        ordered = vc.linkage(m, method)
+        assert cost(vc.figure._tree(ordered)['leaves']) == pytest.approx(best, abs = 1e-12)
+        assert np.array_equal(np.sort(ordered[:, :2], 1), z[:, :2]) and np.array_equal(ordered[:, 2:], z[:, 2:])
+
+
+def test_a_long_chain_clusters_without_recursion():
+    # Each point a little farther from the last, so single linkage makes a chain as deep as the data is long
+    x = np.cumsum(np.linspace(1.0, 2.0, 1500))[:, None]
+    fig, heat = vc.clustermap(np.hstack([x, x]), col_cluster = False, method = 'single', yticklabels = False)
+    assert fig.row_order in (list(range(1500)), list(range(1499, -1, -1)))
+
+
+def test_linkage_says_what_it_cannot_do():
+    m = np.random.default_rng(1).normal(size = (5, 3))
+    for kwargs, match in (({'method': 'nearest'}, 'Unknown method'), ({'metric': 'hamming'}, 'Unknown metric'),
+                          ({'method': 'ward', 'metric': 'cityblock'}, 'euclidean')):
+        with pytest.raises(ValueError, match = match):
+            vc.linkage(m, **kwargs)
+    with pytest.raises(ValueError, match = 'undefined'):
+        vc.linkage(np.vstack([m, np.ones(3)]), metric = 'correlation')
+    with pytest.raises(ValueError, match = 'negative'):
+        vc.linkage(m, metric = 'jensenshannon')
+    with pytest.raises(ValueError, match = 'finite'):
+        vc.linkage(np.where(np.eye(5, 3) > 0, np.nan, m))
 
 
 def test_subplots_returns_axes_as_matplotlib_does():
@@ -1634,7 +1695,6 @@ def test_asymmetric_errors_and_horizontal_spans():
 
 
 def test_clustermap_of_little_or_missing_data():
-    pytest.importorskip('scipy')
     for shape in ((1, 4), (4, 1), (1, 1)):
         fig, heat = vc.clustermap(np.arange(float(np.prod(shape))).reshape(shape), palette = 'couture')
         assert fig.to_png(36.0)[:4] == b'\x89PNG'
