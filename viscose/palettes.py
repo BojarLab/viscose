@@ -71,7 +71,13 @@ class Palette:
     `point` is flat, ring, cut, or sphere. `bar` is flat, deep (gradient from the dark base), soft (gradient from the
     pale base), or needle. `ridge` is flat, deep, or tint. `shadow` is the strength of a soft shadow that every mark
     casts in its own color. `caps` sets axis names in small spaced capitals. `paper` is the page's color, for a dark
-    page with a light `ink`, where shades run from the strongest against the page to the faintest.
+    page with a light `ink`, where shades run from the strongest against the page to the faintest. `font` is a family
+    as (name, regular file, bold file), found among the system's fonts, for a house or journal style; without it, or
+    where its files are missing, Century Gothic or the bundled Comfortaa. `spacing` scales the gaps, pads, legend
+    rows, and color bars that the plot code sets itself, which suit type of about ten points, so that type of five or
+    six points sits as close to its axes as a journal page wants. `minus` is the sign numbers on axes are written
+    with, such as a true minus, '−', in a font that has one. `sequential` and `diverging` take stops of their own,
+    pale to dark and from the second pole through the middle to the first, in place of the ones made from the hues.
     """
     name: str
     a: list
@@ -113,6 +119,11 @@ class Palette:
     subtitle_color: str = ''
     text_bold: bool = False
     paper: str = '#FFFFFF'
+    font: tuple = ()
+    minus: str = '-'
+    spacing: float = 1.0
+    sequential_stops: tuple = ()
+    diverging_stops: tuple = ()
     extra: dict = field(default_factory = dict)
 
     def __post_init__(self):
@@ -124,6 +135,10 @@ class Palette:
                                  f'got {getattr(self, setting)!r}')
         if len(self.a) != 4 or len(self.b) != 4:
             raise ValueError('A palette has two hues of four shades each, from dark to pale')
+        if self.font and len(self.font) != 3:
+            raise ValueError("A palette's font is (name, regular file, bold file)")
+        if any(0 < len(v) < 2 for v in (self.sequential_stops, self.diverging_stops)):
+            raise ValueError("A palette's own scale needs at least two stops")
 
     def color(self, c):
         """An RGB triple from a palette name (a0 to b3, ink, muted, faint, paper), a hex string, a CSS name or a
@@ -178,8 +193,8 @@ class Palette:
         return out
 
     def sequential(self, t):
-        """Magnitude scale from pale to dark in the main hue, at t in [0, 1]."""
-        return ramp([self.a[3], self.a[2], self.a[1], self.a[0]], t)
+        """Magnitude scale from pale to dark in the main hue, or through the palette's own stops, at t in [0, 1]."""
+        return ramp(self.sequential_stops or [self.a[3], self.a[2], self.a[1], self.a[0]], t)
 
     def sequential_r(self, t):
         """The magnitude scale from dark to pale, for values that matter most when low, such as distances."""
@@ -187,8 +202,9 @@ class Palette:
 
     def diverging(self, t):
         """Two-pole scale through the page's color: 0 is the second hue at its strongest, 0.5 is the page, 1 is the main
-        hue at its strongest."""
-        return ramp([self.b[0], self.b[1], self.b[3], self.paper, self.a[3], self.a[1], self.a[0]], t)
+        hue at its strongest; or through the palette's own stops."""
+        return ramp(self.diverging_stops or [self.b[0], self.b[1], self.b[3], self.paper, self.a[3], self.a[1],
+                                             self.a[0]], t)
 
     def on(self, c):
         """Whichever of white or a dark text color reads better over a color, by its luminance: the palette's ink, or

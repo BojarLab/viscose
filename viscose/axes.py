@@ -16,13 +16,14 @@ LEGEND_SPOTS = ('below', 'right', 'upper left', 'upper right', 'lower left', 'lo
 LABEL_MIN = 6.5
 
 
-def nice_ticks(lo, hi, n = 6):
-    """Round tick positions covering [lo, hi]."""
+def nice_ticks(lo, hi, n = 6, steps = (1, 2, 5, 10)):
+    """Round tick positions covering [lo, hi], about n of them, at a step of one of `steps` times a power of ten, such
+    as (1, 2, 2.5, 5, 10) for matplotlib's quarters too."""
     if not math.isfinite(hi - lo) or hi <= lo:
         return [lo]
     mag = 10 ** math.floor(math.log10((hi - lo) / max(n - 1, 1)))
     # The round step whose tick count comes closest to n, counting the ticks that actually fall inside the range
-    step = min((s * mag for s in (1, 2, 5, 10)),
+    step = min((s * mag for s in steps),
                key = lambda v: abs(math.floor(hi / v + 1e-9) - math.ceil(lo / v - 1e-9) + 1 - n))
     first = math.ceil(lo / step - 1e-9)
     # Rounded to the step's own scale, which keeps 0.6 from reading 0.6000000000000001 and 3e-12 from reading 0
@@ -56,6 +57,11 @@ def tick_labels(ticks):
     return labels
 
 
+def _minus(pal, labels):
+    """Numbers written with the palette's minus sign, such as a true minus where its font has one."""
+    return labels if pal.minus == '-' else [s.replace('-', pal.minus) for s in labels]
+
+
 def _numeric(values):
     """Whether values are numbers rather than category labels."""
     return np.asarray(values).dtype.kind in 'fiu'
@@ -86,10 +92,19 @@ def _check_cmap(cmap):
                          "these scales")
 
 
-def _check_scale(scale):
-    """Any other name would quietly draw a linear axis."""
-    if scale not in ('linear', 'log'):
-        raise ValueError(f"An axis scale has to be 'linear' or 'log', got {scale!r}")
+# Each scale's map from data to even spacing along the axis, and back
+WARPS = {'linear': (lambda v: v, lambda u: u),
+         'log': (lambda v: np.log10(np.maximum(v, 1e-300)), lambda u: 10.0 ** u),
+         'sqrt': (lambda v: np.sign(v) * np.sqrt(np.abs(v)), lambda u: np.sign(u) * u * u)}
+
+
+def _warp(scale, functions):
+    """A scale's (forward, inverse) maps; any other name would quietly draw a linear axis."""
+    if scale not in (*WARPS, 'function'):
+        raise ValueError(f"An axis scale has to be 'linear', 'log', 'sqrt', or 'function', got {scale!r}")
+    if (scale == 'function') != (functions is not None):
+        raise ValueError("A 'function' scale takes functions = (forward, inverse), and no other scale takes them")
+    return WARPS[scale] if functions is None else tuple(functions)
 
 
 def _check_limits(lo, hi):
@@ -107,6 +122,8 @@ def _check_marker(marker):
 
 def _check_tick_labels(ticks, labels):
     """Too few labels would otherwise only fail once the figure is saved, and too many would pass unnoticed."""
+    if labels is not None and ticks is None:
+        raise ValueError('Tick labels need the ticks they belong to')
     if labels is not None and len(labels) != len(ticks):
         raise ValueError(f'Ticks need one label each, got {len(ticks)} ticks and {len(labels)} labels')
 
@@ -124,11 +141,16 @@ class Axes:
         self._legend_size = None
         self._xlim, self._ylim = None, None
         self.xlabel, self.ylabel, self.title_text = '', '', ''
-        self._title_fixed = None
+        self._title_fixed, self._title_pad = None, None
         self._xticks, self._yticks, self._xtl, self._ytl = None, None, None, None
         self._tick_size = None
+        self._xfmt, self._yfmt = None, None
+        self._label_size, self._label_pad = {'x': None, 'y': None}, {'x': None, 'y': None}
+        self._xemph, self._yemph = {}, {}
+        self._tick_opts, self._spine_set = {'x': {}, 'y': {}}, {}
         self._xrot, self._yright = 0.0, False
         self._xscale, self._yscale = 'linear', 'linear'
+        self._xwarp, self._ywarp = WARPS['linear'], WARPS['linear']
         self._xinv, self._yinv = False, False
         self._cycle = 0
         self._cats = {'x': {}, 'y': {}}
@@ -137,7 +159,7 @@ class Axes:
         self._scale, self._cbar = None, None
         self._over, self._over_plain = [0.0, 0.0], -math.inf
         self._ridge_labels = None
-        self._fixed, self._cell, self._legend_y, self._align = None, None, None, {}
+        self._fixed, self._cell, self._span, self._legend_y, self._align = None, None, (1, 1), None, {}
         self.rect = self._room = (0.0, 0.0, 1.0, 1.0)
         self.grid_on = pal.grid
         self.show_all = (False, False)
@@ -191,6 +213,25 @@ class Axes:
                       gid = None)
         self._labeled(label, rgb, 'line', dash)
         return self
+
+    def step(self, x, y, where = 'pre', color = None, lw = None, label = None, alpha = 1.0, dash = None, z = 4,
+             clip = True):
+        """A line of steps, as in matplotlib, for counts, cumulative distributions, and survival curves: with
+        where = 'pre' each y holds from the x before it up to its own, with 'post' from its own x up to the next, and
+        with 'mid' between the midpoints around it."""
+        if where not in ('pre', 'post', 'mid'):
+            raise ValueError(f"A step's where has to be 'pre', 'post', or 'mid', got {where!r}")
+        x, y = np.atleast_1d(self._pos(x, 'x')), np.atleast_1d(self._pos(y, 'y'))
+        _check_lengths(x, y)
+        if where == 'mid' and x.size > 1:
+            edges = np.r_[x[0], (x[:-1] + x[1:]) / 2, x[-1]]
+            xs, ys = np.repeat(edges, 2)[1:-1], np.repeat(y, 2)
+        elif where == 'pre':
+            # Each corner repeats a point, taking its x from one neighbor and its y from the other
+            xs, ys = np.repeat(x, 2)[:-1], np.repeat(y, 2)[1:]
+        else:
+            xs, ys = np.repeat(x, 2)[1:], np.repeat(y, 2)[:-1]
+        return self.plot(xs, ys, color = color, lw = lw, label = label, alpha = alpha, dash = dash, z = z, clip = clip)
 
     def scatter(self, x, y, s = 30, color = None, c = None, label = None, alpha = 1.0, cmap = 'sequential', vmin = None,
                 vmax = None, z = 3, marker = 'o', edge = None, gid = None, hue = None, style = None, size = None,
@@ -501,10 +542,36 @@ class Axes:
                   rgb = px[..., :3].tobytes(), alpha = alpha)
         return self
 
-    def arrow(self, x0, y0, x1, y1, color = 'muted', lw = 1.0, alpha = 1.0, gid = None, z = 2):
-        """An arrow between two data points; `gid` names it in SVG output, for hover text."""
+    def arrow(self, x0, y0, x1, y1, color = 'muted', lw = 1.0, alpha = 1.0, gid = None, z = 2, head = None,
+              shrink = (0.0, 0.0), bend = 0.0):
+        """An arrow between two data points; `gid` names it in SVG output, for hover text. `head` is the head's length
+        in points, or 0 for a plain leader line, `shrink` how many points it stays short of its start and its end, as
+        beside a marker or a label, and `bend` turns it into an arc whose middle stands that share of its length to its
+        left."""
         self._add('arrow', z, x0 = float(x0), y0 = float(y0), x1 = float(x1), y1 = float(y1),
-                  rgb = self.pal.color(color), lw = lw, alpha = alpha, gid = gid)
+                  rgb = self.pal.color(color), lw = lw, alpha = alpha, gid = gid, head = head,
+                  shrink = tuple(float(v) for v in shrink), bend = float(bend))
+        return self
+
+    def axline(self, xy, slope = None, xy2 = None, color = 'muted', lw = 0.8, dash = (1, 3), label = None, z = 1):
+        """A straight line through a data point at a slope, or through a second point, across the whole axes, such as
+        the diagonal of observed against predicted values; it leaves the limits to the data."""
+        if (slope is None) == (xy2 is None):
+            raise ValueError('axline takes a slope or a second point, and only one of them')
+        x2, y2 = (xy[0] + 1.0, xy[1] + slope) if xy2 is None else xy2
+        self._add('aline', z, x0 = float(xy[0]), y0 = float(xy[1]), x1 = float(x2), y1 = float(y2),
+                  rgb = self.pal.color(color), lw = lw, dash = dash)
+        self._labeled(label, self.pal.color(color), 'line', dash)
+        return self
+
+    def rectangle(self, x, y, width, height, color = 'faint', edge = None, radius = 0.0, alpha = 1.0, z = 1,
+                  axes_fraction = False):
+        """A rectangle from its lower left corner, in data units or with axes_fraction = True in fractions of the
+        axes, such as a box in a schematic or a card behind text. `edge` is (color, width), `radius` rounds its corners
+        by that many points, and color = 'none' leaves only the edge."""
+        self._add('rect', z, x = float(x), y = float(y), w = float(width), h = float(height),
+                  rgb = self.pal.color(color), edge = None if edge is None else (self.pal.color(edge[0]), edge[1]),
+                  radius = float(radius), alpha = alpha, frac = axes_fraction)
         return self
 
     def axhline(self, y = 0.0, color = 'muted', lw = 0.8, dash = (1, 3), label = None, z = 1):
@@ -519,11 +586,12 @@ class Axes:
 
     def heatmap(self, data, xticklabels = None, yticklabels = None, cmap = 'diverging', vmin = None, vmax = None,
                 center = 0.0, labels_right = True, show_all = False, colorbar = False, colorbar_label = '',
-                annot = False, fmt = '.2f', annot_size = 8.0, names = None):
+                annot = False, fmt = '.2f', annot_size = None, names = None):
         """A matrix of cells, first row at the top, where NaN is left empty. `cmap` is diverging, sequential, or
         sequential_r, which puts the darkest color at the lowest value. Too many labels are thinned unless show_all,
         which can also be a pair for the x and y axes; the page grows for those that must all show. `annot` writes each
-        cell's value into it, formatted by `fmt`, in whichever of ink or white reads over the cell. `names` holds the
+        cell's value into it, formatted by `fmt`, a format spec or a function of the value, in whichever of ink or white
+        reads over the cell. `names` holds the
         rows' and the columns' labels as a pair, by default the tick labels, which draws nothing but tells a viewer such
         as slate what the cell under the mouse is."""
         _check_cmap(cmap)
@@ -553,8 +621,9 @@ class Axes:
                   columns = None if columns is None else [str(v) for v in columns])
         if annot:
             for r, j in np.argwhere(np.isfinite(m)):
-                self.annotate(format(m[r, j], fmt), (j + 0.5, m.shape[0] - r - 0.5), size = annot_size, halo = 0.0,
-                              color = self.pal.on(rgb[r, j]), ha = 'center', clip = True)
+                self.annotate(fmt(m[r, j]) if callable(fmt) else format(m[r, j], fmt), (j + 0.5, m.shape[0] - r - 0.5),
+                              size = annot_size or 8.0 * self.pal.spacing, halo = 0.0, color = self.pal.on(rgb[r, j]),
+                              ha = 'center', clip = True)
         self.set_xlim(0, m.shape[1])
         self.set_ylim(0, m.shape[0])
         # An empty list of labels means none, as None does
@@ -629,36 +698,48 @@ class Axes:
         return self
 
     def text(self, x, y, s, size = None, color = 'ink', bold = None, ha = 'left', va = 'center', rotation = 0.0,
-             halo = 0.0, z = 20, axes_fraction = False):
-        """Text at a data position, or at a fraction of the axes with axes_fraction = True."""
+             halo = 0.0, z = 20, axes_fraction = False, linespacing = 1.25):
+        """Text at a data position, or at a fraction of the axes with axes_fraction = True; several lines are
+        `linespacing` sizes apart."""
         self._add('text', z, x = float(x), y = float(y), s = str(s), size = size, rgb = self.pal.color(color),
                   bold = bold, ha = ha, va = va, rotation = rotation, halo = halo, dx = 0.0, dy = 0.0,
-                  frac = axes_fraction, tag = False, clip = False)
+                  frac = axes_fraction, tag = False, clip = False, spread = False, linespacing = linespacing)
         return self
 
-    def annotate(self, s, xy, offset = (0.0, 0.0), size = 8.6, color = 'ink', bold = None, ha = 'left', va = 'center',
-                 rotation = 0.0, halo = 2.6, z = 20, svg_label = False, clip = False):
+    def annotate(self, s, xy, offset = (0.0, 0.0), size = None, color = 'ink', bold = None, ha = 'left', va = 'center',
+                 rotation = 0.0, halo = None, z = 20, svg_label = False, clip = False, spread = False,
+                 linespacing = 1.25):
         """Text next to a data point, offset in points, with a halo of the page's color that keeps it readable over the
         marks. With svg_label = True, SVG output writes it the way matplotlib writes text, so that glycowork's
         annotate_figure can replace it with a glycan drawing. With clip = True it shows only while its point is within
-        the limits."""
-        self._add('text', z, x = float(xy[0]), y = float(xy[1]), s = str(s), size = size, rgb = self.pal.color(color),
-                  bold = bold, ha = ha, va = va, rotation = rotation, halo = halo, dx = offset[0], dy = offset[1],
-                  frac = False, tag = svg_label, clip = clip)
+        the limits. Labels with spread = True on one side of their points, such as names at the ends of lines, move
+        apart vertically as little as it takes for none to overlap, within the axes' height, each joined to its point
+        by a hairline where it had to move. Without a size it takes 8.6 points, and its halo 2.6, both scaled by the
+        palette's spacing."""
+        k = self.pal.spacing
+        self._add('text', z, x = float(xy[0]), y = float(xy[1]), s = str(s), size = 8.6 * k if size is None else size,
+                  rgb = self.pal.color(color), bold = bold, ha = ha, va = va, rotation = rotation,
+                  halo = 2.6 * k if halo is None else halo, dx = offset[0], dy = offset[1], frac = False,
+                  tag = svg_label, clip = clip, spread = spread, linespacing = linespacing)
         return self
 
     # --- settings ---
-    def set_xlabel(self, s):
-        self.xlabel = s
+    def set_xlabel(self, s, size = None, pad = None):
+        """The x axis's name, at `size` points or the palette's size for axis names, `pad` points below the tick labels
+        if given, as matplotlib's labelpad."""
+        self.xlabel, self._label_size['x'], self._label_pad['x'] = s, size, pad
         return self
 
-    def set_ylabel(self, s):
-        self.ylabel = s
+    def set_ylabel(self, s, size = None, pad = None):
+        """The y axis's name, at `size` points or the palette's size for axis names, `pad` points beside the tick labels
+        if given, as matplotlib's labelpad."""
+        self.ylabel, self._label_size['y'], self._label_pad['y'] = s, size, pad
         return self
 
-    def set_title(self, s, size = None):
-        """The axes' title; without a size it takes 15 points, less where it would not fit."""
-        self.title_text, self._title_fixed = s, size
+    def set_title(self, s, size = None, pad = None):
+        """The axes' title; without a size it takes 15 points, less where it would not fit. `pad` is the points from the
+        axes to its baseline, eight scaled by the palette's spacing unless given."""
+        self.title_text, self._title_fixed, self._title_pad = s, size, pad
         return self
 
     def set_xlim(self, lo, hi):
@@ -669,19 +750,25 @@ class Axes:
         self._ylim = _check_limits(lo, hi)
         return self
 
-    def set_xticks(self, ticks, labels = None, rotation = 0.0):
-        """Ticks at these positions, with these labels or their values, whose labels turn by `rotation` degrees."""
+    def set_xticks(self, ticks = None, labels = None, rotation = 0.0, fmt = None, emphasis = None):
+        """Ticks at these positions, or automatic ones with ticks = None, with these labels or their values, whose
+        labels turn by `rotation` degrees. `fmt` writes the values, as a format string such as '{:.0%}' or a
+        function of the value. `emphasis` maps labels to a color they are set in, bold, such as the method a figure is
+        about."""
         _check_tick_labels(ticks, labels)
-        self._xticks = list(ticks)
+        self._xticks = None if ticks is None else list(ticks)
         self._xtl = None if labels is None else [str(v) for v in labels]
-        self._xrot = rotation
+        self._xrot, self._xfmt, self._xemph = rotation, fmt, dict(emphasis or {})
         return self
 
-    def set_yticks(self, ticks, labels = None):
-        """Ticks at these positions, with these labels or their values."""
+    def set_yticks(self, ticks = None, labels = None, fmt = None, emphasis = None):
+        """Ticks at these positions, or automatic ones with ticks = None, with these labels or their values. `fmt`
+        writes the values, as a format string such as '{:.0%}' or a function of the value. `emphasis` maps labels to a
+        color they are set in, bold."""
         _check_tick_labels(ticks, labels)
-        self._yticks = list(ticks)
+        self._yticks = None if ticks is None else list(ticks)
         self._ytl = None if labels is None else [str(v) for v in labels]
+        self._yfmt, self._yemph = fmt, dict(emphasis or {})
         return self
 
     def set_tick_size(self, size):
@@ -689,13 +776,38 @@ class Axes:
         self._tick_size = size
         return self
 
-    def set_xscale(self, s):
-        _check_scale(s)
+    def tick_params(self, axis = 'both', length = None, labelsize = None, pad = None, labels = None, top = None,
+                    fit = None):
+        """Ticks of the x axis, the y axis, or both, as in matplotlib: their `length` and the `pad` between them and
+        their labels in points, the labels' size, and labels = False to leave the labels out, as beside a panel
+        that shares them. top = True writes the x labels above the axes, as over a table of scores, where a positive
+        `rotation` turns them up and to the right. fit = False keeps every label as set, level or turned as asked,
+        where viscose would otherwise turn or thin labels that crowd. What is not given stays as it was."""
+        if axis not in ('x', 'y', 'both'):
+            raise ValueError(f"tick_params takes axis = 'x', 'y', or 'both', got {axis!r}")
+        if top is not None and axis != 'x':
+            raise ValueError("Only the x labels can go on top, with axis = 'x'")
+        for name in ('x', 'y') if axis == 'both' else (axis, ):
+            given = dict(length = length, labelsize = labelsize, pad = pad, labels = labels, top = top, fit = fit)
+            self._tick_opts[name].update({k: v for k, v in given.items() if v is not None})
+        return self
+
+    def set_spines(self, left = None, bottom = None):
+        """Show or hide the left and the bottom axis line, with their ticks; None keeps the palette's choice."""
+        self._spine_set.update({k: bool(v) for k, v in (('left', left), ('bottom', bottom)) if v is not None})
+        return self
+
+    def set_xscale(self, s, functions = None):
+        """'linear', 'log', 'sqrt' (signed, so zero and below keep their place), or 'function' with
+        functions = (forward, inverse), two maps over arrays from data to even spacing along the axis and back."""
+        self._xwarp = _warp(s, functions)
         self._xscale = s
         return self
 
-    def set_yscale(self, s):
-        _check_scale(s)
+    def set_yscale(self, s, functions = None):
+        """'linear', 'log', 'sqrt' (signed, so zero and below keep their place), or 'function' with
+        functions = (forward, inverse), two maps over arrays from data to even spacing along the axis and back."""
+        self._ywarp = _warp(s, functions)
         self._yscale = s
         return self
 
@@ -758,10 +870,11 @@ class Axes:
         """Page points as data positions, the reverse of `page`."""
         x0, y0, w, h = self.rect
         out = []
-        for v, start, size, (lo, hi), scale in ((px, x0, w, self.xlim, self._xscale),
-                                                (py, y0, h, self.ylim, self._yscale)):
+        for v, start, size, (lo, hi), (forward, inverse) in ((px, x0, w, self.xlim, self._xwarp),
+                                                              (py, y0, h, self.ylim, self._ywarp)):
             t = (np.asarray(v, dtype = float) - start) / size
-            out.append(lo ** (1 - t) * hi ** t if scale == 'log' else lo + t * (hi - lo))
+            lo, hi = forward(np.float64(lo)), forward(np.float64(hi))
+            out.append(inverse(lo + t * (hi - lo)))
         return tuple(out)
 
     # --- limits and ticks ---
@@ -794,6 +907,8 @@ class Axes:
                 vals = np.r_[a['x0'], a['x1']]
             elif k == 'arrow':
                 vals = np.array([a[axis + '0'], a[axis + '1']])
+            elif k == 'rect' and not a['frac']:
+                vals = np.array([a[axis], a[axis] + a['w' if axis == 'x' else 'h']])
             elif k == 'contour':
                 vals = a[axis]
             elif k == 'box' and axis == 'x':
@@ -833,10 +948,15 @@ class Axes:
                 span = 0.03 * math.log10(hi / lo)
                 lo, hi = 10 ** (math.log10(lo) - span), 10 ** (math.log10(hi) + span)
             else:
+                # The margin is a share of the axis as drawn, so measured after the scale's map
+                forward, inverse = self._xwarp if axis == 'x' else self._ywarp
+                ends = forward(np.array([lo, hi, *sticky], dtype = float))
+                lo, hi, sticky = float(ends[0]), float(ends[1]), ends[2:]
                 pad = (hi - lo) * margin if hi > lo else (abs(lo) * 0.1 or 1.0)
                 # Bars of no height stick to both ends, and the axis still needs a range
                 lo, hi = (lo if any(abs(lo - s) < 1e-12 for s in sticky) else lo - pad,
                           hi if hi > lo and any(abs(hi - s) < 1e-12 for s in sticky) else hi + pad)
+                lo, hi = (float(v) for v in inverse(np.array([lo, hi])))
             if fixed is not None:
                 # A log axis has no zero or negative end, so such a limit stays automatic
                 lo, hi = [v if v > 0 or scale != 'log' else auto for v, auto in zip(fixed, (lo, hi))]
@@ -856,7 +976,8 @@ class Axes:
             if a['kind'] == 'text':
                 a['_ha'], a['_dx'] = a['ha'], a['dx']
         self._range()
-        for axis, ticks, labels in (('x', self._xticks, self._xtl), ('y', self._yticks, self._ytl)):
+        for axis, ticks, labels, form in (('x', self._xticks, self._xtl, self._xfmt),
+                                          ('y', self._yticks, self._ytl, self._yfmt)):
             cats = self._cats[axis]
             lo, hi = sorted(getattr(self, axis + 'lim'))
             if ticks is None and cats:
@@ -875,39 +996,63 @@ class Axes:
                 # Ticks set by hand can lie beyond limits that zooming narrowed
                 shown = [i for i, v in enumerate(ticks) if lo - 1e-9 * (hi - lo) <= v <= hi + 1e-9 * (hi - lo)]
                 ticks, labels = [ticks[i] for i in shown], None if labels is None else [labels[i] for i in shown]
+            # Only numbers take the palette's minus sign, not labels given or categories
+            numbers = labels is None
+            if labels is None and form is not None:
+                labels = [form(v) if callable(form) else form.format(v) for v in ticks]
             setattr(self, axis + 'ticks', ticks)
-            setattr(self, axis + 'labels', labels if labels is not None else tick_labels(ticks))
+            labels = labels if labels is not None else tick_labels(ticks)
+            # Ticks without labels, as beside a panel that shares them
+            if self._tick_opts[axis].get('labels', True) is False:
+                labels = []
+            setattr(self, axis + 'labels', _minus(self.pal, labels) if numbers else labels)
 
     def _tx(self, v):
         x0, y0, w, h = self.rect
-        lo, hi = self.xlim
-        v = np.asarray(v, dtype = float)
-        if self._xscale == 'log':
-            return x0 + (np.log10(np.maximum(v, 1e-300)) - math.log10(lo)) / (math.log10(hi) - math.log10(lo)) * w
-        return x0 + (v - lo) / (hi - lo) * w
+        forward = self._xwarp[0]
+        lo, hi = forward(np.float64(self.xlim[0])), forward(np.float64(self.xlim[1]))
+        return x0 + (forward(np.asarray(v, dtype = float)) - lo) / (hi - lo) * w
 
     def _ty(self, v):
         x0, y0, w, h = self.rect
-        lo, hi = self.ylim
-        v = np.asarray(v, dtype = float)
-        if self._yscale == 'log':
-            return y0 + (np.log10(np.maximum(v, 1e-300)) - math.log10(lo)) / (math.log10(hi) - math.log10(lo)) * h
-        return y0 + (v - lo) / (hi - lo) * h
+        forward = self._ywarp[0]
+        lo, hi = forward(np.float64(self.ylim[0])), forward(np.float64(self.ylim[1]))
+        return y0 + (forward(np.asarray(v, dtype = float)) - lo) / (hi - lo) * h
 
     # --- layout ---
     def _tick_sizes(self):
         """Tick label sizes for the x and y axes; a heatmap's labels are many, so they are smaller."""
         if self._tick_size is not None:
-            return self._tick_size, self._tick_size
-        heat = any(a['kind'] == 'heat' for a in self.artists)
-        return (8.2, 8.0) if heat else (self.pal.tick_size, self.pal.tick_size)
+            sizes = self._tick_size, self._tick_size
+        elif any(a['kind'] == 'heat' for a in self.artists):
+            sizes = 8.2 * self.pal.spacing, 8.0 * self.pal.spacing
+        else:
+            sizes = self.pal.tick_size, self.pal.tick_size
+        return tuple(self._tick_opts[axis].get('labelsize', v) for axis, v in zip('xy', sizes))
+
+    def _spines(self):
+        """The axis lines drawn, by the palette's choice unless set_spines changed it."""
+        if 'spines' in self._hidden:
+            return ()
+        return tuple(s for s in ('left', 'bottom')
+                     if self._spine_set.get(s, s in self.pal.spines and s not in self._hidden))
+
+    def _tick_room(self, axis):
+        """The spine's offset, the tick's length, and how far from the plot an axis's tick labels start, in points."""
+        pal, spines = self.pal, self._spines()
+        off = pal.spine_offset if spines else 0.0
+        # Ticks ride their axis line, so a hidden line takes its ticks along
+        drawn = {'x': 'bottom', 'y': 'left'}[axis] in spines and 'ticks' not in self._hidden
+        tl = self._tick_opts[axis].get('length', pal.tick_length) if drawn else 0.0
+        return off, tl, off + tl + self._tick_opts[axis].get('pad', 5.0 * pal.spacing)
 
     def _title_size(self):
         """A long title shrinks to fit the figure's width, down to a readable size; past that the page grows."""
         if self._title_fixed is not None:
             return self._title_fixed
-        wide = text.width(self.title_text, 15.0, self.pal.title_bold) or 1.0
-        return max(9.0, min(15.0, 15.0 * (self.figure._base[0] - self.rect[0] - 3.0) / wide))
+        k = self.pal.spacing
+        wide = text.width(self.title_text, 15.0 * k, self.pal.title_bold) or 1.0
+        return max(9.0 * k, min(15.0 * k, 15.0 * k * (self.figure._base[0] - self.rect[0] - 3.0 * k) / wide))
 
     def _axis_name_widths(self, size):
         """How long the x and y axis names run at a size."""
@@ -927,55 +1072,72 @@ class Axes:
         pal = self.pal
         if not self._ridge_labels:
             return 0.0
-        return 8.0 + max(text.width(text.spaced(pal, s), 7.8 if pal.caps else pal.tick_size + 1, pal.text_bold,
-                                    0.9 if pal.caps else 0.0) for s in self._ridge_labels)
+        k = pal.spacing
+        return 8.0 * k + max(text.width(text.spaced(pal, s), 7.8 * k if pal.caps else pal.tick_size + k,
+                                        pal.text_bold, 0.9 if pal.caps else 0.0) for s in self._ridge_labels)
 
     def _ylabel_room(self):
         """Room the y axis name takes beside the tick labels."""
-        return self.pal.label_size * (1.7 + 1.25 * _extra_lines(self.ylabel)) if self.ylabel else 0.0
+        size, pad = self._label_size['y'] or self.pal.label_size, self._label_pad['y']
+        if not self.ylabel:
+            return 0.0
+        lines = 1.25 * _extra_lines(self.ylabel)
+        # The name's baseline sits `pad` beyond the tick labels, and its glyphs a size beyond that
+        return size * (1.7 + lines) if pad is None else pad + size * (1.0 + lines)
 
     def _colorbar_width(self):
         """Room a colorbar at the right takes, past the tick labels: bar, its ticks, and its label."""
         source = self._cbar['source']
         ticks = nice_ticks(source._scale['lo'], source._scale['hi'], 5)
         label = self.pal.label_size * 1.6 if self._cbar['label'] else 0.0
-        return 12.0 + COLORBAR_WIDTH + 5.0 + max(text.width(s, 8.4) for s in tick_labels(ticks)) + label
+        k = self.pal.spacing
+        widest = max(text.width(s, 8.4 * k) for s in _minus(self.pal, tick_labels(ticks)))
+        return 12.0 * k + COLORBAR_WIDTH * k + 5.0 * k + widest + label
 
     def _margins(self):
         """Room the decorations need around the plot area, in points: left, right, bottom, top."""
         pal = self.pal
-        off = pal.spine_offset if 'spines' not in self._hidden and pal.spines else 0.0
-        tick = pal.tick_length if 'ticks' not in self._hidden and pal.spines else 0.0
-        pad = off + tick + 5.0
+        off, xtl, xpad = self._tick_room('x')
+        _, ytl, ypad = self._tick_room('y')
         sy = self._tick_sizes()[1]
         yw = max((text.width(s, sy, pal.tick_bold) for s in self.ylabels), default = 0.0)
-        left, right, bottom, top = 3.0, 3.0, 3.0, 3.0
-        if self.ylabels and self.yticks is not None and len(self.yticks):
+        k = pal.spacing
+        left, right, bottom, top = 3.0 * k, 3.0 * k, 3.0 * k, 3.0 * k
+        # Ticks left without labels still reach out from their axis line
+        yside = ypad + yw if self.ylabels else off + ytl
+        if self.yticks is not None and len(self.yticks):
             if self._yright:
-                right += pad + yw
+                right += yside
             else:
-                left += pad + yw
-        if self.xlabels and len(self.xticks):
-            bottom += pad + self._xtick_height()
+                left += yside
+        above = self._tick_opts['x'].get('top', False)
+        if len(self.xticks) and above:
+            bottom += off + xtl
+            top += self._tick_opts['x'].get('pad', 5.0 * k) + self._xtick_height() if self.xlabels else 0.0
+        elif len(self.xticks):
+            bottom += xpad + self._xtick_height() if self.xlabels else off + xtl
         if self.ylabel:
             # A spine held away from the data takes room even without tick labels
-            room = self._ylabel_room() + (0.0 if self.ylabels and len(self.yticks) else off)
+            room = self._ylabel_room() + (0.0 if len(self.yticks) else off)
             if self._yright:
                 right += room
             else:
                 left += room
         if self.xlabel:
-            bottom += pal.label_size * (1.7 + 1.25 * _extra_lines(self.xlabel))
-            bottom += 0.0 if self.xlabels and len(self.xticks) else off
+            size, gap = self._label_size['x'] or pal.label_size, self._label_pad['x']
+            lines = 1.25 * _extra_lines(self.xlabel)
+            bottom += size * (1.7 + lines) if gap is None else gap + size * (1.15 + lines)
+            bottom += 0.0 if len(self.xticks) else off
         left += self._ridge_width()
         if self.title_text:
-            top += 21.0 + 1.25 * self._title_size() * _extra_lines(self.title_text)
+            pad = 8.0 * k if self._title_pad is None else self._title_pad
+            top += 13.0 * k + pad + 1.25 * self._title_size() * _extra_lines(self.title_text)
         if self.legend_items and self._legend_opts in ('below', 'right'):
             tw, th = self._legend_size or self._legend_natural()
             if self._legend_opts == 'below':
-                bottom += th + 8.0
+                bottom += th + 8.0 * k
             else:
-                right += tw + 18.0
+                right += tw + 18.0 * k
         if self._cbar and self._cbar['loc'] == 'right':
             right += self._colorbar_width()
         return left, right, bottom, top
@@ -983,7 +1145,7 @@ class Axes:
     def _legend_entries(self):
         """Each item's text size, tracking, shown text, and width, in legend order."""
         pal = self.pal
-        size = 7.4 if pal.caps else pal.tick_size - 0.5
+        size = 7.4 * pal.spacing if pal.caps else pal.tick_size - 0.5 * pal.spacing
         track = 0.7 if pal.caps else 0.0
         out = []
         for s, rgb, kind, marker, area in self.legend_items:
@@ -991,36 +1153,37 @@ class Axes:
             shown = text.spaced(pal, s).replace('\n', ' ')
             header = kind == 'header'
             out.append((shown, rgb, kind, marker, area, text.width(shown, size, pal.text_bold or header, track)
-                        + (0.0 if header else 18.0)))
+                        + (0.0 if header else 18.0 * pal.spacing)))
         return size, track, out
 
     def _legend_natural(self):
         """Legend size before the axes are placed: one row or one column."""
         _, _, entries = self._legend_entries()
-        widths = [e[5] for e in entries]
-        return (max(widths), LEGEND_ROW * len(widths)) if self._legend_opts == 'right' else (sum(widths), LEGEND_ROW)
+        widths, row = [e[5] for e in entries], LEGEND_ROW * self.pal.spacing
+        return (max(widths), row * len(widths)) if self._legend_opts == 'right' else (sum(widths), row)
 
     def _legend_grid(self):
         """Offsets of the legend's items from its top left, wrapped to the axes, and the legend's total size."""
         _, _, w, h = self.rect
         _, _, entries = self._legend_entries()
-        widths = [e[5] for e in entries]
+        widths, k = [e[5] for e in entries], self.pal.spacing
+        row = LEGEND_ROW * k
         if self._legend_opts == 'below':
             spots, x, y = [], 0.0, 0.0
             for v in widths:
                 if x and x + v > w:
-                    x, y = 0.0, y + LEGEND_ROW
+                    x, y = 0.0, y + row
                 spots.append((x, y))
-                x += v + 14.0
-            return spots, (w if y else sum(widths) + 14.0 * (len(widths) - 1), y + LEGEND_ROW)
-        per = max(1, int(h // LEGEND_ROW)) if self._legend_opts == 'right' else len(widths)
+                x += v + 14.0 * k
+            return spots, (w if y else sum(widths) + 14.0 * k * (len(widths) - 1), y + row)
+        per = max(1, int(h // row)) if self._legend_opts == 'right' else len(widths)
         spots, offset, total_h = [], 0.0, 0.0
         for start in range(0, len(widths), per):
             for i in range(start, min(start + per, len(widths))):
-                spots.append((offset, (i - start) * LEGEND_ROW))
-            total_h = max(total_h, (min(start + per, len(widths)) - start) * LEGEND_ROW)
-            offset += max(widths[start:start + per]) + 12.0
-        return spots, (offset - 12.0, total_h)
+                spots.append((offset, (i - start) * row))
+            total_h = max(total_h, (min(start + per, len(widths)) - start) * row)
+            offset += max(widths[start:start + per]) + 12.0 * k
+        return spots, (offset - 12.0 * k, total_h)
 
     def _fit_labels(self):
         """Turn tick labels that would collide, thin those that would still collide, wrap the legend, and move or make
@@ -1028,16 +1191,16 @@ class Axes:
         pal = self.pal
         changed = False
         sx, sy = self._tick_sizes()
-        if len(self.xticks) > 1:
+        if len(self.xticks) > 1 and self.xlabels and self._tick_opts['x'].get('fit', True):
             gap = _gap(self._tx(self.xticks))
-            if not self.xrot and max(text.width(s, sx, pal.tick_bold) for s in self.xlabels) + 6.0 > gap:
+            if not self.xrot and max(text.width(s, sx, pal.tick_bold) for s in self.xlabels) + 6.0 * pal.spacing > gap:
                 self.xrot = 90.0
                 changed = True
             if self.xrot and gap < sx * 1.05 and not self.show_all[0]:
                 k = int(math.ceil(sx * 1.05 / gap))
                 self.xticks, self.xlabels = self.xticks[::k], self.xlabels[::k]
                 changed = True
-        if len(self.yticks) > 1 and not self.show_all[1]:
+        if len(self.yticks) > 1 and self.ylabels and not self.show_all[1] and self._tick_opts['y'].get('fit', True):
             gap = _gap(self._ty(self.yticks))
             if gap < sy * 1.05:
                 k = int(math.ceil(sy * 1.05 / gap))
@@ -1100,7 +1263,7 @@ class Axes:
             getattr(self, '_d_' + k)(c, a)
             for op in c.ops[n:]:
                 op['gid'] = gid
-                if k not in ('hline', 'vline', 'vspan', 'hspan', 'image', 'contour'):
+                if k not in ('hline', 'vline', 'vspan', 'hspan', 'image', 'contour', 'aline', 'rect'):
                     op['mark'] = True
         c.restoreState()
 
@@ -1246,9 +1409,54 @@ class Axes:
                 marks.line(c, self.pal, [x0, x1], [y, y], a['rgb'], a['lw'], a['alpha'], a['dash'])
 
     def _d_arrow(self, c, a):
-        ends = float(self._tx(a['x0'])), float(self._ty(a['y0'])), float(self._tx(a['x1'])), float(self._ty(a['y1']))
-        if math.isfinite(sum(ends)):
-            marks.arrow(c, self.pal, *ends, a['rgb'], a['lw'], a['alpha'])
+        x0, y0 = float(self._tx(a['x0'])), float(self._ty(a['y0']))
+        x1, y1 = float(self._tx(a['x1'])), float(self._ty(a['y1']))
+        n = math.hypot(x1 - x0, y1 - y0)
+        if not math.isfinite(x0 + y0 + x1 + y1) or n <= sum(a['shrink']):
+            return
+        (s0, s1), ux, uy = a['shrink'], (x1 - x0) / n, (y1 - y0) / n
+        marks.arrow(c, self.pal, x0 + ux * s0, y0 + uy * s0, x1 - ux * s1, y1 - uy * s1, a['rgb'], a['lw'], a['alpha'],
+                    a['head'], a['bend'])
+
+    def _d_aline(self, c, a):
+        x0, y0, w, h = self.rect
+        px0, py0 = float(self._tx(a['x0'])), float(self._ty(a['y0']))
+        dx, dy = float(self._tx(a['x1'])) - px0, float(self._ty(a['y1'])) - py0
+        if not math.isfinite(px0 + py0 + dx + dy) or not (dx or dy):
+            return
+        # Far enough each way to cross the whole axes, which the clip then trims
+        reach = 2.0 * math.hypot(w, h) / math.hypot(dx, dy)
+        marks.polyline(c, [px0 - reach * dx, px0 + reach * dx], [py0 - reach * dy, py0 + reach * dy], a['rgb'],
+                       a['lw'], cap = 0, dash = a['dash'])
+
+    def _d_rect(self, c, a):
+        x0, y0, w, h = self.rect
+        if a['frac']:
+            xs, ys = [x0 + a['x'] * w, x0 + (a['x'] + a['w']) * w], [y0 + a['y'] * h, y0 + (a['y'] + a['h']) * h]
+        else:
+            xs = [float(self._tx(a['x'])), float(self._tx(a['x'] + a['w']))]
+            ys = [float(self._ty(a['y'])), float(self._ty(a['y'] + a['h']))]
+        if not math.isfinite(sum(xs) + sum(ys)):
+            return
+        (lx, hx), (ly, hy) = sorted(xs), sorted(ys)
+        r = max(0.0, min(a['radius'], (hx - lx) / 2, (hy - ly) / 2))
+        q = r * (1 - marks.KAPPA)
+        p = c.beginPath()
+        p.moveTo(lx + r, ly)
+        # Each side, then the quarter circle into the next one
+        for start, c1, c2, end in (((hx - r, ly), (hx - q, ly), (hx, ly + q), (hx, ly + r)),
+                                   ((hx, hy - r), (hx, hy - q), (hx - q, hy), (hx - r, hy)),
+                                   ((lx + r, hy), (lx + q, hy), (lx, hy - q), (lx, hy - r)),
+                                   ((lx, ly + r), (lx, ly + q), (lx + q, ly), (lx + r, ly))):
+            p.lineTo(*start)
+            if r:
+                p.curveTo(*c1, *c2, *end)
+        p.close()
+        edge = a['edge'] or (None, None)
+        c.saveState()
+        marks._style(c, a['rgb'], a['alpha'], edge[0], edge[1], a['alpha'], join = 1)
+        c.drawPath(p, fill = a['rgb'] is not None, stroke = a['edge'] is not None)
+        c.restoreState()
 
     def _d_hline(self, c, a):
         x0, _, w, _ = self.rect
@@ -1324,103 +1532,158 @@ class Axes:
                 marks.polyline(c, [x0, x0 + w], [y, y], pal.color(pal.faint), 1.1, cap = 0)
         off = pal.spine_offset
         cap = 1 if pal.spine_round else 0
-        tl = pal.tick_length
-        spines = () if 'spines' in self._hidden else pal.spines
+        spines = self._spines()
         xt, yt = [float(self._tx(v)) for v in self.xticks], [float(self._ty(v)) for v in self.yticks]
-        if 'left' in spines and 'left' not in self._hidden:
+        if 'left' in spines:
+            tl = self._tick_room('y')[1]
             lo, hi = (min(yt), max(yt)) if off and yt else (y0, y0 + h)
             marks.polyline(c, [x0 - off, x0 - off], [lo, hi], ink, pal.spine_width, cap = cap)
-            for y in yt if tl and 'ticks' not in self._hidden else ():
+            for y in yt if tl else ():
                 marks.polyline(c, [x0 - off - tl, x0 - off], [y, y], ink, pal.spine_width, cap = 0)
         if 'bottom' in spines:
+            tl = self._tick_room('x')[1]
             lo, hi = (min(xt), max(xt)) if off and xt else (x0, x0 + w)
             marks.polyline(c, [lo, hi], [y0 - off, y0 - off], ink, pal.spine_width, cap = cap)
-            for x in xt if tl and 'ticks' not in self._hidden else ():
+            for x in xt if tl else ():
                 marks.polyline(c, [x, x], [y0 - off - tl, y0 - off], ink, pal.spine_width, cap = 0)
 
     def _draw_text(self, c):
         pal = self.pal
         x0, y0, w, h = self.rect
         tick_rgb = pal.color(pal.tick_color or pal.muted)
-        off = pal.spine_offset if pal.spines and 'spines' not in self._hidden else 0.0
-        tl = pal.tick_length if pal.spines and 'ticks' not in self._hidden else 0.0
-        pad = off + tl + 5.0
+        off, xtl, pad = self._tick_room('x')
+        _, ytl, ypad = self._tick_room('y')
         size = pal.tick_size
         heat = 'heat' in {a['kind'] for a in self.artists}
         small, ytext = self._tick_sizes()
         ink = pal.color(pal.ink)
+        above = self._tick_opts['x'].get('top', False)
+        rise = y0 + h + self._tick_opts['x'].get('pad', 5.0 * pal.spacing)
         for v, s in zip(self.xticks, self.xlabels):
             x = float(self._tx(v))
-            if self.xrot:
+            rgb, bold = ((pal.color(self._xemph[s]), True) if s in self._xemph else
+                         (ink if heat and self.xrot else tick_rgb, pal.tick_bold))
+            if self.xrot and above:
+                # The label starts at its tick and runs up and away from the axes
+                text.draw(c, x - small * 0.36 * math.sin(math.radians(self.xrot)), rise, s, small, rgb, bold,
+                          ha = 'left' if self.xrot > 0 else 'right', rotation = self.xrot, va = 'baseline')
+            elif self.xrot:
                 # The label's end sits at its tick, and it hangs below the axis either way
-                text.draw(c, x + small * 0.36 * math.sin(math.radians(self.xrot)), y0 - pad, s, small,
-                          ink if heat else tick_rgb, pal.tick_bold, ha = 'right' if self.xrot > 0 else 'left',
-                          rotation = self.xrot, va = 'baseline')
+                text.draw(c, x + small * 0.36 * math.sin(math.radians(self.xrot)), y0 - pad, s, small, rgb, bold,
+                          ha = 'right' if self.xrot > 0 else 'left', rotation = self.xrot, va = 'baseline')
             else:
-                text.draw(c, x, y0 - pad, s, small, tick_rgb, pal.tick_bold, ha = 'center', va = 'top')
+                text.draw(c, x, rise if above else y0 - pad, s, small, rgb, bold, ha = 'center',
+                          va = 'bottom' if above else 'top')
         yw = 0.0
         for v, s in zip(self.yticks, self.ylabels):
             y = float(self._ty(v))
             yw = max(yw, text.width(s, ytext, pal.tick_bold))
+            rgb, bold = ((pal.color(self._yemph[s]), True) if s in self._yemph else
+                         (ink if heat else tick_rgb, pal.tick_bold))
             if self._yright:
-                text.draw(c, x0 + w + pad - 2.0, y, s, ytext, ink if heat else tick_rgb, pal.tick_bold, ha = 'left',
-                          va = 'center')
+                text.draw(c, x0 + w + ypad - 2.0 * pal.spacing, y, s, ytext, rgb, bold, ha = 'left', va = 'center')
             else:
-                text.draw(c, x0 - pad, y, s, ytext, ink if heat else tick_rgb, pal.tick_bold, ha = 'right',
-                          va = 'center')
+                text.draw(c, x0 - ypad, y, s, ytext, rgb, bold, ha = 'right', va = 'center')
         label_rgb = pal.color(pal.label_color or pal.ink)
         track = 0.9 if pal.caps else 0.0
         # Long axis names shrink to stay within their cell, centered on the axes
         rx, ry, rw, rh = self._room
         fits = (2 * min(x0 + w / 2 - rx, rx + rw - x0 - w / 2), 2 * min(y0 + h / 2 - ry, ry + rh - y0 - h / 2))
-        size_x, size_y = [max(LABEL_MIN, min(pal.label_size, pal.label_size * room / wide)) if wide else pal.label_size
-                          for room, wide in zip(fits, self._axis_name_widths(pal.label_size))]
+        base = [self._label_size[axis] or pal.label_size for axis in 'xy']
+        size_x, size_y = [max(min(LABEL_MIN, given), min(given, given * room / wide)) if wide else given
+                          for room, wide, given in zip(fits, [self._axis_name_widths(v)[i] for i, v in enumerate(base)],
+                                                       base)]
         if self.xlabel:
-            drop = pad + self._xtick_height() if self.xlabels and len(self.xticks) else off
-            text.draw(c, x0 + w / 2, y0 - drop - pal.label_size * 0.55, text.spaced(pal, self.xlabel), size_x,
+            drop = (pad + self._xtick_height() if self.xlabels and not above else off + xtl if len(self.xticks) else
+                    off)
+            gap = base[0] * 0.55 if self._label_pad['x'] is None else self._label_pad['x']
+            text.draw(c, x0 + w / 2, y0 - drop - gap, text.spaced(pal, self.xlabel), size_x,
                       label_rgb, pal.label_bold, ha = 'center', va = 'top', tracking = track)
         if self.ylabel:
-            beside = pad + yw if self.ylabels and len(self.yticks) else off
+            beside = ypad + yw if self.ylabels else off + ytl if len(self.yticks) else off
             # Further lines run away from the axes on the right, and towards them on the left
-            ylx = (x0 + w + beside + pal.label_size * 1.3 if self._yright else
-                   x0 - beside - self._ridge_width() - self._ylabel_room() + pal.label_size)
+            ylx = (x0 + w + beside + base[1] * 1.3 if self._yright else
+                   x0 - beside - self._ridge_width() - self._ylabel_room() + base[1])
             text.draw(c, ylx, y0 + h / 2, text.spaced(pal, self.ylabel), size_y, label_rgb, pal.label_bold,
                       ha = 'center', va = 'baseline', rotation = 90.0, tracking = track)
         if self.title_text:
             title_size = self._title_size()
-            text.draw(c, x0, y0 + h + 8.0 + 1.25 * title_size * _extra_lines(self.title_text), self.title_text,
-                      title_size, pal.color(pal.title_color or pal.ink), pal.title_bold, ha = 'left')
+            lift = rise - y0 - h + self._xtick_height() if above and self.xlabels and len(self.xticks) else 0.0
+            pad = 8.0 * pal.spacing if self._title_pad is None else self._title_pad
+            text.draw(c, x0, y0 + h + lift + pad + 1.25 * title_size * _extra_lines(self.title_text),
+                      self.title_text, title_size, pal.color(pal.title_color or pal.ink), pal.title_bold, ha = 'left')
         for a in self.artists:
             if a['kind'] == 'ridges' and a['labels'] is not None:
                 n = len(a['curves'])
                 for i, s in enumerate(self._ridge_labels):
                     t = text.spaced(pal, s)
-                    tsize = 7.8 if pal.caps else size + 1
-                    text.draw(c, x0 - 8.0, float(self._ty(n - 1 - i)) + 1.0, t, tsize, ink, pal.text_bold,
+                    tsize = 7.8 * pal.spacing if pal.caps else size + pal.spacing
+                    text.draw(c, x0 - 8.0 * pal.spacing, float(self._ty(n - 1 - i)) + pal.spacing, t, tsize, ink,
+                              pal.text_bold,
                               ha = 'right', tracking = track)
         lo, hi = sorted(self.ylim)
-        for a in sorted((r for r in self.artists if r['kind'] == 'text'), key = lambda r: r['order']):
-            if (a['clip'] and not (self._in_x(a['x']) and lo <= a['y'] <= hi)) or not math.isfinite(a['x'] + a['y']):
-                continue
+        texts = [a for a in sorted((r for r in self.artists if r['kind'] == 'text'), key = lambda r: r['order'])
+                 if math.isfinite(a['x'] + a['y'])
+                 and not (a['clip'] and not (self._in_x(a['x']) and lo <= a['y'] <= hi))]
+        placed, groups = {}, []
+        for side in ('left', 'right'):
+            # Only labels whose spans across the page overlap can collide, so each run of those moves on its own
+            spans = []
+            for a in (a for a in texts if a['spread'] and a['_ha'] == side):
+                start = float(self._tx(a['x'])) + a['_dx']
+                tw = text.width(a['s'], a['size'] or size, pal.text_bold if a['bold'] is None else a['bold'])
+                spans.append((start, start + tw, a) if side == 'left' else (start - tw, start, a))
+            for start, end, a in sorted(spans, key = lambda v: v[0]):
+                if groups and groups[-1][0] == side and start < groups[-1][1]:
+                    groups[-1][1] = max(groups[-1][1], end)
+                    groups[-1][2].append(a)
+                else:
+                    groups.append([side, end, [a]])
+        for _, _, group in groups:
+            want = np.array([float(self._ty(a['y'])) + a['dy'] for a in group])
+            gap = max((1.25 + a['linespacing'] * _extra_lines(a['s'])) * (a['size'] or size) for a in group)
+            order = np.argsort(want, kind = 'stable')
+            # Closest to where they belong under a least gap: shifted down by their rank's gaps, the positions only have
+            # to rise, which pooling adjacent violators solves exactly, and then the axes' height bounds all alike
+            blocks = []
+            for v in want[order] - gap * np.arange(len(group)):
+                blocks.append([v, 1])
+                while len(blocks) > 1 and blocks[-2][0] / blocks[-2][1] >= blocks[-1][0] / blocks[-1][1]:
+                    total, count = blocks.pop()
+                    blocks[-1][0] += total
+                    blocks[-1][1] += count
+            fit = np.concatenate([np.full(count, total / count) for total, count in blocks])
+            floor = y0 + gap / 2
+            fit = np.clip(fit, floor, max(floor, y0 + h - gap / 2 - gap * (len(group) - 1)))
+            placed.update((id(group[i]), (y, gap)) for i, y in zip(order, fit + gap * np.arange(len(group))))
+        for a in texts:
             bold = pal.text_bold if a['bold'] is None else a['bold']
             px = x0 + a['x'] * w if a['frac'] else float(self._tx(a['x']))
             py = y0 + a['y'] * h if a['frac'] else float(self._ty(a['y']))
+            ty, gap = placed.get(id(a), (py + a['dy'], 0.0))
+            if abs(ty - py - a['dy']) > 0.3 * gap:
+                way = 1.0 if a['_ha'] == 'left' else -1.0
+                k = pal.spacing
+                marks.polyline(c, [px + way * 2.0 * k, px + a['_dx'] - way * 1.5 * k], [py, ty], a['rgb'], 0.5 * k, 0.6,
+                               cap = 0)
             n = len(c.ops)
-            text.draw(c, px + a['_dx'], py + a['dy'], a['s'], a['size'] or size, a['rgb'], bold, ha = a['_ha'],
-                      va = a['va'], rotation = a['rotation'], halo = a['halo'], halo_color = pal.color('paper'))
+            text.draw(c, px + a['_dx'], ty, a['s'], a['size'] or size, a['rgb'], bold, ha = a['_ha'],
+                      va = a['va'], rotation = a['rotation'], halo = a['halo'], halo_color = pal.color('paper'),
+                      linespacing = a['linespacing'])
             if a['tag']:
                 for op in c.ops[n:]:
                     op['label'] = (a['order'], id(self), a['s'])
         # Right of the axes, in order: tick labels, the axis name, the legend, and the color bar
         right = 0.0
         if self._yright:
-            right = (yw + pad if len(self.yticks) else 0.0) + self._ylabel_room()
+            right = (yw + ypad if self.ylabels else off + ytl if len(self.yticks) else 0.0) + self._ylabel_room()
         self._draw_legend(c, right)
         if self._cbar:
             self._draw_colorbar(c, right)
 
     def _draw_colorbar(self, c, right):
         pal = self.pal
+        k, bar = pal.spacing, COLORBAR_WIDTH * pal.spacing
         x0, y0, w, h = self.rect
         scale = self._cbar['source']._scale
         lo, hi = scale['lo'], scale['hi']
@@ -1430,28 +1693,29 @@ class Axes:
         ticks = [t for t in nice_ticks(lo, hi, 5) if lo <= t <= hi and (t == int(t) or not self._cbar['integer'])]
         ink, label = pal.color(pal.ink), self._cbar['label']
         if self._cbar['loc'] == 'fill':
-            bh = min(9.0, h * 0.3)
+            bh = min(9.0 * k, h * 0.3)
             bw, by = w * 0.8, y0 + h * 0.34
             marks.polygon(c, [x0, x0 + bw, x0 + bw, x0], [by, by, by + bh, by + bh], None, 1.0,
                           ((x0, by, x0 + bw, by), stops))
-            for t, s in zip(ticks, tick_labels(ticks)):
+            for t, s in zip(ticks, _minus(pal, tick_labels(ticks))):
                 tx = x0 + (t - lo) / span * bw
-                text.draw(c, tx, by - 3.0, s, 7.4, ink, ha = 'center', va = 'top')
+                text.draw(c, tx, by - 3.0 * k, s, 7.4 * k, ink, ha = 'center', va = 'top')
             if label:
-                text.draw(c, x0, by + bh + 4.0, text.spaced(pal, label), 7.8 if pal.caps else 8.6, ink, ha = 'left')
+                text.draw(c, x0, by + bh + 4.0 * k, text.spaced(pal, label), (7.8 if pal.caps else 8.6) * k, ink,
+                          ha = 'left')
             return
-        right += self._legend_grid()[1][0] + 18.0 if self.legend_items and self._legend_opts == 'right' else 0.0
-        bx = x0 + w + right + 12.0
-        bh = min(h * 0.6, 170.0)
+        right += self._legend_grid()[1][0] + 18.0 * k if self.legend_items and self._legend_opts == 'right' else 0.0
+        bx = x0 + w + right + 12.0 * k
+        bh = min(h * 0.6, 170.0 * k)
         by = y0 + h - bh
-        marks.polygon(c, [bx, bx + COLORBAR_WIDTH, bx + COLORBAR_WIDTH, bx], [by, by, by + bh, by + bh], None, 1.0,
+        marks.polygon(c, [bx, bx + bar, bx + bar, bx], [by, by, by + bh, by + bh], None, 1.0,
                       ((bx, by, bx, by + bh), stops))
         widest = 0.0
-        for t, s in zip(ticks, tick_labels(ticks)):
-            text.draw(c, bx + COLORBAR_WIDTH + 5.0, by + (t - lo) / span * bh, s, 8.4, ink, va = 'center')
-            widest = max(widest, text.width(s, 8.4))
+        for t, s in zip(ticks, _minus(pal, tick_labels(ticks))):
+            text.draw(c, bx + bar + 5.0 * k, by + (t - lo) / span * bh, s, 8.4 * k, ink, va = 'center')
+            widest = max(widest, text.width(s, 8.4 * k))
         if label:
-            text.draw(c, bx + COLORBAR_WIDTH + 5.0 + widest + pal.label_size * 1.3, by + bh / 2,
+            text.draw(c, bx + bar + 5.0 * k + widest + pal.label_size * 1.3, by + bh / 2,
                       text.spaced(pal, label), pal.label_size, pal.color(pal.label_color or pal.ink), pal.label_bold,
                       ha = 'center', va = 'baseline', rotation = 90.0)
 
@@ -1459,33 +1723,36 @@ class Axes:
         pal = self.pal
         if not self.legend_items or self._legend_opts is None:
             return
+        u, row = pal.spacing, LEGEND_ROW * pal.spacing
         x0, y0, w, h = self.rect
         size, track, entries = self._legend_entries()
         spots, (tw, th) = self._legend_grid()
         loc = self._legend_opts
         if loc == 'right':
-            left, top = x0 + w + right + 16.0, y0 + h - 8.0
+            left, top = x0 + w + right + 16.0 * u, y0 + h - 8.0 * u
         elif loc == 'below':
-            rows = round(th / LEGEND_ROW)
+            rows = round(th / row)
             left = x0 if tw >= w else x0 + (w - tw) / 2
-            top = (y0 - 40.0 if self._legend_y is None else self._legend_y) + (rows - 1) * LEGEND_ROW
+            top = (y0 - 40.0 * u if self._legend_y is None else self._legend_y) + (rows - 1) * row
         else:
-            left = x0 + w - tw - 8.0 if 'right' in loc else x0 + 10.0
-            top = y0 + h - 12.0 if 'upper' in loc else y0 + 12.0 + th - LEGEND_ROW
+            left = x0 + w - tw - 8.0 * u if 'right' in loc else x0 + 10.0 * u
+            top = y0 + h - 12.0 * u if 'upper' in loc else y0 + 12.0 * u + th - row
         for (dx, dy), (s, rgb, k, marker, area, _) in zip(spots, entries):
             x, y = left + dx, top - dy
             if k == 'header':
                 text.draw(c, x, y, s, size, pal.color(pal.ink), True, va = 'center', tracking = track)
                 continue
             if k == 'line':
-                marks.polyline(c, [x, x + 12.0], [y, y], rgb, max(pal.line_width, 1.2), cap = 0, dash = marker)
+                marks.polyline(c, [x, x + 12.0 * u], [y, y], rgb, max(pal.line_width, 1.2 * u), cap = 0, dash = marker)
             elif k == 'point':
                 # As large as in the plot, up to what a legend row can hold
-                marks.points(c, pal, [x + 6.0], [y], min(area, 196.0 / pal.point_scale), rgb, marker = marker)
+                marks.points(c, pal, [x + 6.0 * u], [y], min(area, 196.0 * u * u / pal.point_scale), rgb,
+                             marker = marker)
             else:
-                marks.polygon(c, [x, x + 12.0, x + 12.0, x], [y - 4.5, y - 4.5, y + 4.5, y + 4.5], rgb)
-            text.draw(c, x + 17.0, y, s, size, pal.color(pal.ink), pal.text_bold, va = 'center', tracking = track,
-                      halo = 0.0 if loc in ('right', 'below') else 2.6, halo_color = pal.color('paper'))
+                lo, hi = y - 4.5 * u, y + 4.5 * u
+                marks.polygon(c, [x, x + 12.0 * u, x + 12.0 * u, x], [lo, lo, hi, hi], rgb)
+            text.draw(c, x + 17.0 * u, y, s, size, pal.color(pal.ink), pal.text_bold, va = 'center', tracking = track,
+                      halo = 0.0 if loc in ('right', 'below') else 2.6 * u, halo_color = pal.color('paper'))
 
 
 def _recorded(method):

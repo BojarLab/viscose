@@ -102,9 +102,11 @@ fig, heat = vc.clustermap(df, palette = 'aura', title = 'Glycan abundance by tis
 
 | | |
 |---|---|
-| **Plots** | `plot`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `boxplot`, `contour`, `stem`, `hlines`, `vlines`, `arrow`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, `axhspan`, `axvspan`, `image`, and `vc.clustermap` |
-| **Markers** | `o`, `s`, `D`, `^`, `v`, `>`, `<`, `X`, `P`, and `*`, all with the palette's effects |
-| **Annotation** | `text`, `annotate`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text |
+| **Plots** | `plot`, `step`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `boxplot`, `contour`, `stem`, `hlines`, `vlines`, `arrow`, `rectangle`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, `axline`, `axhspan`, `axvspan`, `image`, and `vc.clustermap` |
+| **Markers** | `o`, `s`, `D`, `^`, `v`, `>`, `<`, `X`, `P`, `*`, `h`, and `p`, all with the palette's effects |
+| **Annotation** | `text`, `annotate`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text; `annotate(spread = True)` names line ends directly, moving labels apart exactly as little as it takes, with a hairline to each one that moved |
+| **Pages** | `vc.Figure(183, 120, unit = 'mm')` is a journal page, `fig.add_axes((x, y, w, h), unit = 'mm')` places a panel from its top left, and `fig.letter(x, y, 'a', 'Heading')` and `fig.text` write panel letters and any other text on the page; `vc.subplot_mosaic('abc;ddd')` lets axes span cells of a grid |
+| **Axes** | `set_xscale` takes `linear`, `log`, `sqrt`, or any pair of functions; `fmt` on `set_xticks` and `set_yticks` writes the ticks, as `'{:.0%}'` or a function; `tick_params` sets each axis's tick length, pad, label size, and labels, puts x labels on top, or keeps labels exactly as set; `emphasis` sets chosen tick labels bold in a color; `set_spines` shows or hides each axis line |
 | **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, long axis names shrink, and the page grows for anything that needs it |
 | **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window |
 | **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, for placing things yourself or answering a mouse |
@@ -148,6 +150,8 @@ vc.register_palette(vc.Palette('midnight', ['#14213D', '#27477E', '#5C85C5', '#C
                                '#14213D', '#5A6478', '#E6EAF1', point = 'sphere', bar = 'deep', shadow = 0.4))
 fig, ax = vc.subplots(palette = 'midnight')
 ```
+
+A palette can also bring a house or journal font (`font = ('Arial', 'arial.ttf', 'arialbd.ttf')`), a true minus sign (`minus = '−'`), `spacing` that tightens every gap, pad, and legend row for six-point type, and color scales of its own (`sequential_stops`, `diverging_stops`), so a journal's figure style is one palette.
 
 A palette's `paper` is the color of its page, white unless you say otherwise, and every format draws on it. For a dark page, give it a light
 `ink` and order its shades from the strongest against the page to the faintest, so that rings, halos, and scales follow.

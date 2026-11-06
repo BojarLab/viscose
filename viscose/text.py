@@ -1,7 +1,9 @@
 """Fonts and text: Century Gothic where installed, sub- and superscripts, spaced capitals and halos."""
+import contextlib
 import math
 import os
 import re
+import threading
 from glycorender import pdfwrite
 from glycorender.pdfwrite import TTFont, pdfmetrics
 
@@ -13,8 +15,38 @@ _SCRIPTS = str.maketrans({**{c: f'_{{{v}}}' for c, v in zip('₀₁₂₃₄₅�
                           **{c: f'^{{{v}}}' for c, v in zip('⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻', '0123456789+-')}})
 
 
+# The family a figure is laid out and drawn in, per thread, as figures can be drawn on worker threads side by side
+_family = threading.local()
+# Families whose files this machine lacks, so that each is looked for once
+_missing = set()
+
+
+@contextlib.contextmanager
+def family(font):
+    """Text measured and drawn in a palette's (name, regular file, bold file) family while inside, or in the default
+    family for an empty one."""
+    before = getattr(_family, 'font', ())
+    _family.font = tuple(font)
+    try:
+        yield
+    finally:
+        _family.font = before
+
+
 def fonts():
-    """Regular and bold font names, registered once; glycorender's bundled Comfortaa where Century Gothic is missing."""
+    """Regular and bold font names, registered once: the current palette's family where this machine has it, else
+    Century Gothic, else glycorender's bundled Comfortaa."""
+    font = getattr(_family, 'font', ())
+    if font and font[0] not in _missing:
+        name, regular, bold = font
+        if name + '-Bold' not in pdfmetrics.fonts:
+            try:
+                pdfmetrics.registerFont(TTFont(name, regular))
+                pdfmetrics.registerFont(TTFont(name + '-Bold', bold))
+            except FileNotFoundError:
+                _missing.add(name)
+        if name not in _missing:
+            return name, name + '-Bold'
     if 'CenturyGothic-Bold' in pdfmetrics.fonts:
         return 'CenturyGothic', 'CenturyGothic-Bold'
     if 'Comfortaa-Bold' in pdfmetrics.fonts:
@@ -80,8 +112,9 @@ def outline(c, ttf, text, x, y, size):
 
 
 def draw(c, x, y, text, size, color, bold = False, ha = 'left', va = 'baseline', rotation = 0.0, tracking = 0.0,
-         halo = 0.0, halo_color = (1.0, 1.0, 1.0)):
-    """Draw text at (x, y) in page points; several lines run downward as one block that `va` places."""
+         halo = 0.0, halo_color = (1.0, 1.0, 1.0), linespacing = 1.25):
+    """Draw text at (x, y) in page points; several lines, `linespacing` sizes apart, run downward as one block that
+    `va` places."""
     text = str(text)
     if not text:
         return
@@ -89,7 +122,7 @@ def draw(c, x, y, text, size, color, bold = False, ha = 'left', va = 'baseline',
         parts = text.split('\n')
         lift = {'center': 0.5, 'bottom': 1.0}.get(va, 0.0) * (len(parts) - 1)
         for i, part in enumerate(parts):
-            drop = (i - lift) * size * 1.25
+            drop = (i - lift) * size * linespacing
             draw(c, x + drop * math.sin(math.radians(rotation)), y - drop * math.cos(math.radians(rotation)), part,
                  size, color, bold, ha, va, rotation, tracking, halo, halo_color)
         return

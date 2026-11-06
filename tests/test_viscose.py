@@ -1813,3 +1813,370 @@ def test_a_page_held_to_a_window_never_grows():
     assert fig.to_png(72.0) == fig.to_png(72.0)
     fig.set_size(3, 2).layout()
     assert (fig.width, fig.height) == (3 * 72.0, 2 * 72.0)
+
+
+def _paper_page(palette):
+    """A journal page with every piece of the paper layer."""
+    fig = vc.Figure(183, 90, palette = palette, unit = 'mm')
+    x = np.linspace(0, 1, 12)
+    a = fig.add_axes((16, 12, 60, 50), unit = 'mm')
+    for k in range(4):
+        a.plot(x, 0.5 * x ** (1 + k / 4))
+        a.annotate(f'line {k}', (1, 0.5), offset = (4, 0), spread = True)
+    a.set_yscale('sqrt')
+    a.set_yticks([0, 0.05, 0.1, 0.3, 0.5], fmt = '{:.0%}')
+    b = fig.add_axes((100, 12, 60, 50), unit = 'mm')
+    b.step(x, x ** 2, where = 'post')
+    b.tick_params(axis = 'y', length = 0, labels = False)
+    b.set_spines(left = False)
+    b.set_xscale('function', functions = (np.sqrt, np.square))
+    fig.letter(2, 4, 'a', 'Heading')
+    fig.letter(86, 4, 'b')
+    fig.text(0.98, 0.02, 'note', ha = 'right')
+    return fig
+
+
+def _texts(c):
+    return [o['text'] for o in c.ops if o['kind'] == 'text']
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_a_page_in_millimeters_keeps_its_size_and_places_axes_from_the_top_left(name):
+    fig = _paper_page(name)
+    c = fig._canvas()
+    mm = 72.0 / 25.4
+    assert fig.width == pytest.approx(183 * mm) and fig.height == pytest.approx(90 * mm)
+    assert fig.axes[0].rect == pytest.approx((16 * mm, (90 - 62) * mm, 60 * mm, 50 * mm))
+    heading = 'HEADING' if fig.pal.caps else 'Heading'
+    assert {'a', heading, 'b', 'note', '0%', '50%'} <= set(_texts(c))
+    assert fig.to_png(72.0)[:4] == b'\x89PNG' and fig.to_pdf()[:4] == b'%PDF' and '<svg' in fig.to_svg()
+
+
+def test_a_paper_page_in_another_palette_equals_one_drawn_in_it():
+    assert _paper_page('poster').in_palette('couture').to_png(72.0) == _paper_page('couture').to_png(72.0)
+    assert _paper_page('lumen').in_palette('aura').to_pdf() == _paper_page('aura').to_pdf()
+
+
+def test_a_letter_heading_sits_on_the_letter_baseline():
+    fig = vc.Figure(100, 50, palette = 'couture', unit = 'mm')
+    fig.letter(5, 5, 'a', 'Heading')
+    letter, heading = [o for o in fig._canvas().ops if o['kind'] == 'text']
+    baseline = lambda o: o['ctm'][5] + o['y']
+    assert baseline(letter) == pytest.approx(baseline(heading)) and heading['ctm'][4] > letter['ctm'][4]
+    with pytest.raises(ValueError, match = 'unit'):
+        fig.text(0, 0, 'x', unit = 'cm')
+
+
+def test_sqrt_and_function_scales_space_by_their_map():
+    for scale, functions in (('sqrt', None), ('function', (np.sqrt, np.square))):
+        fig, ax = vc.subplots(figsize = (4, 4))
+        ax.plot([0, 1], [0, 1])
+        ax.set_xlim(0, 1)
+        ax.set_xscale(scale, functions)
+        fig.layout()
+        x0, _, w, _ = ax.rect
+        assert float(ax._tx(0.25)) == pytest.approx(x0 + w / 2)
+        assert float(ax.data(*ax.page(0.36, 0.5))[0]) == pytest.approx(0.36)
+    with pytest.raises(ValueError, match = 'scale'):
+        ax.set_yscale('symlog')
+    with pytest.raises(ValueError, match = 'functions'):
+        ax.set_yscale('sqrt', (np.sqrt, np.square))
+    with pytest.raises(ValueError, match = 'functions'):
+        ax.set_yscale('function')
+
+
+def test_a_sqrt_axis_keeps_zero_and_below_in_order():
+    fig, ax = vc.subplots(figsize = (4, 4))
+    ax.scatter([-0.04, 0, 0.01, 0.6], [0, 1, 2, 3])
+    ax.set_xscale('sqrt')
+    fig.layout()
+    assert np.all(np.diff(ax._tx([-0.04, 0, 0.01, 0.6])) > 0) and ax.xlim[0] < -0.04
+
+
+def test_tick_formats_write_automatic_and_given_ticks():
+    fig, ax = vc.subplots(figsize = (4, 4))
+    ax.plot([0, 1], [0, 2])
+    ax.set_xticks(fmt = '{:.0%}')
+    ax.set_yticks([0, 1, 2], fmt = lambda v: f'{v:g} mM')
+    fig.layout()
+    assert ax.xlabels[0] == '0%' and ax.xlabels[-1] == '100%' and ax.ylabels == ['0 mM', '1 mM', '2 mM']
+    with pytest.raises(ValueError, match = 'need the ticks'):
+        ax.set_xticks(labels = ['a'])
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_tick_params_set_length_pad_size_and_labels_per_axis(name):
+    def margins(**kw):
+        fig, ax = vc.subplots(figsize = (4, 4), palette = name)
+        ax.plot([0, 1], [0, 1])
+        ax.tick_params(**kw)
+        fig.layout()
+        return ax, ax._margins()
+    _, plain = margins()
+    ax, hidden = margins(axis = 'y', labels = False)
+    assert hidden[0] < plain[0] and hidden[2] == plain[2] and ax.ylabels == [] and len(ax.yticks)
+    assert not set(_texts(ax.figure._canvas())) & {'0.2', '0.4', '0.6', '0.8'} - set(ax.xlabels)
+    _, padded = margins(axis = 'x', pad = 20)
+    assert padded[2] == pytest.approx(plain[2] + 15) and padded[0] == plain[0]
+    ax, small = margins(labelsize = 5)
+    assert ax._tick_sizes() == (5, 5) and small[0] < plain[0]
+    with pytest.raises(ValueError, match = 'axis'):
+        ax.tick_params(axis = 'z')
+
+
+def test_tick_length_zero_drops_the_ticks_from_the_page():
+    def ticks(**kw):
+        fig, ax = vc.subplots(figsize = (4, 4), palette = 'couture')
+        ax.plot([0, 1], [0, 1])
+        ax.tick_params(**kw)
+        return len(fig._canvas().ops), ax._margins()[0]
+    (with_ticks, left), (without, tight) = ticks(), ticks(axis = 'y', length = 0)
+    assert without < with_ticks and tight == pytest.approx(left - get_palette('couture').tick_length)
+
+
+def test_set_spines_overrides_the_palette():
+    def spines(name, **kw):
+        fig, ax = vc.subplots(figsize = (4, 4), palette = name)
+        ax.bar([1, 2], [1, 2])
+        ax.set_spines(**kw)
+        return ax._spines()
+    assert spines('aura') == () and spines('aura', left = True) == ('left', )
+    assert spines('couture', left = False) == ('bottom', ) and spines('couture') == ('left', 'bottom')
+
+
+def test_steps_turn_at_their_points():
+    for where, xs, ys in (('pre', [0, 0, 1, 1, 2], [1, 2, 2, 3, 3]), ('post', [0, 1, 1, 2, 2], [1, 1, 2, 2, 3]),
+                          ('mid', [0, 0.5, 0.5, 1.5, 1.5, 2], [1, 1, 2, 2, 3, 3])):
+        fig, ax = vc.subplots(figsize = (3, 3))
+        ax.step([0, 1, 2], [1, 2, 3], where = where, label = where)
+        line = ax.artists[0]
+        assert line['x'].tolist() == xs and line['y'].tolist() == ys and ax.legend_items[0][0] == where
+    with pytest.raises(ValueError, match = 'where'):
+        ax.step([0, 1], [0, 1], where = 'after')
+
+
+def test_spread_labels_part_as_little_as_they_must():
+    fig, ax = vc.subplots(figsize = (5, 5), palette = 'poster')
+    ax.plot([0, 10], [0, 10])
+    for s, y in (('one', 5.0), ('two', 5.0), ('three', 5.05)):
+        ax.annotate(s, (5, y), offset = (6, 0), size = 8, spread = True)
+    # A label in a column of its own, or on the other side, stays where it belongs
+    ax.annotate('apart', (0.2, 5.0), offset = (6, 0), size = 8, spread = True)
+    ax.annotate('still', (5, 5.0), offset = (-6, 0), size = 8, ha = 'right', spread = True)
+    c = fig._canvas()
+    y = {o['text']: o['ctm'][5] for o in c.ops if o['kind'] == 'text'}
+    column = [y[s] for s in ('one', 'two', 'three')]
+    assert np.diff(sorted(column)) == pytest.approx([1.25 * 8] * 2)
+    # Least squares under the gap puts the column's middle where its points' middle is
+    want = [float(ax._ty(v)) for v in (5.0, 5.0, 5.05)]
+    assert np.mean(column) == pytest.approx(np.mean(want))
+    assert y['apart'] == pytest.approx(want[0]) and y['still'] == pytest.approx(want[0])
+    # Only moved labels get a leader
+    leaders = [o for o in c.ops if o['kind'] == 'path' and o.get('stroke') and o['line_width'] == 0.5]
+    assert len(leaders) == 2
+
+
+def _journal(name = 'journal', **settings):
+    """A palette for small type, from couture's colors."""
+    pal = get_palette('couture')
+    base = dict(point = 'flat', bar = 'flat', spines = ('left', 'bottom'), tick_size = 5.8, label_size = 6.5,
+                title_size = 7.0, spacing = 0.55)
+    base.update(settings)
+    return vc.Palette(name, pal.a, pal.b, pal.ink, pal.muted, pal.faint, **base)
+
+
+def test_spacing_scales_the_gaps_that_the_plot_code_sets():
+    def margins(spacing):
+        fig, ax = vc.subplots(figsize = (4, 4), palette = _journal(spacing = spacing))
+        ax.plot([0, 1], [0, 1], label = 'line')
+        ax.set_title('Title', size = 7)
+        ax.legend('below')
+        fig.layout()
+        return np.array(ax._margins()), ax._legend_grid()[1][1]
+    (wide, row), (tight, short) = margins(1.0), margins(0.5)
+    assert np.all(tight < wide) and short == pytest.approx(row / 2)
+    fig, ax = vc.subplots(figsize = (4, 4), palette = _journal(spacing = 0.5))
+    ax.annotate('note', (0.5, 0.5))
+    assert ax.artists[0]['size'] == pytest.approx(4.3) and ax.artists[0]['halo'] == pytest.approx(1.3)
+
+
+def test_a_palette_font_is_used_where_the_machine_has_it_and_falls_back_where_not():
+    from viscose import text
+    missing = _journal('nofont', font = ('NoSuchFamily', 'no_such_font.ttf', 'no_such_font_bold.ttf'))
+    fig, ax = vc.subplots(figsize = (3, 3), palette = missing)
+    ax.set_title('Falls back', size = 7)
+    fonts = {o['font'] for o in fig._canvas().ops if o['kind'] == 'text'}
+    assert fonts and fonts <= set(text.fonts())
+    with pytest.raises(ValueError, match = 'font'):
+        _journal('bad', font = ('Arial', ))
+
+
+def test_a_palette_brings_its_own_scales():
+    pal = _journal(sequential_stops = ('#ffffff', '#ff0000', '#000000'),
+                   diverging_stops = ('#0000ff', '#ffffff', '#ff0000'))
+    assert tuple(pal.sequential(0.5)) == pytest.approx((1.0, 0.0, 0.0))
+    assert tuple(pal.diverging(0.0)) == pytest.approx((0.0, 0.0, 1.0))
+    assert tuple(get_palette('aura').sequential(1.0)) == pytest.approx(get_palette('aura').color('a0'))
+    with pytest.raises(ValueError, match = 'stops'):
+        _journal('one', sequential_stops = ('#ffffff', ))
+
+
+@pytest.mark.parametrize('marker', ['h', 'p'])
+def test_hexagons_and_pentagons_cover_about_a_circle(marker):
+    from viscose.marks import MARKERS
+    xs, ys = np.array(MARKERS[marker]).T
+    area = 0.5 * abs(np.dot(xs, np.roll(ys, -1)) - np.dot(ys, np.roll(xs, -1)))
+    assert area == pytest.approx(np.pi, rel = 0.03)
+    fig, ax = vc.subplots(figsize = (3, 3))
+    ax.scatter(np.arange(60.0), np.arange(60.0), marker = marker)
+    assert fig.to_png(72)[:4] == b'\x89PNG' and fig.to_pdf()[:4] == b'%PDF'
+
+
+def test_axline_crosses_the_axes_and_leaves_the_limits_alone():
+    fig, ax = vc.subplots(figsize = (3, 3), palette = 'couture')
+    ax.scatter([1, 2], [1, 3])
+    before = ax.get_xlim(), ax.get_ylim()
+    ax.axline((0, 0), slope = 1, label = 'identity')
+    assert (ax.get_xlim(), ax.get_ylim()) == before and ax.legend_items[-1][0] == 'identity'
+    c = fig._canvas()
+    line = [o for o in c.ops if o.get('stroke') and o.get('dash')][-1]
+    (_, x0, y0), (_, x1, y1) = line['path'][0], line['path'][1]
+    assert (y1 - y0) / (x1 - x0) > 0 and line['clip'] is not None
+    with pytest.raises(ValueError, match = 'slope'):
+        ax.axline((0, 0))
+
+
+def test_rectangles_fill_and_outline_in_data_or_axes_fractions():
+    fig, ax = vc.subplots(figsize = (3, 3), palette = 'poster')
+    ax.rectangle(0, 0, 2, 1, color = 'a2', radius = 3)
+    ax.rectangle(0.1, 0.1, 0.5, 0.5, color = 'none', edge = ('ink', 0.5), axes_fraction = True)
+    assert ax.get_xlim()[1] > 2
+    ops = [o for o in fig._canvas().ops if o['kind'] == 'path' and not o.get('mark')]
+    filled = [o for o in ops if o['fill'] and o['fill_rgb'] == fig.pal.color('a2')]
+    outlined = [o for o in ops if o['stroke'] and not o['fill'] and o['line_width'] == 0.5]
+    assert filled and any(s[0] == 'c' for s in filled[0]['path']) and outlined
+
+
+def test_arrows_shrink_take_a_head_length_and_bend():
+    def shaft(**kw):
+        fig, ax = vc.subplots(figsize = (3, 3), palette = 'poster')
+        ax.set_xlim(0, 10)
+        ax.set_ylim(0, 10)
+        ax.arrow(1, 5, 9, 5, **kw)
+        ops = [o for o in fig._canvas().ops if o.get('mark')]
+        return ops[0]['path'], ops[-1]['path']
+    (line, _), (short, _) = shaft(), shaft(shrink = (10, 10))
+    assert short[0][1] == pytest.approx(line[0][1] + 10)
+    _, head = shaft(head = 3)
+    assert max(s[1] for s in head if len(s) > 1) - min(s[1] for s in head if len(s) > 1) == pytest.approx(3)
+    bent, _ = shaft(bend = 0.2)
+    assert len(bent) > 3 and max(s[2] for s in bent if len(s) > 1) > line[0][2] + 1
+
+
+def test_linespacing_sets_the_distance_between_lines():
+    def gap(spacing):
+        fig, ax = vc.subplots(figsize = (3, 3))
+        ax.text(0.5, 0.5, 'one\ntwo', size = 10, axes_fraction = True, linespacing = spacing)
+        one, two = [o['ctm'][5] for o in fig._canvas().ops if o['kind'] == 'text' and o['text'] in ('one', 'two')]
+        return one - two
+    assert gap(1.0) == pytest.approx(10.0) and gap(1.25) == pytest.approx(12.5)
+
+
+def test_emphasized_tick_labels_are_bold_in_their_color():
+    fig, ax = vc.subplots(figsize = (3, 3), palette = 'couture')
+    ax.barh(['one', 'two', 'ours'], [1, 2, 3])
+    ax.set_yticks([0, 1, 2], ['one', 'two', 'ours'], emphasis = {'ours': 'a1'})
+    ops = {o['text']: o for o in fig._canvas().ops if o['kind'] == 'text'}
+    assert ops['ours']['fill_rgb'] == fig.pal.color('a1') and ops['ours']['font'].endswith('Bold')
+    assert not ops['one']['font'].endswith('Bold')
+
+
+def test_x_labels_on_top_take_their_room_above():
+    def layout(**kw):
+        fig, ax = vc.subplots(figsize = (4, 4), palette = 'couture')
+        ax.heatmap(np.eye(3), ['alpha', 'beta', 'gamma'], ['a', 'b', 'c'])
+        ax.set_title('Map', size = 9)
+        ax.tick_params(axis = 'x', **kw)
+        fig.layout()
+        labels = {o['text']: o['ctm'][5] for o in fig._canvas().ops if o['kind'] == 'text'}
+        return ax, labels
+    low, below = layout()
+    ax, above = layout(top = True)
+    assert below['alpha'] < low.rect[1] and above['alpha'] > ax.rect[1] + ax.rect[3] and above['Map'] > above['alpha']
+    with pytest.raises(ValueError, match = 'top'):
+        ax.tick_params(axis = 'y', top = True)
+
+
+def test_axis_names_take_their_own_size():
+    fig, ax = vc.subplots(figsize = (3, 3), palette = 'poster')
+    ax.plot([0, 1], [0, 1])
+    ax.set_xlabel('Power', size = 5.6)
+    ax.set_ylabel('FDR', size = 9)
+    sizes = {o['text']: o['size'] for o in fig._canvas().ops if o['kind'] == 'text'}
+    assert sizes['POWER' if fig.pal.caps else 'Power'] == 5.6 and sizes['FDR'] == 9
+
+
+def test_heatmap_annotations_take_a_function():
+    fig, ax = vc.subplots(figsize = (3, 3))
+    ax.heatmap(np.array([[0.25, 0.5]]), annot = True, fmt = lambda v: f'{100 * v:.0f}%')
+    assert {a['s'] for a in ax.artists if a['kind'] == 'text'} == {'25%', '50%'}
+
+
+def test_a_mosaic_spans_cells_and_leaves_dots_empty():
+    fig, axes = vc.subplot_mosaic([['a', 'b', '.'], ['c', 'c', 'c']], figsize = (6, 4), height_ratios = [2, 1])
+    assert set(axes) == {'a', 'b', 'c'} and axes['c']._span == (1, 3)
+    for ax in axes.values():
+        ax.plot([0, 1], [0, 1])
+    fig.layout()
+    a, b, c = (axes[k].rect for k in 'abc')
+    assert c[2] > 2.5 * a[2] and c[1] + c[3] < a[1] and a[3] > c[3] and b[0] > a[0] + a[2]
+    direct, twins = vc.subplot_mosaic([['a', 'b', '.'], ['c', 'c', 'c']], figsize = (6, 4), height_ratios = [2, 1],
+                                      palette = 'aura')
+    for ax in twins.values():
+        ax.plot([0, 1], [0, 1])
+    assert fig.in_palette('aura').to_png(72) == direct.to_png(72)
+    with pytest.raises(ValueError, match = 'rectangle'):
+        vc.subplot_mosaic('ab;ba')
+    fig, axes = vc.subplot_mosaic('ab;cc')
+    assert axes['c']._span == (1, 2)
+
+
+def test_a_palette_minus_writes_numbers_only():
+    fig, ax = vc.subplots(figsize = (3, 3), palette = _journal(minus = '−'))
+    ax.bar(['-a', 'b'], [-2, 3])
+    fig.layout()
+    assert '−2' in ax.ylabels and ax.xlabels == ['-a', 'b']
+    fig, ax = vc.subplots(figsize = (3, 3))
+    ax.plot([-2, 2], [0, 1])
+    fig.layout()
+    assert '-2' in ax.xlabels
+
+
+def test_labels_that_fit_false_keeps_stay_as_set():
+    def labels(**kw):
+        fig, ax = vc.subplots(figsize = (2, 2), palette = 'poster')
+        ax.plot([0, 100], [0, 1])
+        ax.set_xticks(list(range(0, 101, 10)), [f'{v} units' for v in range(0, 101, 10)])
+        ax.set_yticks(list(np.linspace(0, 1, 21)))
+        ax.tick_params(**kw)
+        fig.layout()
+        return ax
+    crowded, kept = labels(), labels(fit = False)
+    assert crowded.xrot == 90.0 and len(crowded.yticks) < 21
+    assert kept.xrot == 0.0 and len(kept.xticks) == 11 and len(kept.yticks) == 21
+
+
+def test_a_title_pad_moves_the_title_and_its_room():
+    def place(pad):
+        fig, ax = vc.subplots(figsize = (3, 3))
+        ax.plot([0, 1], [0, 1])
+        ax.set_title('Title', size = 9, pad = pad)
+        title = [o for o in fig._canvas().ops if o['kind'] == 'text' and o['text'] == 'Title'][0]
+        return title['ctm'][5] - (ax.rect[1] + ax.rect[3]), ax._margins()[3]
+    (near, room), (far, more) = place(2.0), place(12.0)
+    assert near == pytest.approx(2.0) and far == pytest.approx(12.0) and more == pytest.approx(room + 10.0)
+
+
+def test_nice_ticks_take_quarter_steps():
+    assert nice_ticks(0, 0.8, 4) == [0, 0.2, 0.4, 0.6, 0.8]
+    assert nice_ticks(0, 0.8, 4, steps = (1, 2, 2.5, 5, 10)) == [0, 0.25, 0.5, 0.75]

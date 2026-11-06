@@ -1,5 +1,6 @@
 """Figure: lays out axes, draws through glycorender's display list and writes PNG, PDF, or SVG."""
 import builtins
+import functools
 import math
 import os
 import subprocess
@@ -28,6 +29,8 @@ METRICS = ('euclidean', 'sqeuclidean', 'cityblock', 'chebyshev', 'cosine', 'corr
            'jensenshannon')
 # Elements per block of a min-plus product, which keeps each block in the processor's cache
 MINPLUS_BLOCK = 1 << 16
+# Points per unit of a page's size, and of a position given in millimeters from a page's top left
+UNITS = {'in': 72.0, 'mm': 72.0 / 25.4}
 
 
 def show_png(png, viewer = True):
@@ -146,16 +149,35 @@ def _with_ids(svg, ops):
     return svg[:start] + '\n'.join(out) + svg[end:]
 
 
+def _in_font(method):
+    """Layout and drawing measure and set text in the family of the figure's palette."""
+    @functools.wraps(method)
+    def call(self, *args, **kwargs):
+        with text.family(self.pal.font):
+            return method(self, *args, **kwargs)
+    return call
+
+
+def _unit(unit, allowed):
+    """A unit's name, as any other would quietly be read as one of these."""
+    if unit not in allowed:
+        raise ValueError(f"unit has to be {' or '.join(map(repr, allowed))}, got {unit!r}")
+    return unit
+
+
 class Figure:
-    def __init__(self, width = 8.0, height = 8.0, palette = None):
-        """A figure of the given size in inches. Its palette decides the type, axes, and special effects."""
+    def __init__(self, width = 8.0, height = 8.0, palette = None, unit = 'in'):
+        """A figure of the given size, in inches or with unit = 'mm' in millimeters, as a journal gives its columns
+        (89 and 183 mm for one and two in Nature's). Its palette decides the type, axes, and special effects."""
         self.pal = get_palette(palette)
-        self.width, self.height = width * 72.0, height * 72.0
+        k = UNITS[_unit(unit, ('in', 'mm'))]
+        self.width, self.height = width * k, height * k
         self._base = (self.width, self.height)
         self.axes = []
         self._calls, self._inside = [], 0
         self._title, self._subtitle = '', ''
         self._grid, self._held = None, False
+        self._texts = []
 
     def suptitle(self, title, subtitle = ''):
         """The figure's title in the palette's manner, with an optional line under it."""
@@ -168,10 +190,11 @@ class Figure:
         fig = Figure(palette = palette)
         fig._base, fig.width, fig.height = self._base, *self._base
         fig._title, fig._subtitle, fig._grid, fig._held = self._title, self._subtitle, self._grid, self._held
+        fig._texts = list(self._texts)
         twins = {id(ax): Axes(fig, fig.pal) for ax in self.axes}
         for ax in self.axes:
             twin = twins[id(ax)]
-            twin._cell, twin._fixed = ax._cell, ax._fixed
+            twin._cell, twin._span, twin._fixed = ax._cell, ax._span, ax._fixed
             twin._align = {axis: twins[id(other)] for axis, other in ax._align.items()}
             fig.axes.append(twin)
         swap = lambda v: twins[id(v)] if isinstance(v, Axes) else v
@@ -181,12 +204,32 @@ class Figure:
             fig.row_order, fig.col_order = self.row_order, self.col_order
         return fig
 
-    def add_axes(self, rect):
-        """Axes at a fixed (left, bottom, width, height) rectangle in figure fractions."""
+    def add_axes(self, rect, unit = 'fraction'):
+        """Axes whose plot area is a fixed rectangle: (left, bottom, width, height) in figure fractions, or with
+        unit = 'mm' (left, top, width, height) in millimeters from the page's top left, as a journal's layout is drawn.
+        Their labels go around it."""
         ax = Axes(self, self.pal)
-        ax._fixed = tuple(rect)
+        ax._fixed = (*rect, _unit(unit, ('fraction', 'mm')))
         self.axes.append(ax)
         return ax
+
+    def text(self, x, y, s, size = None, color = 'ink', bold = None, ha = 'left', va = 'baseline', rotation = 0.0,
+             unit = 'fraction', linespacing = 1.25):
+        """Text on the page, outside any axes: at (x, y) in figure fractions from the lower left, or with unit = 'mm'
+        in millimeters from the top left, with several lines `linespacing` sizes apart. Without a size it takes the
+        palette's for axis names."""
+        self._texts.append(dict(x = float(x), y = float(y), s = str(s), size = size, color = color, bold = bold,
+                                ha = ha, va = va, rotation = rotation, unit = _unit(unit, ('fraction', 'mm')),
+                                title = None, linespacing = linespacing))
+        return self
+
+    def letter(self, x, y, char, title = '', size = None, unit = 'mm'):
+        """A panel's letter, bold and with its top at (x, y), in millimeters from the page's top left or with
+        unit = 'fraction' in figure fractions, and an optional heading on its baseline beside it, in the palette's
+        manner of axis names. Without a size it is three points larger than those."""
+        self._texts.append(dict(x = float(x), y = float(y), s = str(char), size = size, unit = _unit(unit, ('fraction',
+                                'mm')), title = str(title)))
+        return self
 
     def _head(self):
         pal = self.pal
@@ -207,6 +250,7 @@ class Figure:
         self._layout()
         return self
 
+    @_in_font
     def _layout(self):
         """Fit each axes into its grid cell, leaving exactly the room its labels need."""
         for ax in self.axes:
@@ -232,24 +276,27 @@ class Figure:
             for ax in self.axes:
                 if ax._fixed is None and not self._held:
                     l, r, b, t = ax._margins()
-                    row, col = ax._cell
-                    extra[col] = np.maximum(extra[col], ax._over)
-                    grow_w = (l + r) / PLOT_SHARE_MARGINS / (wr[col] / sum(wr)) + 2 * pad + gap * (ncols - 1)
-                    grow_h = (b + t) / PLOT_SHARE_MARGINS / (hr[row] / sum(hr)) + pad + head + gap * (nrows - 1)
+                    (row, col), (rs, cs) = ax._cell, ax._span
+                    # What overhangs on the left goes into the first column of the axes, and on the right its last
+                    extra[col, 0], extra[col + cs - 1, 1] = (max(extra[col, 0], ax._over[0]),
+                                                             max(extra[col + cs - 1, 1], ax._over[1]))
+                    share_w, share_h = sum(wr[col:col + cs]) / sum(wr), sum(hr[row:row + rs]) / sum(hr)
+                    grow_w = (l + r) / PLOT_SHARE_MARGINS / share_w + 2 * pad + gap * (ncols - 1)
+                    grow_h = (b + t) / PLOT_SHARE_MARGINS / share_h + pad + head + gap * (nrows - 1)
                     # Axis names that would still not fit at their smallest
                     name_w, name_h = ax._axis_name_widths(LABEL_MIN)
-                    grow_w = max(grow_w, (name_w + l + r) / (wr[col] / sum(wr)) + 2 * pad + gap * (ncols - 1))
-                    grow_h = max(grow_h, (name_h + b + t) / (hr[row] / sum(hr)) + pad + head + gap * (nrows - 1))
+                    grow_w = max(grow_w, (name_w + l + r) / share_w + 2 * pad + gap * (ncols - 1))
+                    grow_h = max(grow_h, (name_h + b + t) / share_h + pad + head + gap * (nrows - 1))
                     self.width = min(max(self.width, grow_w), self._base[0] * 3)
                     self.height = min(max(self.height, grow_h), self._base[1] * 3)
                     # Labels that must all show get the room they need, however much that is
                     sx, sy = ax._tick_sizes()
                     if ax.show_all[0] and ax.xrot:
                         need = len(ax.xticks) * sx * 1.05 + l + r
-                        self.width = max(self.width, need / (wr[col] / sum(wr)) + 2 * pad + gap * (ncols - 1))
+                        self.width = max(self.width, need / share_w + 2 * pad + gap * (ncols - 1))
                     if ax.show_all[1]:
                         need = len(ax.yticks) * sy * 1.05 + b + t
-                        self.height = max(self.height, need / (hr[row] / sum(hr)) + pad + head + gap * (nrows - 1))
+                        self.height = max(self.height, need / share_h + pad + head + gap * (nrows - 1))
             total_w = self.width - 2 * pad - gap * (ncols - 1)
             total_h = self.height - pad - head - gap * (nrows - 1)
             cw, ch = np.asarray(wr, float) / sum(wr) * total_w, np.asarray(hr, float) / sum(hr) * total_h
@@ -257,15 +304,21 @@ class Figure:
         for ax in self.axes:
             l, r, b, t = ax._margins()
             if ax._fixed is not None:
-                fx, fy, fw, fh = ax._fixed
-                ax.rect = (fx * self.width, fy * self.height, fw * self.width, fh * self.height)
+                fx, fy, fw, fh, unit = ax._fixed
+                mm = UNITS['mm']
+                ax.rect = ((fx * mm, self.height - (fy + fh) * mm, fw * mm, fh * mm) if unit == 'mm' else
+                           (fx * self.width, fy * self.height, fw * self.width, fh * self.height))
                 ax._room = (0.0, 0.0, self.width, self.height)
             else:
-                row, col = ax._cell
+                (row, col), (rs, cs) = ax._cell, ax._span
                 cx = pad + sum(cw[:col]) + gap * col + extra[:col].sum() + extra[col, 0]
-                cy = pad + sum(ch[row + 1:]) + gap * (nrows - 1 - row)
-                ax.rect = (cx + l, cy + b, max(cw[col] - l - r, 10.0), max(ch[row] - b - t, 10.0))
-                ax._room = (cx, cy, cw[col], ch[row])
+                cy = pad + sum(ch[row + rs:]) + gap * (nrows - row - rs)
+                # A cell spanning columns takes the gaps between them and what they grew by inside it
+                wide = cw[col] if cs == 1 else (sum(cw[col:col + cs]) + gap * (cs - 1) + extra[col:col + cs].sum()
+                                                - extra[col, 0] - extra[col + cs - 1, 1])
+                tall = ch[row] if rs == 1 else sum(ch[row:row + rs]) + gap * (rs - 1)
+                ax.rect = (cx + l, cy + b, max(wide - l - r, 10.0), max(tall - b - t, 10.0))
+                ax._room = (cx, cy, wide, tall)
                 ax._legend_y = cy + 10.0
         # Dendrograms share their matrix's rows or columns, whatever room its labels took
         for ax in self.axes:
@@ -279,11 +332,12 @@ class Figure:
         can go, as earlier ones have other columns to their right and axes at fixed fractions move with the page."""
         if self._grid is None or any(ax._fixed is not None for ax in self.axes):
             return self.width
-        last = [ax for ax in self.axes if ax._cell[1] == self._grid[1] - 1]
+        last = [ax for ax in self.axes if ax._cell[1] + ax._span[1] == self._grid[1]]
         grown = max([ax._over[1] for ax in last], default = 0.0)
         needed = max([ax._over_plain for ax in last], default = -math.inf)
         return min(self.width, max(self.width - grown, self.width + needed))
 
+    @_in_font
     def _canvas(self, stamp_dpi = None, marker_forms = False, layout = True):
         """Everything drawn onto a fresh display list; `stamp_dpi` names a raster output, where many discs become an
         image, and `marker_forms` a PDF, where markers of one size can be one stored shape."""
@@ -308,6 +362,20 @@ class Figure:
                           tracking = 0.9 if caps else 0.0)
         for ax in self.axes:
             ax._draw_text(c)
+        for t in self._texts:
+            x, y = ((t['x'] * UNITS['mm'], self.height - t['y'] * UNITS['mm']) if t['unit'] == 'mm' else
+                    (t['x'] * self.width, t['y'] * self.height))
+            if t['title'] is None:
+                text.draw(c, x, y, t['s'], t['size'] or pal.label_size, pal.color(t['color']),
+                          pal.text_bold if t['bold'] is None else t['bold'], t['ha'], t['va'], t['rotation'],
+                          linespacing = t['linespacing'])
+                continue
+            size = t['size'] or pal.label_size + 3.0
+            text.draw(c, x, y, t['s'], size, pal.color(pal.title_color or pal.ink), True, va = 'top')
+            # The heading starts a letter's width and a space on, on the letter's baseline
+            text.draw(c, x + text.width(t['s'], size, True) + 0.45 * size, y - text.CAP_HEIGHT * size,
+                      text.spaced(pal, t['title']), pal.label_size, pal.color(pal.label_color or pal.ink),
+                      pal.label_bold, tracking = 0.9 if pal.caps else 0.0)
         return c
 
     def _shadow_op(self, dpi, layout = True):
@@ -427,9 +495,11 @@ class Figure:
         return self.to_png(144.0)
 
 
-def subplots(nrows = 1, ncols = 1, figsize = (8.0, 8.0), palette = None, width_ratios = None, height_ratios = None):
-    """A figure and its axes, as in matplotlib: one Axes, a 1D array for a single row or column, or a 2D array."""
-    fig = Figure(figsize[0], figsize[1], palette)
+def subplots(nrows = 1, ncols = 1, figsize = (8.0, 8.0), palette = None, width_ratios = None, height_ratios = None,
+             unit = 'in'):
+    """A figure and its axes, as in matplotlib: one Axes, a 1D array for a single row or column, or a 2D array.
+    `figsize` is in inches, or with unit = 'mm' in millimeters."""
+    fig = Figure(figsize[0], figsize[1], palette, unit)
     fig._grid = (nrows, ncols, width_ratios or [1] * ncols, height_ratios or [1] * nrows)
     rows = []
     for r in range(nrows):
@@ -444,6 +514,35 @@ def subplots(nrows = 1, ncols = 1, figsize = (8.0, 8.0), palette = None, width_r
         return fig, rows[0][0]
     grid = np.array(rows, dtype = object)
     return fig, grid.ravel() if nrows == 1 or ncols == 1 else grid
+
+
+def subplot_mosaic(mosaic, figsize = (8.0, 8.0), palette = None, width_ratios = None, height_ratios = None,
+                   unit = 'in'):
+    """A figure whose axes take rectangles of a grid, as in matplotlib: `mosaic` is a list of rows, each a list or a
+    string of labels, or one string with rows split by ';', where a label repeated over a rectangle of cells makes one
+    axes spanning them and '.' leaves a cell empty, such as [['a', 'b', 'c'], ['d', 'd', 'd']] or 'abc;ddd'. Returns
+    the figure and a dict of axes by label."""
+    rows = [list(r) for r in (mosaic.split(';') if isinstance(mosaic, str) else mosaic)]
+    if not rows or any(len(r) != len(rows[0]) for r in rows):
+        raise ValueError('A mosaic needs rows of equal length')
+    nrows, ncols = len(rows), len(rows[0])
+    fig = Figure(figsize[0], figsize[1], palette, unit)
+    fig._grid = (nrows, ncols, width_ratios or [1] * ncols, height_ratios or [1] * nrows)
+    found = {}
+    for r, row in enumerate(rows):
+        for j, key in enumerate(row):
+            if key != '.':
+                found.setdefault(key, []).append((r, j))
+    axes = {}
+    for key, cells in found.items():
+        (r0, j0), (r1, j1) = np.min(cells, axis = 0), np.max(cells, axis = 0)
+        if len(cells) != (r1 - r0 + 1) * (j1 - j0 + 1):
+            raise ValueError(f'Each label of a mosaic has to fill a rectangle of cells, and {key!r} does not')
+        ax = Axes(fig, fig.pal)
+        ax._cell, ax._span = (int(r0), int(j0)), (int(r1 - r0 + 1), int(j1 - j0 + 1))
+        fig.axes.append(ax)
+        axes[key] = ax
+    return fig, axes
 
 
 def _given_labels(given, names, n):

@@ -19,7 +19,12 @@ MARKERS = {'o': None,
            '*': [(math.sin(i * math.pi / 5) * (1.25 if i % 2 == 0 else .55),
                   math.cos(i * math.pi / 5) * (1.25 if i % 2 == 0 else .55)) for i in range(10, 0, -1)],
            '>': [(-.8, -1.05), (1.15, 0), (-.8, 1.05)],
-           '<': [(.8, 1.05), (-1.15, 0), (.8, -1.05)]}
+           '<': [(.8, 1.05), (-1.15, 0), (.8, -1.05)],
+           # A hexagon standing on a corner and a pentagon on a side, with the area of the unit circle
+           'h': [(1.1 * math.cos(math.radians(90 + 60 * i)), 1.1 * math.sin(math.radians(90 + 60 * i)))
+                 for i in range(6)],
+           'p': [(1.15 * math.cos(math.radians(90 + 72 * i)), 1.15 * math.sin(math.radians(90 + 72 * i)))
+                 for i in range(5)]}
 # From this many discs on, a raster output stamps them instead of tracing each one's curves, this many at a time: a
 # smaller batch finds more of its pixels opaque already, a larger one costs less around them
 STAMP_MIN, STAMP_BATCH = 50, 100
@@ -336,16 +341,25 @@ def line(c, pal, xs, ys, rgb, lw = None, alpha = 1.0, dash = None):
     polyline(c, xs, ys, rgb, lw, alpha, cap = 0 if pal.bar == 'needle' else 1, dash = dash)
 
 
-def arrow(c, pal, x0, y0, x1, y1, rgb, lw, alpha = 1.0):
-    """A shaft ending in a filled head at (x1, y1), scaled to the palette's line weight."""
+def arrow(c, pal, x0, y0, x1, y1, rgb, lw, alpha = 1.0, head = None, bend = 0.0):
+    """A shaft ending in a filled head at (x1, y1), scaled to the palette's line weight, with the head `head` points
+    long if given. With a `bend`, the shaft is an arc whose middle stands that share of its length off the straight
+    line, to the left of its direction for a positive bend."""
     width = lw * pal.line_width / 2.0
     n = math.hypot(x1 - x0, y1 - y0)
     if not n:
         return
-    ux, uy = (x1 - x0) / n, (y1 - y0) / n
-    head = min(max(6.0, width * 3.2), n)
+    # The arc's control point; the head points along the arc where it ends
+    cx, cy = (x0 + x1) / 2 - bend * (y1 - y0), (y0 + y1) / 2 + bend * (x1 - x0)
+    tx, ty = (x1 - cx, y1 - cy) if bend else (x1 - x0, y1 - y0)
+    ux, uy = tx / math.hypot(tx, ty), ty / math.hypot(tx, ty)
+    head = min(max(6.0, width * 3.2) if head is None else head, n)
     bx, by = x1 - ux * head, y1 - uy * head
-    if head < n:
+    if head < n and bend:
+        t = np.linspace(0.0, 1.0, 24)[:, None]
+        q = (1 - t) ** 2 * np.array([x0, y0]) + 2 * t * (1 - t) * np.array([cx, cy]) + t ** 2 * np.array([bx, by])
+        polyline(c, q[:, 0], q[:, 1], rgb, width, alpha, cap = 0)
+    elif head < n:
         polyline(c, [x0, bx], [y0, by], rgb, width, alpha, cap = 0)
     half = head * 0.42
     polygon(c, [x1, bx - uy * half, bx + uy * half], [y1, by + ux * half, by - ux * half], rgb, alpha)

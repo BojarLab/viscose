@@ -1,7 +1,7 @@
 """viscose: scientific plots that are pieces of art. Palettes bring their own special effects."""
 from importlib.metadata import version, PackageNotFoundError
 from . import marks, text
-from .figure import Figure, clustermap, linkage, show_png, subplots
+from .figure import Figure, clustermap, linkage, show_png, subplot_mosaic, subplots
 from .axes import Axes
 from .palettes import Palette, default_palette, palette, palettes, register_palette, set_palette, get_palette
 try:
@@ -9,4 +9,4 @@ try:
 except PackageNotFoundError:
     __version__ = '0.0.0'
 __all__ = ['Axes', 'Figure', 'Palette', 'clustermap', 'default_palette', 'get_palette', 'linkage', 'palette',
-           'palettes', 'register_palette', 'set_palette', 'show_png', 'subplots']
+           'palettes', 'register_palette', 'set_palette', 'show_png', 'subplot_mosaic', 'subplots']
