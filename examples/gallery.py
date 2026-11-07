@@ -1,4 +1,4 @@
-"""The seven standard figures in every palette, from seeded demonstration data: python examples/gallery.py [outdir]"""
+"""The eight standard figures in every palette, from seeded demonstration data: python examples/gallery.py [outdir]"""
 import sys
 from pathlib import Path
 import numpy as np
@@ -160,7 +160,23 @@ def trial(palette):
     return fig
 
 
-FIGURES = {1: volcano, 2: heatmap, 3: ridges, 4: spectrum, 5: stacked, 6: embedding, 7: trial}
+def groups(palette):
+    rng = np.random.default_rng(31)
+    stages = ['Healthy', 'Adenoma', 'Carcinoma', 'Metastasis']
+    sialyl = {s: rng.normal(m, sd, n) for s, m, sd, n in zip(stages, (2.1, 2.7, 3.6, 4.4), (.5, .7, .8, .9),
+                                                                (28, 21, 34, 14))}
+    fucose = {s: rng.gamma(k, .55, n) + 1 for s, k, n in zip(stages, (5.2, 4.4, 3.1, 2.6), (28, 21, 34, 14))}
+    fig, (a, b) = vc.subplots(1, 2, figsize = (10, 6), palette = palette, sharey = True)
+    fig.suptitle('Glycan motifs by stage', '97 colorectal samples')
+    a.boxplot(sialyl)
+    a.set_title('Sialyl Lewis x')
+    a.set_ylabel('Relative abundance (%)')
+    b.violinplot(fucose)
+    b.set_title('Core fucose')
+    return fig
+
+
+FIGURES = {1: volcano, 2: heatmap, 3: ridges, 4: spectrum, 5: stacked, 6: embedding, 7: trial, 8: groups}
 
 
 if __name__ == '__main__':

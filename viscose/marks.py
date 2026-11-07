@@ -406,6 +406,44 @@ def box(c, pal, x, w, stats, rgb, alpha = 1.0):
     polyline(c, [x, x + w], [median, median], pal.color(pal.on(rgb)), max(lw, 1.4), alpha, cap = 0)
 
 
+def violin(c, pal, xs, ys, cx, half, rgb, alpha = 1.0):
+    """A violin in the palette's manner of bars, its shades running across it from its middle at `cx` out to `half` on
+    either side; a needle's palette draws it pale inside a hairline, as its bars are slender."""
+    dark, base, light = pal.shades(rgb)
+    across = (cx - half, ys[0], cx + half, ys[0])
+    if pal.bar == 'deep':
+        polygon(c, xs, ys, None, alpha, (across, (dark, light, dark)))
+    elif pal.bar == 'soft':
+        polygon(c, xs, ys, None, alpha, (across, (light, base, light)))
+    elif pal.bar == 'needle':
+        polygon(c, xs, ys, light, alpha)
+        p = c.beginPath()
+        p.moveTo(xs[0], ys[0])
+        for x, y in zip(xs[1:], ys[1:]):
+            p.lineTo(x, y)
+        p.close()
+        c.saveState()
+        _style(c, stroke = rgb, lw = 0.9, stroke_alpha = alpha, cap = 1, join = 1)
+        c.drawPath(p, fill = 0, stroke = 1)
+        c.restoreState()
+    else:
+        polygon(c, xs, ys, rgb, alpha)
+
+
+def inner_box(c, pal, x, w, stats, rgb, alpha = 1.0):
+    """The quartiles and median inside a violin, as a slim bar `w` wide on a line between the whiskers, with the median
+    a dot in the page's color; `stats` are the lower whisker, quartile, median, quartile, and upper whisker in page
+    points."""
+    low, q1, median, q3, high = stats
+    dark = pal.shades(rgb)[0]
+    # A needle's violin is pale, so its own color stands out on it; others take a darker shade, or ink if none is darker
+    ink = rgb if pal.bar == 'needle' else dark if dark != pal.color(rgb) else pal.color(pal.on(rgb))
+    polyline(c, [x, x], [low, high], ink, max(w * 0.22, 0.8), alpha, cap = 0)
+    if q3 > q1:
+        polygon(c, [x - w / 2, x + w / 2, x + w / 2, x - w / 2], [q1, q1, q3, q3], ink, alpha)
+    shapes(c, np.array([x]), np.array([median]), np.array([w * 0.36]), pal.color('paper'), alpha)
+
+
 def segment(c, pal, x, y, w, h, rgb, gap, alpha = 1.0):
     """One piece of a stacked bar, with a gap to the piece below it."""
     dark, base, light = pal.shades(rgb)

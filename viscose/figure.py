@@ -19,6 +19,8 @@ from .palettes import get_palette
 # Shadow offset and blur in points; a blur cannot stay vector, so the PDF and SVG carry it as an image at this
 # resolution
 SHADOW_DX, SHADOW_DY, SHADOW_BLUR, SHADOW_DPI = 1.2, 5.0, 4.7, 100.0
+# A byte's value in [0, 1], as glycorender reads image bytes
+BYTES = (np.arange(256) / 255.0).astype(np.float32)
 # Margins may take this share of an axes' cell before the figure grows
 PLOT_SHARE_MARGINS = 0.55
 # Coding agents and CI can hold a real console, so a terminal alone does not mean someone wants a window per figure
@@ -65,8 +67,11 @@ def _shadow_layer(ops, width, height, dpi, strength):
     img = raster.render(ops, width, height, sc, sc, None).astype(np.float32) / 255.0
     alpha = img[..., 3]
     radius = max(1, int(round(SHADOW_BLUR * sc)))
-    # How far the marks darken white in each channel, blurred; a soft shadow is this darkening at the given strength
-    dark = np.stack([raster._box_blur((1.0 - img[..., i]) * alpha, radius) for i in range(3)], axis = -1)
+    # How far the marks darken white in each channel, blurred, a channel per thread; a soft shadow is this darkening at
+    # the given strength
+    with ThreadPoolExecutor(3) as pool:
+        dark = np.stack(list(pool.map(lambda i: raster._box_blur((1.0 - img[..., i]) * alpha, radius), range(3))),
+                        axis = -1)
     dx, dy = int(round(SHADOW_DX * sc)), int(round(SHADOW_DY * sc))
     # Moved, with whatever leaves the page gone rather than back in at the opposite edge
     moved = np.zeros_like(dark)
@@ -80,14 +85,17 @@ def _shadow_layer(ops, width, height, dpi, strength):
 
 def _upscale(plane, h, w, box):
     """The (y0, y1, x0, x1) window of a bilinear resize to (h, w) of one channel, for a shadow so soft that its
-    full-resolution detail would be wasted. Plane by plane, whose long inner loops run several times faster."""
+    full-resolution detail would be wasted. Plane by plane, whose long inner loops run several times faster, and columns
+    first, on only the rows of the small grid that the window reaches, so that the large one only gathers whole rows."""
+    spots = []
     for axis, n, lo, hi in ((0, h, box[0], box[1]), (1, w, box[2], box[3])):
         u = np.clip((np.arange(lo, hi) + 0.5) * plane.shape[axis] / n - 0.5, 0.0, plane.shape[axis] - 1.0)
         i = np.minimum(u.astype(int), plane.shape[axis] - 2)
-        t = (u - i).astype(np.float32)
-        t = t[:, None] if axis == 0 else t
-        plane = np.take(plane, i, axis = axis) * (1 - t) + np.take(plane, i + 1, axis = axis) * t
-    return plane
+        spots.append((i, (u - i).astype(np.float32)))
+    (ri, rt), (ci, ct) = spots
+    plane = plane[ri[0]:ri[-1] + 2]
+    plane = np.take(plane, ci, axis = 1) * (1 - ct) + np.take(plane, ci + 1, axis = 1) * ct
+    return plane[ri - ri[0]] * (1 - rt)[:, None] + plane[ri - ri[0] + 1] * rt[:, None]
 
 
 def _path_data(segments):
@@ -194,7 +202,8 @@ class Figure:
         twins = {id(ax): Axes(fig, fig.pal) for ax in self.axes}
         for ax in self.axes:
             twin = twins[id(ax)]
-            twin._cell, twin._span, twin._fixed = ax._cell, ax._span, ax._fixed
+            twin._cell, twin._span, twin._fixed, twin._outer = ax._cell, ax._span, ax._fixed, dict(ax._outer)
+            twin._share = {axis: [twins[id(other)] for other in group] for axis, group in ax._share.items()}
             twin._align = {axis: twins[id(other)] for axis, other in ax._align.items()}
             fig.axes.append(twin)
         swap = lambda v: twins[id(v)] if isinstance(v, Axes) else v
@@ -300,9 +309,23 @@ class Figure:
             total_w = self.width - 2 * pad - gap * (ncols - 1)
             total_h = self.height - pad - head - gap * (nrows - 1)
             cw, ch = np.asarray(wr, float) / sum(wr) * total_w, np.asarray(hr, float) / sum(hr) * total_h
+            # Axes that share an axis line up: each column takes its widest margins, each row its tallest, and the plot
+            # areas divide what is left by the ratios
+            aligned = any(len(group) > 1 for ax in self.axes for group in ax._share.values())
+            if aligned:
+                sides, levels = np.zeros((ncols, 2)), np.zeros((nrows, 2))
+                for ax in self.axes:
+                    if ax._fixed is None:
+                        l, r, b, t = ax._margins()
+                        (row, col) = ax._cell
+                        sides[col], levels[row] = np.maximum(sides[col], (l, r)), np.maximum(levels[row], (b, t))
+                cw = np.asarray(wr, float) / sum(wr) * (total_w - sides.sum()) + sides.sum(axis = 1)
+                ch = np.asarray(hr, float) / sum(hr) * (total_h - levels.sum()) + levels.sum(axis = 1)
             self.width += extra.sum()
         for ax in self.axes:
             l, r, b, t = ax._margins()
+            if self._grid is not None and aligned and ax._fixed is None:
+                (l, r), (b, t) = sides[ax._cell[1]], levels[ax._cell[0]]
             if ax._fixed is not None:
                 fx, fy, fw, fh, unit = ax._fixed
                 mm = UNITS['mm']
@@ -378,8 +401,11 @@ class Figure:
                       pal.label_bold, tracking = 0.9 if pal.caps else 0.0)
         return c
 
-    def _shadow_op(self, dpi, layout = True):
-        """The palette's soft shadow as an image op to go under everything else, or None for a palette without one."""
+    def _shadow(self, dpi, layout = True):
+        """The palette's soft shadow for an output at `dpi`: its straight-alpha RGBA at no more than SHADOW_DPI, the
+        (top, bottom, left, right) box on the output's own pixel grid where some alpha survives rounding, beyond which
+        it can be left out, the output's rows and columns, and the page's drawing state. None for a palette without one
+        or a page without marks."""
         if not self.pal.shadow:
             return None
         res = min(dpi, SHADOW_DPI)
@@ -388,7 +414,6 @@ class Figure:
         if not marks:
             return None
         arr = _shadow_layer(marks, self.width, self.height, res, self.pal.shadow)
-        # Only the box that some alpha survives rounding in, on the output's own grid, so that it composites fast
         seen = arr[..., 3] * 255.0 + 0.5 >= 1.0
         ys, xs = np.flatnonzero(seen.any(axis = 1)), np.flatnonzero(seen.any(axis = 0))
         if not len(ys):
@@ -398,36 +423,66 @@ class Figure:
         fy, fx = h / arr.shape[0], w / arr.shape[1]
         y0, y1 = max(0, int((ys[0] - 0.5) * fy - 0.5)), min(h, int((ys[-1] + 1.5) * fy + 0.5) + 1)
         x0, x1 = max(0, int((xs[0] - 0.5) * fx - 0.5)), min(w, int((xs[-1] + 1.5) * fx + 0.5) + 1)
-        px = []
-        for k in range(4):
-            plane = arr[y0:y1, x0:x1, k] if dpi <= SHADOW_DPI else _upscale(arr[..., k], h, w, (y0, y1, x0, x1))
-            px.append((plane * 255.0 + 0.5).astype(np.uint8))
-        op = dict(c.state)
-        op.update(kind = 'image', w = x1 - x0, h = y1 - y0, rgb = np.dstack(px[:3]).tobytes(), alpha = px[3].tobytes(),
-                  ctm = ((x1 - x0) / sc, 0.0, 0.0, (y1 - y0) / sc, x0 / sc, (h - y1) / sc))
-        return op
+        return arr, (y0, y1, x0, x1), h, w, c.state
 
-    def _raster_canvas(self, dpi):
+    def _shadow_op(self, dpi, layout = True):
+        """The palette's soft shadow as an image op at no more than SHADOW_DPI to go under everything else, for PDF and
+        SVG, or None."""
+        found = self._shadow(min(dpi, SHADOW_DPI), layout)
+        if found is None:
+            return None
+        arr, (y0, y1, x0, x1), h, w, state = found
+        px = [(arr[y0:y1, x0:x1, k] * 255.0 + 0.5).astype(np.uint8) for k in range(4)]
+        sc = min(dpi, SHADOW_DPI) / 72.0
+        return dict(state, kind = 'image', w = x1 - x0, h = y1 - y0, rgb = np.dstack(px[:3]).tobytes(),
+                    alpha = px[3].tobytes(), ctm = ((x1 - x0) / sc, 0.0, 0.0, (y1 - y0) / sc, x0 / sc, (h - y1) / sc))
+
+    def _shadow_under(self, dpi):
+        """The palette's soft shadow for a raster output, as the premultiplied layer that glycorender lays under the
+        page: (top, left, planes) on the output's own pixels, scaled up from SHADOW_DPI where finer, or None."""
+        found = self._shadow(dpi, False)
+        if found is None:
+            return None
+        arr, (y0, y1, x0, x1), h, w, _ = found
+        out = np.empty((4, y1 - y0, x1 - x0), np.float32)
+        # In 8 bits, as an image would carry it, then premultiplied as glycorender would composite that image: a soft
+        # gradient then keeps runs of equal values, which pack far smaller than values rounded pixel by pixel. A plane
+        # and a band of rows per thread, as the whole page is millions of pixels each
+        step = max(1, -(-(y1 - y0) // 3))
+        def plane(job):
+            k, r0 = job
+            r1 = min(y1, r0 + step)
+            v = arr[r0:r1, x0:x1, k] if dpi <= SHADOW_DPI else _upscale(arr[..., k], h, w, (r0, r1, x0, x1))
+            v = np.multiply(v, 255.0, dtype = np.float32)
+            v += 0.5
+            np.take(BYTES, v.astype(np.uint8), out = out[k, r0 - y0:r1 - y0])
+        def premultiply(job):
+            k, r0 = job
+            out[k, r0 - y0:r0 - y0 + step] *= out[3, r0 - y0:r0 - y0 + step]
+        with ThreadPoolExecutor(12) as pool:
+            list(pool.map(plane, [(k, r0) for k in range(4) for r0 in range(y0, y1, step)]))
+            list(pool.map(premultiply, [(k, r0) for k in range(3) for r0 in range(y0, y1, step)]))
+        return y0, x0, out
+
+    def _raster(self, dpi, background):
+        """The page's pixels at `dpi`, with its soft shadow computed on a thread beside the drawing and laid under it;
+        they share nothing once laid out, and numpy releases the GIL for most of its work."""
         self._layout()
-        # The shadow and the page share nothing once laid out, and numpy and zlib release the GIL for most of their work
         with ThreadPoolExecutor(1) as pool:
-            shadow = pool.submit(self._shadow_op, dpi, False)
+            shadow = pool.submit(self._shadow_under, dpi)
             c = self._canvas(stamp_dpi = dpi, layout = False)
-            op = shadow.result()
-        if op is not None:
-            c.ops.insert(0, op)
-        return c
+            return raster.render(c.ops, self.width, self.height, dpi / 72.0, dpi / 72.0, self.pal.color(background),
+                                 under = shadow.result)
 
     def to_png(self, dpi = 300.0, background = 'paper'):
         """PNG bytes; background is any color, by default the palette's page, and None keeps the page transparent."""
-        return self._raster_canvas(dpi).to_png(dpi / 72.0, dpi / 72.0, self.pal.color(background))
+        return raster.encode_png(self._raster(dpi, background), (), (dpi, dpi))
 
     def to_rgba(self, dpi = 144.0, background = 'paper'):
         """The page as an array of shape (rows, columns, 4) of 8-bit RGBA, first row at the top, for showing it in a
         window without encoding a PNG; background is any color, by default the palette's page, and None keeps the page
         transparent."""
-        page = raster.render(self._raster_canvas(dpi).ops, self.width, self.height, dpi / 72.0, dpi / 72.0,
-                             self.pal.color(background))
+        page = self._raster(dpi, background)
         return page if page.shape[2] == 4 else np.dstack([page, np.full(page.shape[:2], 255, np.uint8)])
 
     def display_list(self, layout = True):
@@ -496,20 +551,30 @@ class Figure:
 
 
 def subplots(nrows = 1, ncols = 1, figsize = (8.0, 8.0), palette = None, width_ratios = None, height_ratios = None,
-             unit = 'in'):
+             unit = 'in', sharex = False, sharey = False):
     """A figure and its axes, as in matplotlib: one Axes, a 1D array for a single row or column, or a 2D array.
-    `figsize` is in inches, or with unit = 'mm' in millimeters."""
+    `figsize` is in inches, or with unit = 'mm' in millimeters. `sharex` and `sharey` give axes the same limits, scale,
+    and ticks: True or 'all' across the figure, 'row' within each row, 'col' within each column. Then only the outer
+    panels show those tick labels and the axis's name, the bottom row's for x shared by columns, the first column's for
+    y shared by rows, and the plot areas line up across rows and columns."""
     fig = Figure(figsize[0], figsize[1], palette, unit)
     fig._grid = (nrows, ncols, width_ratios or [1] * ncols, height_ratios or [1] * nrows)
-    rows = []
+    for name, share in (('sharex', sharex), ('sharey', sharey)):
+        if share not in (False, True, 'none', 'all', 'row', 'col'):
+            raise ValueError(f"{name} has to be True, False, 'all', 'none', 'row', or 'col', got {share!r}")
+    rows = [[Axes(fig, fig.pal) for _ in range(ncols)] for _ in range(nrows)]
     for r in range(nrows):
-        row = []
         for j in range(ncols):
-            ax = Axes(fig, fig.pal)
+            ax = rows[r][j]
             ax._cell = (r, j)
             fig.axes.append(ax)
-            row.append(ax)
-        rows.append(row)
+            for axis, share in (('x', sharex), ('y', sharey)):
+                if share in (True, 'all', 'row', 'col'):
+                    ax._share[axis] = ([a for row in rows for a in row] if share in (True, 'all') else
+                                       rows[r] if share == 'row' else [row[j] for row in rows])
+            # As matplotlib labels them: x below the bottom row of a column that shares it, y beside the first column
+            ax._outer = {'x': sharex in (True, 'all', 'col') and r < nrows - 1,
+                         'y': sharey in (True, 'all', 'row') and j > 0}
     if nrows == 1 and ncols == 1:
         return fig, rows[0][0]
     grid = np.array(rows, dtype = object)

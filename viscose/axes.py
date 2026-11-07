@@ -161,6 +161,8 @@ class Axes:
         self._ridge_labels = None
         self._fixed, self._cell, self._span, self._legend_y, self._align = None, None, (1, 1), None, {}
         self.rect = self._room = (0.0, 0.0, 1.0, 1.0)
+        # Axes whose limits these share, and whether their tick labels and name stay hidden as an inner panel's
+        self._share, self._outer = {'x': [self], 'y': [self]}, {'x': False, 'y': False}
         self.grid_on = pal.grid
         self.show_all = (False, False)
 
@@ -458,19 +460,19 @@ class Axes:
                   lw = lw, cap = capsize)
         return self
 
-    def boxplot(self, data, positions = None, labels = None, width = 0.5, colors = None, whis = 1.5, fliers = True,
-                alpha = 1.0, z = 3):
-        """Box plots of several groups, in the palette's manner: `data` is a list of value lists or a {label: values}
-        dict. A box spans the quartiles with its median marked, whiskers reach the last value within `whis` box heights,
-        and `fliers` shows the values beyond. Groups sit at 0, 1, 2, and so on, unless `positions` says otherwise."""
+    def _groups(self, data, positions, labels, colors, whis):
+        """Groups of values for box, strip, and violin plots, as (positions, labels, colors, values, stats): stats per
+        group are its lower whisker, quartile, median, quartile, upper whisker, and the values beyond the whiskers, or
+        None for a group without values."""
         if isinstance(data, dict):
             labels, data = list(data) if labels is None else labels, list(data.values())
         positions = np.arange(len(data), dtype = float) if positions is None else np.asarray(positions, dtype = float)
         colors = self.pal.contrast(len(data)) if colors is None else [self.pal.color(k) for k in colors]
-        stats = []
-        for values in data:
-            v = np.asarray(values, dtype = float)
+        values, stats = [], []
+        for group in data:
+            v = np.asarray(group, dtype = float).ravel()
             v = v[np.isfinite(v)]
+            values.append(v)
             if not v.size:
                 stats.append(None)
                 continue
@@ -479,7 +481,85 @@ class Axes:
             within = v[(v >= q1 - whis * (q3 - q1)) & (v <= q3 + whis * (q3 - q1))]
             low, high = (within.min(), within.max()) if within.size else (q1, q3)
             stats.append((low, q1, median, q3, high, v[(v < low) | (v > high)]))
-        self._add('box', z, x = positions, stats = stats, w = width, rgb = colors, alpha = alpha, fliers = fliers)
+        return positions, labels, colors, values, stats
+
+    def _strip(self, values, spread, size):
+        """Each group's points spread across a share of its width, `spread` per value, by a golden-ratio sequence over
+        the values in order, so that values close in size lie apart, and the same on every draw."""
+        offsets = []
+        for v, share in zip(values, spread):
+            u = np.empty(len(v))
+            u[np.argsort(v, kind = 'stable')] = (np.arange(len(v)) * 0.6180339887498949 + 0.5) % 1.0 - 0.5
+            offsets.append(u * share)
+        # Many points get smaller, so that a crowd still reads as points
+        sizes = [float(size) if size is not None else 16.0 * min(1.0, math.sqrt(150.0 / max(len(v), 1))) + 2.0
+                 for v in values]
+        return offsets, sizes
+
+    def boxplot(self, data, positions = None, labels = None, width = 0.5, colors = None, whis = 1.5, fliers = True,
+                alpha = 1.0, z = 3, points = True, jitter = 0.7, point_size = None):
+        """Box plots of several groups, in the palette's manner: `data` is a list of value lists or a {label: values}
+        dict. A box spans the quartiles with its median marked, and whiskers reach the last value within `whis` box
+        heights. With `points`, every value shows as a point over its box, spread across `jitter` of its width, and the
+        box takes a paler shade; without, `fliers` shows the values beyond the whiskers. Groups sit at 0, 1, 2, and so
+        on, unless `positions` says otherwise."""
+        positions, labels, colors, values, stats = self._groups(data, positions, labels, colors, whis)
+        offsets, sizes = self._strip(values, [jitter * width] * len(values), point_size)
+        self._add('box', z, x = positions, stats = stats, w = width, rgb = colors, alpha = alpha, fliers = fliers,
+                  values = values, offsets = offsets if points else None, sizes = sizes, box = True)
+        if labels is not None:
+            self.set_xticks(positions, labels)
+        return self
+
+    def stripplot(self, data, positions = None, labels = None, width = 0.5, colors = None, alpha = 1.0, z = 3,
+                  jitter = 0.7, point_size = None):
+        """Every value of several groups as a point, spread across `jitter` of the group's `width` so that equal values
+        stay apart, as in seaborn's stripplot. `data` is a list of value lists or a {label: values} dict."""
+        positions, labels, colors, values, stats = self._groups(data, positions, labels, colors, 1.5)
+        offsets, sizes = self._strip(values, [jitter * width] * len(values), point_size)
+        self._add('box', z, x = positions, stats = stats, w = width, rgb = colors, alpha = alpha, fliers = False,
+                  values = values, offsets = offsets, sizes = sizes, box = False)
+        if labels is not None:
+            self.set_xticks(positions, labels)
+        return self
+
+    def violinplot(self, data, positions = None, labels = None, width = 0.8, colors = None, alpha = 1.0, z = 3,
+                   inner = 'box', bw_adjust = 1.0, cut = 2.0, point_size = None):
+        """Violin plots of several groups, in the palette's manner: each group's density, by a Gaussian kernel of
+        Scott's bandwidth times `bw_adjust`, mirrored around its position and running `cut` bandwidths past its
+        extremes, as in seaborn. All violins share one scale, so that each holds the same area, and the widest is
+        `width` across. `inner` is 'box' for the quartiles and median inside, 'points' for every value spread across the
+        violin's width at its height, or None. `data` is a list of value lists or a {label: values} dict."""
+        if inner not in ('box', 'points', None):
+            raise ValueError(f"A violin's inner has to be 'box', 'points', or None, got {inner!r}")
+        positions, labels, colors, values, stats = self._groups(data, positions, labels, colors, 1.5)
+        shapes = []
+        for v in values:
+            # A single value or equal ones have no spread to draw
+            bw = np.std(v, ddof = 1) * len(v) ** -0.2 * bw_adjust if len(v) > 1 else 0.0
+            if not bw > 0:
+                shapes.append(None)
+                continue
+            grid = np.linspace(v.min() - cut * bw, v.max() + cut * bw, 128)
+            spots, weights = np.unique(v, return_counts = True)
+            if len(spots) > 5000:
+                # Many values go through a histogram first, far finer than the kernel
+                weights, edges = np.histogram(v, 2000)
+                spots = (edges[:-1] + edges[1:]) / 2
+            density = np.zeros(len(grid))
+            for start in range(0, len(spots), 2000):
+                d = (grid[:, None] - spots[None, start:start + 2000]) / bw
+                density += (np.exp(-0.5 * d * d) * weights[start:start + 2000]).sum(axis = 1)
+            shapes.append((grid, density / (len(v) * bw * math.sqrt(2 * math.pi))))
+        peak = max([s[1].max() for s in shapes if s is not None], default = 1.0)
+        shapes = [None if s is None else (s[0], s[1] / peak * width / 2) for s in shapes]
+        offsets, sizes = self._strip(values, [1.0] * len(values), point_size)
+        if inner == 'points':
+            # Spread as wide as the violin is at each value, within it
+            offsets = [u * 1.6 * np.interp(v, s[0], s[1]) if s is not None else u * 0.0
+                       for u, v, s in zip(offsets, values, shapes)]
+        self._add('violin', z, x = positions, stats = stats, shapes = shapes, w = width, rgb = colors, alpha = alpha,
+                  inner = inner, values = values, offsets = offsets, sizes = sizes)
         if labels is not None:
             self.set_xticks(positions, labels)
         return self
@@ -727,14 +807,14 @@ class Axes:
     # --- settings ---
     def set_xlabel(self, s, size = None, pad = None):
         """The x axis's name, at `size` points or the palette's size for axis names, `pad` points below the tick labels
-        if given, as matplotlib's labelpad."""
-        self.xlabel, self._label_size['x'], self._label_pad['x'] = s, size, pad
+        if given, as matplotlib's labelpad. An inner panel of axes sharing x keeps it hidden, as matplotlib does."""
+        self.xlabel, self._label_size['x'], self._label_pad['x'] = '' if self._outer['x'] else s, size, pad
         return self
 
     def set_ylabel(self, s, size = None, pad = None):
         """The y axis's name, at `size` points or the palette's size for axis names, `pad` points beside the tick labels
-        if given, as matplotlib's labelpad."""
-        self.ylabel, self._label_size['y'], self._label_pad['y'] = s, size, pad
+        if given, as matplotlib's labelpad. An inner panel of axes sharing y keeps it hidden, as matplotlib does."""
+        self.ylabel, self._label_size['y'], self._label_pad['y'] = '' if self._outer['y'] else s, size, pad
         return self
 
     def set_title(self, s, size = None, pad = None):
@@ -800,16 +880,20 @@ class Axes:
 
     def set_xscale(self, s, functions = None):
         """'linear', 'log', 'sqrt' (signed, so zero and below keep their place), or 'function' with
-        functions = (forward, inverse), two maps over arrays from data to even spacing along the axis and back."""
-        self._xwarp = _warp(s, functions)
-        self._xscale = s
+        functions = (forward, inverse), two maps over arrays from data to even spacing along the axis and back. Axes
+        sharing x share it."""
+        warp = _warp(s, functions)
+        for ax in self._share['x']:
+            ax._xwarp, ax._xscale = warp, s
         return self
 
     def set_yscale(self, s, functions = None):
         """'linear', 'log', 'sqrt' (signed, so zero and below keep their place), or 'function' with
-        functions = (forward, inverse), two maps over arrays from data to even spacing along the axis and back."""
-        self._ywarp = _warp(s, functions)
-        self._yscale = s
+        functions = (forward, inverse), two maps over arrays from data to even spacing along the axis and back. Axes
+        sharing y share it."""
+        warp = _warp(s, functions)
+        for ax in self._share['y']:
+            ax._ywarp, ax._yscale = warp, s
         return self
 
     def set(self, **settings):
@@ -892,6 +976,17 @@ class Axes:
                 for x, b, v, bw in zip(a['x'], a['b'], a['h'], a['w']):
                     xs, ys = (self._tx([b, b + v]), self._ty([x - bw / 2, x + bw / 2])) if a['horizontal'] else (
                         self._tx([x - bw / 2, x + bw / 2]), self._ty([self._base(b, self._yscale, self.ylim), b + v]))
+                    out.append([min(xs), min(ys), max(xs), max(ys)])
+            elif k in ('box', 'violin'):
+                # Each group as one box around what it draws
+                for x, stats, v, shape in zip(a['x'], a['stats'], a['values'], a.get('shapes', [None] * len(a['x']))):
+                    if stats is None:
+                        continue
+                    half = a['w'] / 2 if shape is None else float(shape[1].max())
+                    shown = v if k == 'violin' or a['offsets'] is not None or a['fliers'] else []
+                    ys = [*([stats[0], stats[4]] if k == 'box' and a['box'] else []), *shown,
+                          *(shape[0][[0, -1]] if shape is not None else [])]
+                    xs, ys = self._tx([x - half, x + half]), self._ty([min(ys), max(ys)])
                     out.append([min(xs), min(ys), max(xs), max(ys)])
             elif k == 'rect':
                 xs = [x0 + a['x'] * w, x0 + (a['x'] + a['w']) * w] if a['frac'] else self._tx([a['x'], a['x'] + a['w']])
@@ -980,11 +1075,16 @@ class Axes:
                 vals = np.array([a[axis], a[axis] + a['w' if axis == 'x' else 'h']])
             elif k == 'contour':
                 vals = a[axis]
-            elif k == 'box' and axis == 'x':
+            elif k in ('box', 'violin') and axis == 'x':
                 vals = np.r_[a['x'] - a['w'] * 0.66, a['x'] + a['w'] * 0.66]
+            elif k == 'box' and a['offsets'] is not None:
+                vals = np.concatenate([np.zeros(0)] + a['values'])
             elif k == 'box':
                 # Fliers the plot does not show take up no room in it
                 vals = np.array([u for v in a['stats'] if v for u in (v[0], v[4], *(v[5] if a['fliers'] else ()))])
+            elif k == 'violin':
+                vals = np.concatenate([np.zeros(0)] + [v if s is None else s[0][[0, -1]]
+                                                       for v, s in zip(a['values'], a['shapes'])])
             elif k == 'bars' and (axis == 'x') != a['horizontal']:
                 # A little room beside the outer bars, in their own scale, as a histogram's can be of any
                 vals = np.r_[a['x'] - a['w'] * 0.6, a['x'] + a['w'] * 0.6]
@@ -1003,13 +1103,19 @@ class Axes:
             if vals.size:
                 lo.append(vals.min())
                 hi.append(vals.max())
-        return (min(lo), max(hi), sticky) if lo else (0.0, 1.0, [])
+        return (min(lo), max(hi), sticky) if lo else None
 
     def _range(self):
-        """The limits of both axes, as set or from the data."""
-        for axis, fixed, scale, margin, inverted in (('x', self._xlim, self._xscale, self._xmargin, self._xinv),
-                                                     ('y', self._ylim, self._yscale, self._ymargin, self._yinv)):
-            lo, hi, sticky = self._extent(axis)
+        """The limits of both axes, as set or from the data, of all the axes they share an axis with."""
+        for axis, scale, margin in (('x', self._xscale, self._xmargin), ('y', self._yscale, self._ymargin)):
+            group = self._share[axis]
+            found = [e for e in (ax._extent(axis) for ax in group) if e is not None]
+            lo, hi, sticky = ((min(e[0] for e in found), max(e[1] for e in found), [v for e in found for v in e[2]])
+                              if found else (0.0, 1.0, []))
+            # Limits set on one of them, or turned around, hold for all
+            fixed = next((v for v in [getattr(ax, '_' + axis + 'lim') for ax in [self] + group] if v is not None),
+                         None)
+            inverted = any(getattr(ax, '_' + axis + 'inv') for ax in group)
             if scale == 'log':
                 # Nothing above zero leaves one decade to show
                 lo = lo if lo > 0 else 1.0
@@ -1072,7 +1178,7 @@ class Axes:
             setattr(self, axis + 'ticks', ticks)
             labels = labels if labels is not None else tick_labels(ticks)
             # Ticks without labels, as beside a panel that shares them
-            if self._tick_opts[axis].get('labels', True) is False:
+            if self._tick_opts[axis].get('labels', True) is False or self._outer[axis]:
                 labels = []
             setattr(self, axis + 'labels', _minus(self.pal, labels) if numbers else labels)
 
@@ -1327,7 +1433,7 @@ class Axes:
             # Color 'none' draws nothing but an edge, while a dendrogram's None means the palette's choice
             if k == 'text' or (k != 'dendro' and a.get('rgb', k) is None and not a.get('edge')):
                 continue
-            pad = 9.0 if k == 'points' else 0.0 if k == 'heat' else 1.0
+            pad = 9.0 if k in ('points', 'box', 'violin') else 0.0 if k == 'heat' else 1.0
             # A named element stays a bare path, for the code that looks for it in the SVG
             gid = a.get('gid')
             free = gid or k == 'image' or not a.get('clip', True)
@@ -1452,15 +1558,55 @@ class Axes:
             marks.polylines(c, [(self._tx(xs), self._ty(ys)) for xs, ys in a['lines']], a['rgb'], a['lw'], a['alpha'],
                             dash = a['dash'])
 
+    def _paired(self, rgb):
+        """A group's mark in a paler shade under points in its own color, or, where its color is the palest already, in
+        that color under points a shade darker."""
+        dark, _, light = self.pal.shades(rgb)
+        return (light, rgb) if light != rgb else (rgb, dark)
+
+    def _group_points(self, c, x, v, offsets, size, rgb, alpha):
+        """A group's values as points at their spread positions, leaving out those beyond the limits."""
+        px, (lo, hi) = x + offsets, sorted(self.ylim)
+        keep = (v >= lo) & (v <= hi) & (px >= min(self.xlim)) & (px <= max(self.xlim))
+        marks.points(c, self.pal, self._tx(px[keep]), self._ty(v[keep]), size, rgb, alpha)
+
     def _d_box(self, c, a):
-        for x, stats, rgb in zip(a['x'], a['stats'], a['rgb']):
+        dots = a['offsets'] is not None
+        for i, (x, stats, rgb) in enumerate(zip(a['x'], a['stats'], a['rgb'])):
             if stats is None:
                 continue
             x0, x1 = float(self._tx(x - a['w'] / 2)), float(self._tx(x + a['w'] / 2))
-            marks.box(c, self.pal, min(x0, x1), abs(x1 - x0), [float(self._ty(v)) for v in stats[:5]], rgb, a['alpha'])
-            if a['fliers'] and len(stats[5]):
+            fill, ink = self._paired(rgb) if dots and a['box'] else (rgb, rgb)
+            if a['box']:
+                marks.box(c, self.pal, min(x0, x1), abs(x1 - x0), [float(self._ty(v)) for v in stats[:5]], fill,
+                          a['alpha'])
+            if dots:
+                self._group_points(c, x, a['values'][i], a['offsets'][i], a['sizes'][i], ink, a['alpha'])
+            elif a['fliers'] and len(stats[5]):
                 marks.points(c, self.pal, np.full(len(stats[5]), (x0 + x1) / 2), self._ty(stats[5]), 12.0, rgb,
                              a['alpha'])
+
+    def _d_violin(self, c, a):
+        pal = self.pal
+        for i, (x, stats, shape, rgb) in enumerate(zip(a['x'], a['stats'], a['shapes'], a['rgb'])):
+            if stats is None:
+                continue
+            dots = a['inner'] == 'points'
+            fill, ink = self._paired(rgb) if dots else (rgb, rgb)
+            cx = float(self._tx(x))
+            if shape is not None:
+                grid, half = shape
+                ys = self._ty(grid)
+                left, right = self._tx(x - half), self._tx(x + half)
+                marks.violin(c, pal, np.r_[left, right[::-1]], np.r_[ys, ys[::-1]], cx,
+                             float(np.max(np.abs(right - left))) / 2, fill, a['alpha'])
+            if dots or shape is None:
+                self._group_points(c, x, a['values'][i], a['offsets'][i], a['sizes'][i], ink, a['alpha'])
+            elif a['inner'] == 'box':
+                low, q1, median, q3, high = (float(self._ty(v)) for v in stats[:5])
+                span = abs(float(self._tx(x + a['w'] / 2) - self._tx(x - a['w'] / 2)))
+                marks.inner_box(c, pal, cx, min(max(span * 0.08, 2.5), 7.0), (low, q1, median, q3, high), rgb,
+                                a['alpha'])
 
     def _d_stems(self, c, a):
         pal = self.pal

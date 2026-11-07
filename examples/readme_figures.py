@@ -183,6 +183,7 @@ if __name__ == '__main__':
     arrange([[fit(with_glycans(glycan_volcano()), 900, 900), fit(with_glycans(glycan_network()), 900, 900)]],
             'glycans.png')
     arrange([[fit(Image.open(BytesIO(markers().to_png(200))).convert('RGB'), 1400, 1000)]], 'hue_style_size.png')
+    arrange([[fit(Image.open(BytesIO(gallery.groups('lumen').to_png(200))).convert('RGB'), 1400, 840)]], 'groups.png')
     arrange([[tile(gallery.heatmap('aura'), 1100)]], 'clustermap.png')
     for path in sorted(OUT.glob('*.png')):
         print(path.name, path.stat().st_size // 1024, 'kB')

@@ -8,6 +8,7 @@ import pytest
 import viscose as vc
 from viscose import marks
 from viscose.axes import fmt, nice_ticks, tick_labels
+from viscose.figure import SHADOW_DPI
 from viscose.palettes import get_palette, ramp
 from viscose.text import runs, width
 from glycorender import pdfwrite, raster
@@ -361,7 +362,7 @@ def test_boxplot_shows_quartiles_whiskers_and_fliers():
 
 def test_boxplot_without_fliers_leaves_them_out_of_the_limits():
     fig, ax = vc.subplots(figsize = (5, 4))
-    ax.boxplot([[1, 2, 3, 4, 5, 100]], fliers = False)
+    ax.boxplot([[1, 2, 3, 4, 5, 100]], fliers = False, points = False)
     assert ax.get_ylim()[1] < 10
 
 
@@ -508,11 +509,13 @@ def test_slate_can_tell_a_figure():
 def test_shadow_at_high_resolution_matches_the_page_grid():
     fig, ax = vc.subplots(figsize = (2, 2), palette = 'aura')
     ax.bar(['a'], [1])
-    op = fig._shadow_op(300.0)
-    assert op['w'] <= 600 and op['h'] <= 600 and len(op['rgb']) == op['w'] * op['h'] * 3
-    assert abs(op['ctm'][0] * 300.0 / 72.0 - op['w']) < 1e-6 and abs(op['ctm'][3] * 300.0 / 72.0 - op['h']) < 1e-6
-    # The soft shadow reaches past the bar but fades out before the page's corner
-    assert op['alpha'][0] == 0 and max(op['alpha']) > 0
+    fig.layout()
+    top, left, planes = fig._shadow_under(300.0)
+    assert planes.shape[0] == 4 and top + planes.shape[1] <= 600 and left + planes.shape[2] <= 600
+    # Premultiplied, so no channel exceeds its alpha
+    assert planes.dtype == np.float32 and (planes[:3] <= planes[3] + 1e-6).all() and planes.min() >= 0
+    # The soft shadow reaches past the bar but fades out before the corner of its box
+    assert planes[3, 0, 0] < 1 / 255 and planes[3].max() > 0.1
 
 
 def test_colliding_tick_labels_turn_and_then_thin():
@@ -1215,15 +1218,18 @@ def test_many_sizes_stay_vector():
 def test_shadow_is_cropped_and_stays_on_the_grid():
     fig, ax = vc.subplots(figsize = (4, 4), palette = 'aura')
     ax.bar(['a', 'b'], [1.0, 2.0])
+    # For PDF and SVG, an image at no more than SHADOW_DPI, on that resolution's own pixels and smaller than the page
     op = fig._shadow_op(300.0)
     a, _, _, d, e, f = op['ctm']
-    # On the output's own pixels, and smaller than the page
-    sc = 300.0 / 72.0
+    sc = SHADOW_DPI / 72.0
     assert op['w'] < fig.width * sc and op['h'] < fig.height * sc
     for value, size in ((a * sc, op['w']), (d * sc, op['h'])):
         assert abs(value - size) < 1e-6
     assert abs(e * sc - round(e * sc)) < 1e-6 and abs(f * sc - round(f * sc)) < 1e-6
     assert len(op['alpha']) == op['w'] * op['h'] and len(op['rgb']) == 3 * op['w'] * op['h']
+    # For PNG, a layer on the output's own pixels, as much smaller than the page
+    top, left, planes = fig._shadow_under(300.0)
+    assert planes.shape[1] < fig.height * 300 / 72 and planes.shape[2] < fig.width * 300 / 72
 
 
 def test_shadow_does_not_wrap_around_the_page():
@@ -1394,7 +1400,8 @@ def test_scalars_and_missing_values_draw_in_every_format(name):
              lambda ax: ax.annotate('a', (1, np.nan)), lambda ax: ax.scatter([0, 1], [0, 1], c = [np.nan, np.nan]),
              lambda ax: ax.contour(np.arange(3.0), np.arange(3.0), np.full((3, 3), np.nan)),
              lambda ax: ax.heatmap(np.full((3, 3), np.nan), colorbar = True),
-             lambda ax: ax.boxplot([[0.0, 10.0]], whis = 0), lambda ax: ax.scatter([0, 1], [0, 1], s = -1.0)]
+             lambda ax: ax.boxplot([[0.0, 10.0]], whis = 0), lambda ax: ax.scatter([0, 1], [0, 1], s = -1.0),
+             lambda ax: ax.violinplot([[np.nan, 1.0], [], [np.inf, 1.0, 2.0]]), lambda ax: ax.stripplot([[np.nan]])]
     for call in calls:
         fig, ax = vc.subplots(figsize = (3, 2), palette = name)
         call(ax)
@@ -2228,3 +2235,141 @@ def test_placed_text_keeps_its_side_where_an_annotation_turns():
         fig.layout()
         return ax.artists[-1]['_ha']
     assert ha('annotate') == 'right' and ha('text') == 'left'
+
+
+def _group_fills(fig):
+    """The fill colors of the marks drawn, in drawing order."""
+    return [op['fill_rgb'] for op in fig._canvas().ops if op['kind'] == 'path' and op.get('mark') and op['fill']]
+
+
+def test_boxplot_draws_every_value_over_a_paler_box():
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'poster')
+    values = [1.0, 2.0, 2.0, 2.0, 3.0, 4.0, 50.0]
+    ax.boxplot({'a': values}, colors = ['a1'])
+    offsets = ax.artists[0]['offsets'][0]
+    # Every value is a point, equal values apart, within the jitter's share of the box, the same on every call
+    assert len(offsets) == 7 and len(set(offsets[1:4])) == 3 and np.abs(offsets).max() <= 0.7 * 0.5 / 2
+    again = vc.subplots(palette = 'poster')[1].boxplot({'a': values}, colors = ['a1']).artists[0]['offsets'][0]
+    assert np.array_equal(offsets, again)
+    fig.layout()
+    assert ax.get_ylim()[1] > 50
+    pal = fig.pal
+    fills = _group_fills(fig)
+    assert pal.color('a2') in fills and fills.count(pal.color('a1')) == 7
+    # Without points, a value beyond the whiskers shows as a flier only, and the box keeps its color
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'poster')
+    ax.boxplot({'a': values}, colors = ['a1'], points = False)
+    fills = _group_fills(fig)
+    assert pal.color('a2') not in fills and fills.count(pal.color('a1')) == 2
+
+
+def test_the_palest_box_takes_darker_points():
+    fig, ax = vc.subplots(palette = 'poster')
+    ax.boxplot([[1, 2, 3]], colors = ['a3'])
+    assert _group_fills(fig).count(fig.pal.color('a2')) == 3
+
+
+def test_stripplot_draws_points_alone():
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'aura')
+    ax.stripplot({'a': [1.0, 1.0, 1.0, np.nan], 'b': [2.0, 3.0], 'c': []})
+    strip = ax.artists[0]
+    assert not strip['box'] and len(strip['values'][0]) == 3 and len(set(strip['offsets'][0])) == 3
+    fig.layout()
+    # Aura's flat points are one path per group, and no box goes under them
+    assert ax.xlabels == ['a', 'b', 'c'] and _group_fills(fig) == fig.pal.contrast(2)
+
+
+def test_violins_hold_one_area_and_match_a_gaussian_kernel():
+    stats = pytest.importorskip('scipy.stats')
+    rng = np.random.default_rng(2)
+    a, b = rng.normal(0, 1, 40), rng.normal(3, 2, 25)
+    fig, ax = vc.subplots(palette = 'lumen')
+    ax.violinplot([a, b], width = 0.8)
+    shapes = ax.artists[0]['shapes']
+    # Seaborn's kernel: Scott's bandwidth, cut two bandwidths past the extremes
+    for v, (grid, half) in zip((a, b), shapes):
+        kde = stats.gaussian_kde(v)
+        bw = np.sqrt(kde.covariance[0, 0])
+        assert grid[0] == pytest.approx(v.min() - 2 * bw) and grid[-1] == pytest.approx(v.max() + 2 * bw)
+        ratio = half / kde(grid)
+        assert np.allclose(ratio, ratio[0])
+    areas = [np.trapezoid(half, grid) for grid, half in shapes]
+    assert areas[0] == pytest.approx(areas[1], rel = 0.02)
+    assert max(half.max() for _, half in shapes) == pytest.approx(0.4)
+
+
+def test_violin_points_stay_inside_and_inner_is_checked():
+    v = np.random.default_rng(5).normal(0, 1, 60)
+    fig, ax = vc.subplots(palette = 'couture')
+    ax.violinplot([v, [2.0], [2.0, 2.0]], inner = 'points')
+    art = ax.artists[0]
+    grid, half = art['shapes'][0]
+    assert np.all(np.abs(art['offsets'][0]) <= 0.8 * np.interp(v, grid, half) + 1e-12)
+    # A single value, or equal ones, has no spread and shows as points
+    assert art['shapes'][1] is None and art['shapes'][2] is None
+    assert fig.to_png(72)[:4] == b'\x89PNG'
+    with pytest.raises(ValueError, match = 'inner'):
+        ax.violinplot([v], inner = 'quartiles')
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_violins_and_strips_in_every_palette_and_format(name, tmp_path):
+    rng = np.random.default_rng(6)
+    fig, axes = vc.subplots(1, 3, figsize = (9, 3), palette = name)
+    data = {'u': rng.normal(0, 1, 30), 'v': rng.normal(1, 0.5, 20)}
+    axes[0].violinplot(data)
+    axes[1].violinplot(data, inner = 'points')
+    axes[2].stripplot(data)
+    for suffix in ('png', 'pdf', 'svg'):
+        assert fig.save(tmp_path / f'groups.{suffix}').stat().st_size > 0
+    fig.layout()
+    assert len(axes[0].boxes()) == 2 and len(axes[2].boxes()) == 2
+
+
+def test_shared_axes_share_limits_and_label_only_outer_panels():
+    fig, axes = vc.subplots(2, 3, figsize = (9, 6), sharex = True, sharey = 'row')
+    for i, ax in enumerate(axes.ravel()):
+        ax.plot([0, i + 1], [0, 10 * (i // 3 + 1) + i])
+        ax.set_xlabel('time')
+        ax.set_ylabel('level')
+    fig.layout()
+    assert len({ax.get_xlim() for ax in axes.ravel()}) == 1
+    assert axes[0, 0].get_ylim() == axes[0, 2].get_ylim() != axes[1, 0].get_ylim()
+    assert [bool(ax.xlabels) for ax in axes.ravel()] == [False] * 3 + [True] * 3
+    assert [bool(ax.ylabels) for ax in axes.ravel()] == [True, False, False] * 2
+    assert [ax.xlabel for ax in axes.ravel()] == [''] * 3 + ['time'] * 3
+    assert [ax.ylabel for ax in axes.ravel()] == ['level', '', ''] * 2
+    # Plot areas line up along rows and columns
+    rects = np.array([ax.rect for ax in axes.ravel()]).reshape(2, 3, 4)
+    assert np.allclose(rects[0, :, 1], rects[0, 0, 1]) and np.allclose(rects[:, 0, 0], rects[0, 0, 0])
+    assert np.allclose(rects[..., 2], rects[0, 0, 2]) and np.allclose(rects[..., 3], rects[0, 0, 3])
+
+
+def test_shared_axes_share_set_limits_scales_and_inversion():
+    fig, axes = vc.subplots(1, 2, sharey = True)
+    axes[0].plot([1, 10], [1, 100])
+    axes[1].plot([1, 10], [5, 50])
+    axes[1].set_yscale('log')
+    axes[0].invert_yaxis()
+    fig.layout()
+    assert axes[0]._yscale == 'log' and axes[0].get_ylim() == axes[1].get_ylim() and axes[1].get_ylim()[1] > 0
+    axes[1].set_ylim(2, 20)
+    fig.layout()
+    assert axes[0].get_ylim() == axes[1].get_ylim() == (20, 2)
+    with pytest.raises(ValueError, match = 'sharex'):
+        vc.subplots(1, 2, sharex = 'rows')
+
+
+def test_group_plots_and_shared_axes_in_another_palette_equal_ones_drawn_in_it():
+    rng = np.random.default_rng(7)
+    data = {'a': rng.normal(0, 1, 20), 'b': rng.normal(1, 1, 15)}
+    def draw(palette):
+        fig, axes = vc.subplots(1, 3, figsize = (9, 3), palette = palette, sharey = True)
+        axes[0].boxplot(data)
+        axes[0].set_ylabel('value')
+        axes[1].violinplot(data)
+        axes[2].stripplot(data)
+        axes[2].set_ylabel('hidden')
+        return fig
+    moved, direct = draw('poster').in_palette('aura'), draw('aura')
+    assert moved.to_png(72.0) == direct.to_png(72.0) and moved.to_pdf() == direct.to_pdf()
