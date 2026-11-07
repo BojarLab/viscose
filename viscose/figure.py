@@ -199,11 +199,13 @@ class Figure:
         fig._base, fig.width, fig.height = self._base, *self._base
         fig._title, fig._subtitle, fig._grid, fig._held = self._title, self._subtitle, self._grid, self._held
         fig._texts = list(self._texts)
-        twins = {id(ax): Axes(fig, fig.pal) for ax in self.axes}
+        twins, cats = {id(ax): Axes(fig, fig.pal) for ax in self.axes}, {}
         for ax in self.axes:
             twin = twins[id(ax)]
             twin._cell, twin._span, twin._fixed, twin._outer = ax._cell, ax._span, ax._fixed, dict(ax._outer)
             twin._share = {axis: [twins[id(other)] for other in group] for axis, group in ax._share.items()}
+            # Categories shared as the axes share them, to fill again as the calls run
+            twin._cats = {axis: cats.setdefault(id(found), {}) for axis, found in ax._cats.items()}
             twin._align = {axis: twins[id(other)] for axis, other in ax._align.items()}
             fig.axes.append(twin)
         swap = lambda v: twins[id(v)] if isinstance(v, Axes) else v
@@ -262,12 +264,17 @@ class Figure:
     @_in_font
     def _layout(self):
         """Fit each axes into its grid cell, leaving exactly the room its labels need."""
+        # Brackets stretch an axis shared by several, so all start over before any sets its limits
+        for ax in self.axes:
+            ax._lift = 1.0
         for ax in self.axes:
             ax._limits()
-        # A first pass places the axes so that labels can be fitted to them, and later ones place them around the result
+        # A first pass places the axes so that labels can be fitted to them, and later ones place them around the
+        # result, with the y limits that the brackets need in their height
         for _ in range(5):
             self._place()
-            if not any([ax._fit_labels() for ax in self.axes]):
+            lifted = [ax._fit_brackets() for ax in self.axes]
+            if not any([ax._fit_labels() for ax in self.axes]) and not any(lifted):
                 break
 
     def _place(self):
@@ -554,7 +561,8 @@ def subplots(nrows = 1, ncols = 1, figsize = (8.0, 8.0), palette = None, width_r
              unit = 'in', sharex = False, sharey = False):
     """A figure and its axes, as in matplotlib: one Axes, a 1D array for a single row or column, or a 2D array.
     `figsize` is in inches, or with unit = 'mm' in millimeters. `sharex` and `sharey` give axes the same limits, scale,
-    and ticks: True or 'all' across the figure, 'row' within each row, 'col' within each column. Then only the outer
+    ticks, and categories, each at one place in all of them: True or 'all' across the figure, 'row' within each row,
+    'col' within each column. Then only the outer
     panels show those tick labels and the axis's name, the bottom row's for x shared by columns, the first column's for
     y shared by rows, and the plot areas line up across rows and columns."""
     fig = Figure(figsize[0], figsize[1], palette, unit)
@@ -572,6 +580,9 @@ def subplots(nrows = 1, ncols = 1, figsize = (8.0, 8.0), palette = None, width_r
                 if share in (True, 'all', 'row', 'col'):
                     ax._share[axis] = ([a for row in rows for a in row] if share in (True, 'all') else
                                        rows[r] if share == 'row' else [row[j] for row in rows])
+                    # One list of categories for all, in order of first appearance in any, so that a category has one
+                    # place in every panel, whichever groups each holds
+                    ax._cats[axis] = ax._share[axis][0]._cats[axis]
             # As matplotlib labels them: x below the bottom row of a column that shares it, y beside the first column
             ax._outer = {'x': sharex in (True, 'all', 'col') and r < nrows - 1,
                          'y': sharey in (True, 'all', 'row') and j > 0}

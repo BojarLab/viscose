@@ -92,15 +92,26 @@ ax.text(0.02, 0.98, 'F = 4.2\np = 0.003', axes_fraction = True, va = 'top')
 
 <p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/hue_style_size.png" alt="A scatter plot with color, shape, and size mapped to data, with a three-part legend" width="80%"></p>
 
-Group comparisons show every sample. `boxplot` spreads each value as a point over a paler box, `violinplot` draws each group's density with its quartiles inside, or its points spread as wide as the density, and `stripplot` gives the points alone. `sharex` and `sharey` put panels on one scale, with tick labels on the outer ones and the plot areas lined up.
+Group comparisons show every sample. `boxplot` spreads each value as a point over a paler box, `violinplot` draws each group's density with its quartiles inside, or its points spread as wide as the density, and `stripplot` gives the points alone. `bracket` marks a difference between two groups with a p-value or stars, above the data between them; several stack by themselves, narrower ones lower, and the axis grows to hold them. `sharex` and `sharey` put panels on one scale, with tick labels on the outer ones and the plot areas lined up.
 
 ```python
 fig, (a, b) = vc.subplots(1, 2, palette = 'lumen', sharey = True)
 a.boxplot({'Healthy': healthy, 'Adenoma': adenoma, 'Carcinoma': carcinoma, 'Metastasis': metastasis})
+a.bracket('Healthy', 'Adenoma', 0.003)
+a.bracket('Healthy', 'Carcinoma', '***')
 b.violinplot(core_fucose)
 ```
 
-<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/groups.png" alt="Box plots with every sample as a point beside violin plots, on one shared scale, in Lumen" width="80%"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/groups.png" alt="Box plots with every sample as a point and significance brackets beside violin plots, on one shared scale, in Lumen" width="80%"></p>
+
+Groups within groups come straight from a tidy table, as seaborn takes them: name the columns, and `hue` sets each category's boxes, violins, or strips side by side under one legend. Long names read across the page, where the plot turns by itself when x holds the numbers, or with `orient = 'h'`. `swarm = True` packs the points side by side so that none overlap, which suits 20 to 100 samples a group, and `names` tells slate's console which sample sits under the mouse. `bracket(('Core fucose', 'Healthy'), ('Core fucose', 'Tumor'), 0.01)` compares two groups of a hue, `density_norm = 'width'` keeps every violin readable beside a narrow one, and panels with `sharex` or `sharey` share their categories, so each group holds one place in all of them, whatever order each panel lists it in.
+
+```python
+fig, ax = vc.subplots(palette = 'couture')
+ax.boxplot(df, x = 'abundance', y = 'motif', hue = 'tissue', swarm = True, names = 'sample')
+```
+
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/subgroups.png" alt="Horizontal box plots of five glycan motifs, healthy and tumor side by side, with every sample as a swarm of points, in Couture" width="80%"></p>
 
 Clustermaps come with both dendrograms and a color bar. Hand over a DataFrame and it brings its own labels. viscose clusters by itself, with scipy's seven linkage methods, its common metrics, or a function of your own, and orders the leaves so that neighbors are as alike as the tree allows. That order is the exact optimum, which scipy's `optimal_leaf_ordering` reached in 158 of 300 small trees checked by brute force, and it comes faster: 0.6 s against scipy's 2.8 s for 1,000 rows, and 3.2 s against 20 s for 2,000. `vc.linkage` gives the same trees in scipy's format.
 
@@ -114,11 +125,11 @@ fig, heat = vc.clustermap(df, palette = 'aura', title = 'Glycan abundance by tis
 |---|---|
 | **Plots** | `plot`, `step`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `boxplot`, `violinplot`, `stripplot`, `contour`, `stem`, `hlines`, `vlines`, `arrow`, `rectangle`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, `axline`, `axhspan`, `axvspan`, `image`, and `vc.clustermap` |
 | **Markers** | `o`, `s`, `D`, `^`, `v`, `>`, `<`, `X`, `P`, `*`, `h`, and `p`, all with the palette's effects |
-| **Annotation** | `text`, `annotate`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text; `annotate(spread = True)` names line ends directly, moving labels apart exactly as little as it takes, with a hairline to each one that moved |
+| **Annotation** | `text`, `annotate`, `bracket`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text; `annotate(spread = True)` names line ends directly, moving labels apart exactly as little as it takes, with a hairline to each one that moved |
 | **Pages** | `vc.Figure(183, 120, unit = 'mm')` is a journal page, `fig.add_axes((x, y, w, h), unit = 'mm')` places a panel from its top left, and `fig.letter(x, y, 'a', 'Heading')` and `fig.text` write panel letters and any other text on the page; `vc.subplot_mosaic('abc;ddd')` lets axes span cells of a grid |
 | **Axes** | `set_xscale` takes `linear`, `log`, `sqrt`, or any pair of functions; `fmt` on `set_xticks` and `set_yticks` writes the ticks, as `'{:.0%}'` or a function; `tick_params` sets each axis's tick length, pad, label size, and labels, puts x labels on top, or keeps labels exactly as set; `emphasis` sets chosen tick labels bold in a color; `set_spines` shows or hides each axis line |
 | **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, long axis names shrink, and the page grows for anything that needs it; `vc.subplots(sharex = True, sharey = 'row')` shares limits, scales, and ticks across all panels, rows, or columns, as in matplotlib |
-| **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window |
+| **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG; `scatter(rasterized = True)` makes tens of thousands of points one image there, as 100,000 points take 1.7 MB of SVG in place of 17.6 MB, with axes and text still vector; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window |
 | **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, and `ax.boxes()` gives the page boxes of everything drawn, for placing things yourself clear of it or answering a mouse |
 | **Display** | `fig.show()` works inline in Jupyter and slate, and in the system's image viewer from a terminal, with CI and coding agents kept silent |
 | **SVG hooks** | `gid` on `arrow` and `scatter` names elements for hover text and scripting |

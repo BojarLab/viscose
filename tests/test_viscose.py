@@ -2373,3 +2373,382 @@ def test_group_plots_and_shared_axes_in_another_palette_equal_ones_drawn_in_it()
         return fig
     moved, direct = draw('poster').in_palette('aura'), draw('aura')
     assert moved.to_png(72.0) == direct.to_png(72.0) and moved.to_pdf() == direct.to_pdf()
+
+
+def _bracketed(palette, invert = False, log = False, **kw):
+    rng = np.random.default_rng(5)
+    data = {name: rng.lognormal(m, 0.4, 25) for name, m in zip('abcd', (0.0, 0.5, 1.2, 1.6))}
+    fig, ax = vc.subplots(figsize = (5, 4), palette = palette, **kw)
+    ax.boxplot(data)
+    if log:
+        ax.set_yscale('log')
+    if invert:
+        ax.invert_yaxis()
+    ax.bracket(0, 1, 0.012)
+    ax.bracket('b', 'c', '**')
+    ax.bracket(0, 2, 2.3e-5)
+    ax.bracket(2, 3, 'n.s.')
+    ax.bracket('a', 'd', '***\nall')
+    return fig, ax, data
+
+
+def _bracket_parts(ax):
+    """Each bracket's span, line, and top on the page, in drawing order."""
+    plan = ax._bracket_plan()
+    return [plan[id(a)] for a in ax.artists if a['kind'] == 'bracket']
+
+
+@pytest.mark.parametrize('invert, log', [(False, False), (True, False), (False, True)])
+def test_brackets_sit_over_their_groups_stack_and_fit_the_axes(invert, log):
+    fig, ax, data = _bracketed('lumen', invert, log)
+    fig.layout()
+    x0, y0, w, h = ax.rect
+    parts = _bracket_parts(ax)
+    for (left, right, line, top), (g0, g1) in zip(parts, [(0, 1), (1, 2), (0, 2), (2, 3), (0, 3)]):
+        assert left == pytest.approx(ax.page(g0, 0)[0]) and right == pytest.approx(ax.page(g1, 0)[0])
+        # Above every value of the groups it spans, on the page, and within the axes
+        highest = max(float(np.max(ax.page(0, v)[1])) for v in list(data.values())[g0:g1 + 1])
+        assert line - 4.0 > highest and top <= y0 + h
+    # Brackets that meet lie one above the other, the narrower lower
+    for i, j in [(0, 1), (1, 2), (0, 2), (2, 4), (3, 4)]:
+        assert parts[i][3] < parts[j][2] - 4.0 or parts[j][3] < parts[i][2] - 4.0
+    assert parts[2][2] > parts[0][3] and parts[4][2] > max(p[3] for p in parts[:4])
+    # The limits grew only at the page's top
+    bare = vc.subplots(figsize = (5, 4))[1].boxplot(data)
+    if log:
+        bare.set_yscale('log')
+    if invert:
+        bare.invert_yaxis()
+    assert bare.get_ylim()[0] == pytest.approx(ax.ylim[0])
+    assert (ax.ylim[1] < bare.get_ylim()[1]) if invert else (ax.ylim[1] > bare.get_ylim()[1])
+
+
+def test_brackets_write_p_values_and_find_groups_by_name():
+    fig, ax, _ = _bracketed('poster')
+    assert [a['s'] for a in ax.artists if a['kind'] == 'bracket'] == ['p = 0.012', '**', 'p = 2.3×10^{-5}', 'n.s.',
+                                                                    '***\nall']
+    assert vc.subplots(palette = _journal(minus = '−'))[1].bracket(0, 1, 1e-7).artists[0]['s'] == 'p = 10^{−7}'
+    # Categories of a line join the boxes' after them, rather than land on them
+    ax.plot(['u', 'v'], [1, 2])
+    assert (ax.bracket('u', 'v').artists[-1]['x0'], ax.artists[-1]['x1']) == (4.0, 5.0)
+    for ends in (('a', 'zz'), (1, 1), (0, np.nan)):
+        with pytest.raises(ValueError, match = 'bracket'):
+            ax.bracket(*ends)
+
+
+def test_brackets_keep_limits_set_by_hand_and_cast_no_shadow():
+    fig, ax, _ = _bracketed('aura')
+    ax.set_ylim(0, 30)
+    fig.layout()
+    assert ax.ylim == (0.0, 30.0) and len(ax._bracket_plan()) == 5
+    c = fig._canvas()
+    texts = [op for op in c.ops if op['kind'] == 'text' and op['text'] in ('**', 'n.s.')]
+    assert len(texts) == 2 and not any(op.get('mark') or op.get('clip') for op in texts)
+    # Limits that leave no room above the data, or leave its ends behind, hide a bracket, as zooming in a window would
+    ax.set_ylim(0, 3)
+    fig.layout()
+    shown = ax._bracket_plan()
+    assert 0 < len(shown) < 5 and max(v[3] for v in shown.values()) <= ax.rect[1] + ax.rect[3] + 0.5
+    ax.set_xlim(-0.5, 1.5)
+    fig.layout()
+    assert all(a['x1'] <= 1 for a in ax.artists if a['kind'] == 'bracket' and id(a) in ax._bracket_plan())
+    assert '**' not in [op['text'] for op in fig._canvas().ops if op['kind'] == 'text']
+
+
+def test_brackets_share_their_lift_with_axes_sharing_y_and_stay_put_on_saving_again():
+    rng = np.random.default_rng(2)
+    fig, (a, b) = vc.subplots(1, 2, figsize = (8, 4), sharey = True)
+    a.boxplot([rng.normal(0, 1, 20), rng.normal(1, 1, 20)])
+    b.violinplot([rng.normal(0, 1, 20), rng.normal(3, 1, 20)])
+    b.bracket(0, 1, '*')
+    first = fig.to_png(72.0)
+    assert a.ylim == b.ylim and a._lift == b._lift > 1.0
+    a.get_ylim()
+    assert a.ylim == b.ylim and fig.to_png(72.0) == first
+
+
+def test_bracket_boxes_cover_line_and_text():
+    fig, ax, _ = _bracketed('couture')
+    fig.layout()
+    boxes, (left, right, line, top) = ax.boxes(), _bracket_parts(ax)[1]
+    on_line = boxes[np.isclose((boxes[:, 1] + boxes[:, 3]) / 2, line) & (boxes[:, 0] >= left - 1)
+                    & (boxes[:, 2] <= right + 1)]
+    assert len(on_line) > 20
+    label = boxes[np.isclose((boxes[:, 0] + boxes[:, 2]) / 2, (left + right) / 2) & (boxes[:, 1] > line)
+                  & (boxes[:, 1] < top)]
+    assert len(label) == 1 and label[0][3] <= top + 1e-6
+    assert label[0][2] - label[0][0] == pytest.approx(width('**', fig.pal.tick_size, fig.pal.text_bold))
+
+
+def test_brackets_in_another_palette_equal_ones_drawn_in_it():
+    moved, direct = _bracketed('poster', True)[0].in_palette('couture'), _bracketed('couture', True)[0]
+    assert moved.to_png(72.0) == direct.to_png(72.0) and moved.to_pdf() == direct.to_pdf()
+    assert re.sub(r'grad\d+', 'grad', moved.to_svg()) == re.sub(r'grad\d+', 'grad', direct.to_svg())
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_boxes_and_inner_boxes_draw_on_a_turned_axis(name):
+    def ops(turn):
+        fig, (a, b) = vc.subplots(1, 2, palette = name)
+        a.boxplot([[1, 2, 3, 4, 9], [2, 3, 5, 6]])
+        b.violinplot([[1, 2, 3, 4, 9], [2, 3, 5, 6]])
+        if turn:
+            a.invert_yaxis()
+            b.invert_yaxis()
+        return len(fig._canvas().ops)
+    assert ops(True) == ops(False)
+
+
+def _rasterized(palette, rasterized = True, **kw):
+    rng = np.random.default_rng(4)
+    fig, ax = vc.subplots(figsize = (3, 3), palette = palette)
+    ax.scatter(rng.normal(size = 300), rng.normal(size = 300), hue = rng.choice(['a', 'b', 'c'], 300),
+               rasterized = rasterized, **kw)
+    ax.set_xlabel('log2 fold change')
+    return fig, ax
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_a_rasterized_scatter_is_one_image_in_vector_output_only(name):
+    fig, ax = _rasterized(name)
+    ops = fig._canvas().ops
+    images = [op for op in ops if op['kind'] == 'image' and op.get('mark')]
+    texts = [op for op in ops if op['kind'] == 'text']
+    # One image for all three colors, clipped to the axes, with the axes, the legend, and the text still vector
+    assert len(images) == 1 and images[0]['clip'] and len(texts) > 5
+    assert any(op['kind'] == 'path' and op.get('mark') is None for op in ops)
+    x0, y0, w, h = ax.rect
+    a, _, _, d, e, f = images[0]['ctm']
+    assert e > x0 - 10.0 and f > y0 - 10.0 and e + a < x0 + w + 10.0 and f + d < y0 + h + 10.0
+    assert images[0]['w'] == pytest.approx(a * 300 / 72) and images[0]['h'] == pytest.approx(d * 300 / 72)
+    # PNG stays as it was, and the image matches what it draws
+    plain = _rasterized(name, False)[0]
+    assert fig.to_png(72.0) == plain.to_png(72.0)
+    drawn = raster.render(ops, fig.width, fig.height, 300 / 72, 300 / 72, (1.0, 1.0, 1.0)).astype(int)
+    stamped = raster.render(plain._canvas(stamp_dpi = 300).ops, fig.width, fig.height, 300 / 72, 300 / 72,
+                            (1.0, 1.0, 1.0)).astype(int)
+    assert np.abs(drawn - stamped).max() <= 2
+    # Beside a soft shadow, which is an image of its own
+    assert b'/Subtype /Image' in fig.to_pdf() and fig.to_svg().count('<image') == 1 + bool(fig.pal.shadow)
+
+
+def test_rasterized_points_take_their_dpi_any_marker_and_no_clip():
+    fig, ax = _rasterized('couture', 72, s = np.linspace(5, 60, 300), marker = 's')
+    fig.layout()
+    op = [op for op in fig._canvas().ops if op['kind'] == 'image'][0]
+    assert op['w'] == pytest.approx(op['ctm'][0], abs = 1e-9)
+    # A named scatter has no clip, so its image covers what its points reach on the page
+    fig, ax = vc.subplots(figsize = (3, 3))
+    ax.scatter([0, 1], [0, 1], gid = 'dots', rasterized = True)
+    ops = fig._canvas().ops
+    assert [op['gid'] for op in ops if op['kind'] == 'image'] == ['dots'] and '<g id="dots">' in fig.to_svg()
+    # Nothing to draw, or nothing in view, makes no image
+    fig, ax = vc.subplots(figsize = (3, 3))
+    ax.scatter([], [], rasterized = True)
+    ax.scatter([5.0], [5.0], rasterized = True)
+    ax.set_xlim(0, 1)
+    assert not [op for op in fig._canvas().ops if op['kind'] == 'image']
+
+
+def test_a_rasterized_scatter_in_another_palette_equals_one_drawn_in_it():
+    moved, direct = _rasterized('poster')[0].in_palette('aura'), _rasterized('aura')[0]
+    assert moved.to_pdf() == direct.to_pdf() and moved.to_png(72.0) == direct.to_png(72.0)
+    assert re.sub(r'grad\d+', 'grad', moved.to_svg()) == re.sub(r'grad\d+', 'grad', direct.to_svg())
+
+
+def test_data_without_a_range_keeps_its_ticks_off_the_corners():
+    fig, ax = vc.subplots(figsize = (3, 2.4), palette = 'poster')
+    ax.scatter(1.0, 2.0)
+    fig.layout()
+    for ticks, (lo, hi) in ((ax.xticks, ax.xlim), (ax.yticks, ax.ylim)):
+        assert lo < min(ticks) and max(ticks) < hi
+
+
+@pytest.mark.parametrize('name, marker', [('poster', 'o'), ('lumen', 'o'), ('aura', '^')])
+def test_marks_under_opaque_blocks_are_skipped_and_change_nothing(name, marker):
+    rng = np.random.default_rng(9)
+    x, y = rng.normal(size = 6000) * 8 + 50, rng.normal(size = 6000) * 8 + 50
+    def stamped():
+        c = pdfwrite.Canvas(BytesIO(), pagesize = (100, 100))
+        c.stamp_dpi = 150.0
+        c.state['clip'] = [((0, 0, 100, 100), c.state['ctm'])]
+        marks.points(c, get_palette(name), x, y, 30.0, (0.2, 0.4, 0.6), marker = marker)
+        return c.ops[-1]['rgb'] + c.ops[-1]['alpha']
+    calls = []
+    hidden = marks._hidden
+    with patch.object(marks, '_hidden', lambda *a: calls.append(hidden(*a)) or calls[-1]):
+        skipping = stamped()
+    with patch.object(marks, '_hidden', lambda buf, cx, *a: np.zeros(len(cx), bool)):
+        assert stamped() == skipping
+    assert sum(v.sum() for v in calls) > 3000
+
+
+def _tidy(n = 12, seed = 9):
+    """Long-form data: a value per sample, with its class, condition, and name."""
+    rng = np.random.default_rng(seed)
+    rows = [(c, h, rng.normal(i + 2 * j, 1.0), f'{c}-{h}-{k}') for i, c in enumerate(['sialyl', 'fucosyl', 'mannose'])
+            for j, h in enumerate(['healthy', 'cancer']) for k in range(n)]
+    return {key: [r[i] for r in rows] for i, key in enumerate(['cls', 'cond', 'value', 'sample'])}
+
+
+def _same_stats(a, b):
+    return len(a) == len(b) and all(s is t is None or s is not None and t is not None and np.allclose(s[:5], t[:5])
+                                    and np.array_equal(s[5], t[5]) for s, t in zip(a, b))
+
+
+def test_long_form_input_matches_a_dict_of_groups():
+    pd = pytest.importorskip('pandas')
+    tidy = _tidy()
+    by = {c: [v for v, k in zip(tidy['value'], tidy['cls']) if k == c] for c in dict.fromkeys(tidy['cls'])}
+    for method in ('boxplot', 'stripplot', 'violinplot'):
+        wide = getattr(vc.subplots()[1], method)(by).artists[0]
+        for table in (tidy, pd.DataFrame(tidy)):
+            ax = getattr(vc.subplots()[1], method)(table, x = 'cls', y = 'value')
+            long = ax.artists[0]
+            assert np.array_equal(long['x'], wide['x']) and all(np.array_equal(a, b) for a, b in
+                                                                 zip(long['values'], wide['values']))
+            assert _same_stats(long['stats'], wide['stats']) and not long['horizontal'] and ax._cats['x'] == {
+                'sialyl': 0, 'fucosyl': 1, 'mannose': 2}
+    # Columns given as values work alike, numbers as categories go by size, and order chooses and orders them
+    ax = vc.subplots()[1].boxplot(x = [3, 1, 2, 1], y = [1.0, 2.0, 3.0, 4.0])
+    assert list(ax._cats['x']) == ['1', '2', '3'] and list(ax.artists[0]['values'][0]) == [2.0, 4.0]
+    ax = vc.subplots()[1].boxplot(tidy, x = 'cls', y = 'value', order = ['mannose', 'sialyl'])
+    assert list(ax._cats['x']) == ['mannose', 'sialyl'] and len(ax.artists[0]['values'][0]) == 24
+    with pytest.raises(ValueError, match = 'orient'):
+        vc.subplots()[1].boxplot(tidy, x = 'cls', y = 'value', orient = 'sideways')
+    with pytest.raises(ValueError, match = 'hue'):
+        vc.subplots()[1].boxplot([[1, 2]], hue = ['a', 'b'])
+
+
+def test_hue_sets_groups_side_by_side_with_one_legend():
+    tidy = _tidy()
+    fig, ax = vc.subplots(figsize = (6, 4), palette = 'poster')
+    ax.boxplot(tidy, x = 'cls', y = 'value', hue = 'cond', points = False)
+    ax.stripplot(tidy, x = 'cls', y = 'value', hue = 'cond')
+    box = ax.artists[0]
+    # Two levels share 0.8 of each category, each box 0.8 of its share
+    assert np.allclose(box['x'], [-0.2, 0.2, 0.8, 1.2, 1.8, 2.2]) and np.allclose(box['w'], 0.32)
+    assert box['rgb'][::2] == [fig.pal.contrast(2)[0]] * 3 and box['rgb'][1::2] == [fig.pal.contrast(2)[1]] * 3
+    assert box['groups'][:2] == [('sialyl', 'healthy'), ('sialyl', 'cancer')]
+    # The strip over the boxes adds points to the legend, and nothing twice
+    assert [e[0] for e in ax.legend_items] == ['cond', 'healthy', 'cancer', 'healthy', 'cancer']
+    assert [e[2] for e in ax.legend_items] == ['header', 'patch', 'patch', 'point', 'point']
+    assert ax.bracket(('fucosyl', 'healthy'), ('fucosyl', 'cancer'), 0.01).artists[-1]['x0'] == pytest.approx(0.8)
+    with pytest.raises(ValueError, match = 'hue'):
+        ax.bracket(('fucosyl', 'unknown'), 'sialyl')
+    nested = {c: {h: [v for v, k, g in zip(tidy['value'], tidy['cls'], tidy['cond']) if (k, g) == (c, h)]
+                  for h in ('healthy', 'cancer')} for c in ('sialyl', 'fucosyl', 'mannose')}
+    again = vc.subplots()[1].boxplot(nested, points = False).artists[0]
+    assert np.allclose(again['x'], box['x']) and _same_stats(again['stats'], box['stats'])
+    fig.layout()
+    # One box per group of the boxes, then of the strip, side by side across the page, before the bracket's pieces
+    boxes = ax.boxes()[:12]
+    assert ax.xlabels == ['sialyl', 'fucosyl', 'mannose'] and np.all(np.diff(boxes[:6, 0]) > 0)
+
+
+def test_horizontal_groups_run_across_with_the_first_on_top():
+    tidy = _tidy()
+    fig, ax = vc.subplots(figsize = (6, 4), palette = 'lumen')
+    ax.violinplot(tidy, x = 'value', y = 'cls', hue = 'cond')
+    art = ax.artists[0]
+    assert art['horizontal'] and list(ax._cats['y']) == ['sialyl', 'fucosyl', 'mannose'] and ax._yinv
+    fig.layout()
+    assert ax.ylabels == ['sialyl', 'fucosyl', 'mannose'] and ax.ylim[0] > ax.ylim[1]
+    # Each violin is wider than tall on the page, and the first group is the highest
+    boxes = ax.boxes()
+    assert np.all(boxes[:, 2] - boxes[:, 0] > boxes[:, 3] - boxes[:, 1]) and boxes[0, 3] == boxes[:, 3].max()
+    assert ax.get_xlim()[0] < min(tidy['value']) and ax.get_xlim()[1] > max(tidy['value'])
+    for orient in ('h', 'v'):
+        drawn = vc.subplots(figsize = (6, 4), palette = 'lumen')[1].boxplot(tidy, x = 'cls', y = 'value',
+                                                                             orient = orient)
+        assert drawn.artists[0]['horizontal'] == (orient == 'h')
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_hue_horizontal_and_swarms_in_every_palette_and_format(name, tmp_path):
+    tidy = _tidy(30)
+    fig, axes = vc.subplots(2, 2, figsize = (9, 7), palette = name)
+    axes[0, 0].boxplot(tidy, x = 'cls', y = 'value', hue = 'cond', swarm = True)
+    axes[0, 1].violinplot(tidy, x = 'value', y = 'cls', hue = 'cond', inner = 'swarm', density_norm = 'width')
+    axes[1, 0].stripplot(tidy, x = 'value', y = 'cls', swarm = True, names = 'sample')
+    axes[1, 1].boxplot(tidy, x = 'value', y = 'cls', points = False)
+    axes[1, 1].violinplot(tidy, x = 'value', y = 'cls', inner = 'box', alpha = 0.5)
+    for suffix in ('png', 'pdf', 'svg'):
+        assert fig.save(tmp_path / f'groups.{suffix}').stat().st_size > 0
+
+
+def test_names_follow_their_values():
+    fig, ax = vc.subplots()
+    ax.stripplot({'a': [1.0, np.nan, 3.0], 'b': [2.0]}, names = {'a': ['x', 'y', 'z'], 'b': ['w']})
+    assert [list(n) for n in ax.artists[0]['names']] == [['x', 'z'], ['w']]
+    tidy = _tidy(3)
+    ax.boxplot(tidy, x = 'cls', y = 'value', names = 'sample')
+    assert list(ax.artists[1]['names'][0]) == ['sialyl-healthy-0', 'sialyl-healthy-1', 'sialyl-healthy-2',
+                                               'sialyl-cancer-0', 'sialyl-cancer-1', 'sialyl-cancer-2']
+    assert vc.subplots()[1].boxplot([[1.0]]).artists[0]['names'] is None
+    with pytest.raises(ValueError, match = 'names'):
+        vc.subplots()[1].boxplot({'a': [1.0, 2.0]}, names = {'a': ['x']})
+    with pytest.raises(ValueError, match = 'names'):
+        vc.subplots()[1].boxplot(tidy, x = 'cls', y = 'value', names = ['x'])
+
+
+@pytest.mark.parametrize('horizontal', [False, True])
+def test_swarm_points_never_overlap_and_stay_within_their_group(horizontal):
+    rng = np.random.default_rng(4)
+    data = {'a': rng.normal(0, 1, 60), 'b': rng.normal(1, 0.5, 30)}
+    fig, ax = vc.subplots(figsize = (6, 6), palette = 'couture')
+    ax.stripplot(data, swarm = True, orient = 'h' if horizontal else 'v')
+    fig.layout()
+    art = ax.artists[0]
+    offsets, sizes = ax._spread(art)
+    assert offsets is ax._spread(art)[0]
+    for x, v, u, s in zip(art['x'], art['values'], offsets, sizes):
+        assert 0 < np.abs(u).max() <= 0.4 + 1e-9
+        px, py = ax.page(v, x + u) if horizontal else ax.page(x + u, v)
+        gaps = np.hypot(px[:, None] - px[None], py[:, None] - py[None]) + np.eye(len(v)) * 1e9
+        assert gaps.min() >= np.sqrt(s * fig.pal.point_scale) - 1e-6
+    # Equal values beyond the width squeeze into it, where the others keep their places
+    tied = vc.subplots(figsize = (6, 2))[1].stripplot([[0.0] * 150 + list(np.linspace(1, 9, 9))], swarm = True)
+    tied.figure.layout()
+    u = tied._spread(tied.artists[0])[0][0]
+    assert np.abs(u[:150]).max() == pytest.approx(0.4) and np.all(u[150:] == 0)
+
+
+def test_shared_axes_merge_their_categories():
+    fig, axes = vc.subplots(1, 2, figsize = (8, 3), sharex = True, sharey = True)
+    axes[0].boxplot({'a': [1, 2, 3], 'b': [2, 3, 4]})
+    axes[1].stripplot({'c': [1, 2], 'a': [3, 4]})
+    assert axes[0]._cats['x'] is axes[1]._cats['x'] and axes[1].artists[0]['x'].tolist() == [2.0, 0.0]
+    fig.layout()
+    assert axes[0].xlabels == axes[1].xlabels == ['a', 'b', 'c'] and axes[0].get_xlim() == axes[1].get_xlim()
+    # Unshared panels keep categories of their own, and a replay in another palette shares them as drawn
+    fig2, axes2 = vc.subplots(1, 2, sharey = True)
+    axes2[0].boxplot({'a': [1, 2]})
+    axes2[1].boxplot({'c': [1, 2]})
+    assert axes2[1].artists[0]['x'].tolist() == [0.0]
+    moved = fig.in_palette('aura')
+    assert moved.axes[0]._cats['x'] is moved.axes[1]._cats['x']
+    assert moved.axes[1].artists[0]['x'].tolist() == [2.0, 0.0]
+
+
+def test_hue_and_swarms_in_another_palette_equal_ones_drawn_in_it():
+    tidy = _tidy()
+    def draw(palette):
+        fig, axes = vc.subplots(1, 2, figsize = (8, 3), palette = palette, sharex = True)
+        axes[0].boxplot(tidy, x = 'cls', y = 'value', hue = 'cond', swarm = True)
+        axes[1].violinplot(tidy, x = 'cls', y = 'value', hue = 'cond', inner = 'swarm', order = ['mannose', 'sialyl'])
+        return fig
+    moved, direct = draw('lumen').in_palette('poster'), draw('poster')
+    assert moved.to_png(72.0) == direct.to_png(72.0) and moved.to_pdf() == direct.to_pdf()
+
+
+def test_violins_scale_by_area_count_or_width():
+    rng = np.random.default_rng(3)
+    data = [rng.normal(0, 1, 40), rng.normal(0, 0.1, 10)]
+    peaks = {norm: [h.max() for _, h in vc.subplots()[1].violinplot(data, density_norm = norm).artists[0]['shapes']]
+             for norm in ('area', 'count', 'width')}
+    assert peaks['width'] == pytest.approx([0.4, 0.4]) and max(peaks['area']) == pytest.approx(0.4)
+    # The narrow group peaks highest by area, and its fewer values bring it down by count
+    assert peaks['area'][1] / peaks['area'][0] == pytest.approx(4 * peaks['count'][1] / peaks['count'][0])
+    with pytest.raises(ValueError, match = 'density_norm'):
+        vc.subplots()[1].violinplot(data, density_norm = 'height')

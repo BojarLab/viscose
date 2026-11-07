@@ -169,14 +169,32 @@ def groups(palette):
     fig, (a, b) = vc.subplots(1, 2, figsize = (10, 6), palette = palette, sharey = True)
     fig.suptitle('Glycan motifs by stage', '97 colorectal samples')
     a.boxplot(sialyl)
+    a.bracket('Healthy', 'Adenoma', 0.003)
+    a.bracket('Healthy', 'Carcinoma', '***')
     a.set_title('Sialyl Lewis x')
     a.set_ylabel('Relative abundance (%)')
     b.violinplot(fucose)
+    b.bracket('Healthy', 'Metastasis', 2e-6)
     b.set_title('Core fucose')
     return fig
 
 
-FIGURES = {1: volcano, 2: heatmap, 3: ridges, 4: spectrum, 5: stacked, 6: embedding, 7: trial, 8: groups}
+def subgroups(palette):
+    rng = np.random.default_rng(17)
+    motifs = {'Sialyl Lewis x': (3.4, 1.8), 'Core fucose': (6.1, 7.4), 'Bisecting GlcNAc': (2.2, 3.5),
+              'LacdiNAc': (1.4, 1.1), 'Blood group H': (4.8, 2.9)}
+    rows = [(motif, tissue, rng.gamma(9.0, mean / 9.0), f'{tissue[0]}{k + 1}') for motif, means in motifs.items()
+            for tissue, mean in zip(('Healthy', 'Tumor'), means) for k in range(24)]
+    tidy = {key: [r[i] for r in rows] for i, key in enumerate(('motif', 'tissue', 'abundance', 'sample'))}
+    fig, ax = vc.subplots(figsize = (10, 6), palette = palette)
+    fig.suptitle('Glycan motifs in tumor and healthy tissue', '48 colorectal samples')
+    ax.boxplot(tidy, x = 'abundance', y = 'motif', hue = 'tissue', swarm = True, names = 'sample')
+    ax.set_xlabel('Relative abundance (%)')
+    return fig
+
+
+FIGURES = {1: volcano, 2: heatmap, 3: ridges, 4: spectrum, 5: stacked, 6: embedding, 7: trial, 8: groups,
+           9: subgroups}
 
 
 if __name__ == '__main__':

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "viscose"
-version = "0.1.5"
+version = "0.2.0"
 description = "Scientific plots that are pieces of art: palettes with their own special effects, drawn without matplotlib"
 readme = "README.md"
 authors = [
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Visualization",
 ]
 keywords = ["plotting", "visualization", "figures", "palettes", "glycowork"]
-dependencies = ["numpy", "glycorender>=0.5.5"]
+dependencies = ["numpy", "glycorender>=0.5.6"]
 requires-python = ">=3.11"
 
 [project.optional-dependencies]

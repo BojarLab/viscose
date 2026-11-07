@@ -33,6 +33,11 @@ POINT_GROUPS = 200
 # A stamped marker other than a disc takes its coverage from a table per size, with its center on the nearest of this
 # many positions per pixel and axis; a scatter with more sizes than this stays vector
 SPRITE_PHASES, SPRITE_SIZES = 8, 4
+# A stamped layer counts the opaque pixels of each block of this many pixels square, so that a mark whose reach lies
+# within opaque blocks costs nothing
+CELL = 8
+# A glowing line's strokes under it, as (width in line widths, alpha), from the bottom up
+GLOW = ((4.2, 0.06), (2.7, 0.1), (1.6, 0.2))
 
 
 def _style(c, rgb = None, alpha = 1.0, stroke = None, lw = None, stroke_alpha = 1.0, cap = 0, join = 0, dash = None):
@@ -69,8 +74,27 @@ def _stamp_buffer(c, xs, ys, rs, marker):
     ny = int(math.ceil(min(by + bh, float(np.max(ys)) + reach) * sc)) - py0
     if nx <= 0 or ny <= 0:
         return None
+    # Per block, how many of its pixels are opaque, and how many it has within the layer, which marks whose areas add up
+    # to the layer's count, as only those cover much of it many times over
+    rows = np.minimum(CELL, ny - np.arange(-(-ny // CELL)) * CELL)
+    cols = np.minimum(CELL, nx - np.arange(-(-nx // CELL)) * CELL)
     return dict(sc = sc, px0 = px0, py0 = py0, nx = nx, ny = ny, rgb = np.zeros((ny * nx, 3), np.float32),
-                alpha = np.zeros(ny * nx, np.float32), last = np.zeros(ny * nx, np.int32), sprites = {})
+                alpha = np.zeros(ny * nx, np.float32), last = np.zeros(ny * nx, np.int32), sprites = {},
+                opaque = np.zeros(len(rows) * len(cols), np.int32), full = np.outer(rows, cols).ravel(),
+                ncx = len(cols), filled = False, dense = len(xs) * math.pi * float(np.mean(rs) * sc) ** 2 >= nx * ny)
+
+
+def _hidden(buf, cx, cy, lo, hi):
+    """Which marks centered on pixels (cx, cy), reaching from lo to hi pixels around them, lie on opaque blocks of the
+    layer, where they would change nothing."""
+    ncx = buf['ncx']
+    ncy = len(buf['full']) // ncx
+    step = np.arange((hi - lo) // CELL + 2)
+    gx = [np.clip((cx + v) // CELL, 0, ncx - 1) for v in (lo, hi)]
+    gy = [np.clip((cy + v) // CELL, 0, ncy - 1) for v in (lo, hi)]
+    ids = (np.minimum(gy[0][:, None] + step, gy[1][:, None])[:, :, None] * ncx
+           + np.minimum(gx[0][:, None] + step, gx[1][:, None])[:, None, :])
+    return (buf['opaque'][ids] == buf['full'][ids]).all(axis = (1, 2))
 
 
 def _in_order(found):
@@ -93,12 +117,15 @@ def _under(buf, spots, fill, edge, rgb, alpha, stroke):
     drawn = a > 0.0
     spots, body, edge, a = spots[drawn], body[drawn], edge[drawn], a[drawn]
     # Several marks can reach one pixel, and writing them all at once would keep only the last: each round takes the
-    # topmost one left at each pixel, as the last index written to a pixel stays there
+    # topmost one left at each pixel, as the last index written to a pixel stays there. The first round holds every
+    # pixel once
+    pixels = None
     while len(spots):
         n = np.arange(len(spots), dtype = np.int32)
         last[spots] = n
         top = last[spots] == n
         s = spots[top]
+        pixels = s if pixels is None else pixels
         under = 1.0 - opacity[s]
         premul[s] += (body[top, None] * color + edge[top, None] * pen) * under[:, None]
         opacity[s] += a[top] * under
@@ -106,6 +133,13 @@ def _under(buf, spots, fill, edge, rgb, alpha, stroke):
         spots, body, edge, a = spots[left], body[left], edge[left], a[left]
         left = opacity[spots] < 0.999
         spots, body, edge, a = spots[left], body[left], edge[left], a[left]
+    # Each pixel turns opaque once, in its block's count, and the layer notes when a block first fills. Counting too few
+    # only skips fewer marks, so a few pixels at a time are not worth counting
+    done = pixels[opacity[pixels] >= 0.999] if buf['dense'] and pixels is not None else ()
+    if len(done) >= CELL * CELL:
+        blocks = done // buf['nx'] // CELL * buf['ncx'] + done % buf['nx'] // CELL
+        buf['opaque'] += np.bincount(blocks, minlength = len(buf['opaque'])).astype(np.int32)
+        buf['filled'] = buf['filled'] or bool((buf['opaque'][blocks] == buf['full'][blocks]).any())
 
 
 def _stamp(buf, xs, ys, rs, rgb, alpha, stroke, lw):
@@ -122,6 +156,8 @@ def _stamp(buf, xs, ys, rs, rgb, alpha, stroke, lw):
         near = off[:, None] ** 2 + off[None, :] ** 2 <= (k + 2) ** 2
         oy, ox = (v[near] for v in np.meshgrid(off, off, indexing = 'ij'))
         i = np.flatnonzero(reach == k)
+        if buf['filled'] and len(i) >= CELL:
+            i = i[~_hidden(buf, np.floor(cx[i]).astype(int), np.floor(cy[i]).astype(int), -k, k)]
         px, py = np.floor(cx[i]), np.floor(cy[i])
         ix, iy = px.astype(np.int32)[:, None] + ox, py.astype(np.int32)[:, None] + oy
         on = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
@@ -173,6 +209,9 @@ def _stamp_shapes(buf, xs, ys, rs, rgb, alpha, stroke, lw, marker):
             buf['sprites'][key] = oy - k, ox - k, cover[:, oy, ox], inked[:, oy, ox]
         oy, ox, fill, edge = buf['sprites'][key]
         i = np.flatnonzero(rs == r)
+        if buf['filled'] and len(i) >= CELL:
+            i = i[~_hidden(buf, qx[i] // SPRITE_PHASES, qy[i] // SPRITE_PHASES, min(oy.min(), ox.min()),
+                           max(oy.max(), ox.max()))]
         ix, iy = (qx[i] // SPRITE_PHASES)[:, None] + ox, (qy[i] // SPRITE_PHASES)[:, None] + oy
         on = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
         spots = (iy * nx + ix)[on]
@@ -334,11 +373,26 @@ def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None):
 
 
 def line(c, pal, xs, ys, rgb, lw = None, alpha = 1.0, dash = None):
+    """A line in the palette's manner, with its glow under it as strokes of its color, ever wider and fainter."""
     lw = pal.line_width if lw is None else lw
-    if pal.glow:
-        for k, a in ((4.2, 0.06), (2.7, 0.1), (1.6, 0.2)):
+    cap = 0 if pal.bar == 'needle' else 1
+    if pal.glow and getattr(c, 'stamp_dpi', None):
+        # Raster output blends strokes of one color once, the line too where it shares the glow's ends and has no dashes
+        both = dash is None and cap == 1
+        p = c.beginPath()
+        p.moveTo(xs[0], ys[0])
+        for x, y in zip(xs[1:], ys[1:]):
+            p.lineTo(x, y)
+        c.saveState()
+        _style(c, stroke = rgb, lw = lw, stroke_alpha = alpha, cap = 1, join = 1)
+        c.drawStrokes(p, [lw * k for k, _ in GLOW] + [lw] * both, [a * alpha for _, a in GLOW] + [alpha] * both)
+        c.restoreState()
+        if both:
+            return
+    elif pal.glow:
+        for k, a in GLOW:
             polyline(c, xs, ys, rgb, lw * k, a * alpha)
-    polyline(c, xs, ys, rgb, lw, alpha, cap = 0 if pal.bar == 'needle' else 1, dash = dash)
+    polyline(c, xs, ys, rgb, lw, alpha, cap = cap, dash = dash)
 
 
 def arrow(c, pal, x0, y0, x1, y1, rgb, lw, alpha = 1.0, head = None, bend = 0.0):
@@ -390,27 +444,37 @@ def bar(c, pal, x, y, w, h, rgb, horizontal = False, alpha = 1.0, flip = False, 
         polygon(c, xs, ys, rgb, alpha)
 
 
-def box(c, pal, x, w, stats, rgb, alpha = 1.0):
+def turn(horizontal, xs, ys):
+    """Page coordinates of a mark drawn up the page, (across, along), for one laid across it, where they swap."""
+    return (ys, xs) if horizontal else (xs, ys)
+
+
+def box(c, pal, x, w, stats, rgb, alpha = 1.0, horizontal = False):
     """A box plot's whiskers, box in the palette's manner of bars, and median; (x, w) is the box's left edge and width,
-    and `stats` holds the lower whisker, quartile, median, quartile, and upper whisker in page points."""
+    and `stats` holds the lower whisker, quartile, median, quartile, and upper whisker in page points. A box across the
+    page takes x and w up the page and its stats across."""
     low, q1, median, q3, high = stats
     lw, mid = max(pal.line_width * 0.5, 0.9), x + w / 2
     # A shade darker than the box, as a pale one would otherwise leave them hard to see
-    polylines(c, [([mid, mid], [low, q1]), ([mid, mid], [q3, high]), ([mid - w / 4, mid + w / 4], [low, low]),
-                  ([mid - w / 4, mid + w / 4], [high, high])], pal.shades(rgb)[0], lw, alpha, cap = 0)
+    polylines(c, [turn(horizontal, *v) for v in (([mid, mid], [low, q1]), ([mid, mid], [q3, high]),
+                                                 ([mid - w / 4, mid + w / 4], [low, low]),
+                                                 ([mid - w / 4, mid + w / 4], [high, high]))],
+              pal.shades(rgb)[0], lw, alpha, cap = 0)
     # A needle's wide top would read as part of the data here
     if pal.bar == 'needle':
-        polygon(c, [x, x + w, x + w, x], [q1, q1, q3, q3], rgb, alpha)
+        polygon(c, *turn(horizontal, [x, x + w, x + w, x], [q1, q1, q3, q3]), rgb, alpha)
     else:
-        bar(c, pal, x, q1, w, q3 - q1, rgb, False, alpha)
-    polyline(c, [x, x + w], [median, median], pal.color(pal.on(rgb)), max(lw, 1.4), alpha, cap = 0)
+        bar(c, pal, *((q1, x, q3 - q1, w) if horizontal else (x, q1, w, q3 - q1)), rgb, horizontal, alpha)
+    polyline(c, *turn(horizontal, [x, x + w], [median, median]), pal.color(pal.on(rgb)), max(lw, 1.4), alpha, cap = 0)
 
 
-def violin(c, pal, xs, ys, cx, half, rgb, alpha = 1.0):
+def violin(c, pal, xs, ys, cx, half, rgb, alpha = 1.0, horizontal = False):
     """A violin in the palette's manner of bars, its shades running across it from its middle at `cx` out to `half` on
-    either side; a needle's palette draws it pale inside a hairline, as its bars are slender."""
+    either side; a needle's palette draws it pale inside a hairline, as its bars are slender. A violin across the page
+    takes xs and cx up the page and ys across."""
     dark, base, light = pal.shades(rgb)
-    across = (cx - half, ys[0], cx + half, ys[0])
+    across = (ys[0], cx - half, ys[0], cx + half) if horizontal else (cx - half, ys[0], cx + half, ys[0])
+    xs, ys = turn(horizontal, xs, ys)
     if pal.bar == 'deep':
         polygon(c, xs, ys, None, alpha, (across, (dark, light, dark)))
     elif pal.bar == 'soft':
@@ -430,18 +494,18 @@ def violin(c, pal, xs, ys, cx, half, rgb, alpha = 1.0):
         polygon(c, xs, ys, rgb, alpha)
 
 
-def inner_box(c, pal, x, w, stats, rgb, alpha = 1.0):
+def inner_box(c, pal, x, w, stats, rgb, alpha = 1.0, horizontal = False):
     """The quartiles and median inside a violin, as a slim bar `w` wide on a line between the whiskers, with the median
     a dot in the page's color; `stats` are the lower whisker, quartile, median, quartile, and upper whisker in page
-    points."""
+    points, across the page if `horizontal`, with x up it."""
     low, q1, median, q3, high = stats
     dark = pal.shades(rgb)[0]
     # A needle's violin is pale, so its own color stands out on it; others take a darker shade, or ink if none is darker
     ink = rgb if pal.bar == 'needle' else dark if dark != pal.color(rgb) else pal.color(pal.on(rgb))
-    polyline(c, [x, x], [low, high], ink, max(w * 0.22, 0.8), alpha, cap = 0)
+    polyline(c, *turn(horizontal, [x, x], [low, high]), ink, max(w * 0.22, 0.8), alpha, cap = 0)
     if q3 > q1:
-        polygon(c, [x - w / 2, x + w / 2, x + w / 2, x - w / 2], [q1, q1, q3, q3], ink, alpha)
-    shapes(c, np.array([x]), np.array([median]), np.array([w * 0.36]), pal.color('paper'), alpha)
+        polygon(c, *turn(horizontal, [x - w / 2, x + w / 2, x + w / 2, x - w / 2], [q1, q1, q3, q3]), ink, alpha)
+    shapes(c, *turn(horizontal, np.array([x]), np.array([median])), np.array([w * 0.36]), pal.color('paper'), alpha)
 
 
 def segment(c, pal, x, y, w, h, rgb, gap, alpha = 1.0):
