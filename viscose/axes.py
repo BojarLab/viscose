@@ -703,7 +703,8 @@ class Axes:
         `linespacing` sizes apart."""
         self._add('text', z, x = float(x), y = float(y), s = str(s), size = size, rgb = self.pal.color(color),
                   bold = bold, ha = ha, va = va, rotation = rotation, halo = halo, dx = 0.0, dy = 0.0,
-                  frac = axes_fraction, tag = False, clip = False, spread = False, linespacing = linespacing)
+                  frac = axes_fraction, tag = False, clip = False, spread = False, linespacing = linespacing,
+                  placed = True)
         return self
 
     def annotate(self, s, xy, offset = (0.0, 0.0), size = None, color = 'ink', bold = None, ha = 'left', va = 'center',
@@ -852,6 +853,74 @@ class Axes:
         return self
 
     # --- positions ---
+    def boxes(self):
+        """What the axes draw, as rows of (left, bottom, right, top) in page points once `Figure.layout` has placed
+        them: one per point, per piece of a line about a point long, per bar and rectangle, and per line of text at its
+        unspread place, for placing labels, keys, and cards clear of it all. Bands and spans are left out, as the ground
+        under the data."""
+        pal, out = self.pal, []
+        x0, y0, w, h = self.rect
+        lo_x, hi_x = sorted(self.xlim)
+        lo_y, hi_y = sorted(self.ylim)
+        pieces = []
+        for a in self.artists:
+            k = a['kind']
+            if k == 'points':
+                x, y = np.atleast_1d(a['x']), np.atleast_1d(a['y'])
+                keep = np.isfinite(x) & np.isfinite(y) & (x >= lo_x) & (x <= hi_x) & (y >= lo_y) & (y <= hi_y)
+                area = np.broadcast_to(np.asarray(a['s'], dtype = float), x.shape)
+                r = np.sqrt(np.maximum(area, 0) * pal.point_scale) / 2
+                r = r[keep] + (a['edge'][1] / 2 if a['edge'] else 0.0)
+                px, py = self._tx(x[keep]), self._ty(y[keep])
+                out += list(np.column_stack([px - r, py - r, px + r, py + r]))
+            elif k == 'line':
+                px, py = self._tx(a['x']), y0 + a['y'] * h if a['frac'] else self._ty(a['y'])
+                if a['offset'] is not None:
+                    px, py = px + a['offset'][:, 0], py + a['offset'][:, 1]
+                pieces.append((px, py, pal.line_width if a['lw'] is None else a['lw']))
+            elif k in ('hline', 'vline'):
+                v = float(self._ty(a['v']) if k == 'hline' else self._tx(a['v']))
+                ends = ([x0, x0 + w], [v, v]) if k == 'hline' else ([v, v], [y0, y0 + h])
+                pieces.append((*map(np.array, ends), a['lw']))
+            elif k == 'hsegs':
+                for y, xa, xb in zip(self._ty(a['y']), self._tx(a['x0']), self._tx(a['x1'])):
+                    pieces.append((np.array([xa, xb]), np.array([y, y]), a['lw']))
+            elif k == 'vsegs':
+                for x, ya, yb in zip(self._tx(a['x']), self._ty(a['y0']), self._ty(a['y1'])):
+                    pieces.append((np.array([x, x]), np.array([ya, yb]), a['lw']))
+            elif k == 'bars':
+                for x, b, v, bw in zip(a['x'], a['b'], a['h'], a['w']):
+                    xs, ys = (self._tx([b, b + v]), self._ty([x - bw / 2, x + bw / 2])) if a['horizontal'] else (
+                        self._tx([x - bw / 2, x + bw / 2]), self._ty([self._base(b, self._yscale, self.ylim), b + v]))
+                    out.append([min(xs), min(ys), max(xs), max(ys)])
+            elif k == 'rect':
+                xs = [x0 + a['x'] * w, x0 + (a['x'] + a['w']) * w] if a['frac'] else self._tx([a['x'], a['x'] + a['w']])
+                ys = [y0 + a['y'] * h, y0 + (a['y'] + a['h']) * h] if a['frac'] else self._ty([a['y'], a['y'] + a['h']])
+                out.append([min(xs), min(ys), max(xs), max(ys)])
+            elif k == 'text' and not a['rotation'] and math.isfinite(a['x'] + a['y']):
+                px = x0 + a['x'] * w if a['frac'] else float(self._tx(a['x']))
+                py = y0 + a['y'] * h if a['frac'] else float(self._ty(a['y']))
+                size, bold = a['size'] or pal.tick_size, pal.text_bold if a['bold'] is None else a['bold']
+                lines = str(a['s']).split('\n')
+                # As text.draw sets them: the block's lift, then each line's baseline and its glyphs' reach
+                lift = {'center': 0.5, 'bottom': 1.0}.get(a['va'], 0.0) * (len(lines) - 1)
+                shift = {'baseline': 0.0, 'center': -text.CAP_HEIGHT * size / 2, 'top': -text.CAP_HEIGHT * size,
+                         'bottom': 0.22 * size}[a['va']]
+                with text.family(pal.font):
+                    for i, line in enumerate(lines):
+                        tw = text.width(line, size, bold)
+                        ha = a.get('_ha', a['ha'])
+                        left = px + a.get('_dx', a['dx']) - {'left': 0.0, 'center': tw / 2, 'right': tw}[ha]
+                        base = py + a['dy'] - (i - lift) * size * a['linespacing'] + shift
+                        out.append([left, base - 0.22 * size, left + tw, base + text.CAP_HEIGHT * size])
+        for px, py, lw in pieces:
+            for xa, ya, xb, yb in zip(px[:-1], py[:-1], px[1:], py[1:]):
+                if np.isfinite([xa, ya, xb, yb]).all():
+                    t = np.linspace(0.0, 1.0, max(2, int(math.hypot(xb - xa, yb - ya)) + 1))
+                    sx, sy = xa + t * (xb - xa), ya + t * (yb - ya)
+                    out += list(np.column_stack([sx - lw / 2, sy - lw / 2, sx + lw / 2, sy + lw / 2]))
+        return np.array(out, dtype = float).reshape(-1, 4)
+
     def get_xlim(self):
         """The x limits as drawn, whether set or automatic."""
         self._range()
@@ -1083,7 +1152,9 @@ class Axes:
             return 0.0
         lines = 1.25 * _extra_lines(self.ylabel)
         # The name's baseline sits `pad` beyond the tick labels, and its glyphs a size beyond that
-        return size * (1.7 + lines) if pad is None else pad + size * (1.0 + lines)
+        # `pad` runs to the name's lowest glyph, which faces the tick labels: a descender, or deeper, a subscript
+        low = 0.37 if any(rise < 0 for _, rise, _ in text.runs(self.ylabel)) else 0.22
+        return size * (1.7 + lines) if pad is None else pad + size * (1.0 + lines + low)
 
     def _colorbar_width(self):
         """Room a colorbar at the right takes, past the tick labels: bar, its ticks, and its label."""
@@ -1226,8 +1297,9 @@ class Axes:
             over_right, over_left = px + gap + tw - (page - 3.0), tw + gap - (px - 3.0)
             natural_right = a['ha'] == 'left'
             # The label's own side if it fits, else the other side if that fits, else whichever side overflows less. A
-            # glycan drawing always grows rightward from its label's anchor, so such a label stays and the page grows.
-            if a['tag'] or (over_right if natural_right else over_left) <= 0:
+            # glycan drawing always grows rightward from its label's anchor, so such a label stays and the page grows,
+            # as does text placed with `text`, where its caller put it.
+            if a['tag'] or a.get('placed') or (over_right if natural_right else over_left) <= 0:
                 use_right = natural_right
             elif (over_left if natural_right else over_right) <= 0:
                 use_right = not natural_right
@@ -1323,6 +1395,10 @@ class Axes:
 
     def _d_points(self, c, a):
         mask = np.isfinite(a['x']) & np.isfinite(a['y'])
+        # A point beyond the limits is not drawn, while one at the edge is drawn whole, which the clip's margin allows
+        for v, (lo, hi) in ((a['x'], sorted(self.xlim)), (a['y'], sorted(self.ylim))):
+            slack = 1e-9 * (hi - lo)
+            mask &= (v >= lo - slack) & (v <= hi + slack)
         s = a['s'] if np.ndim(a['s']) == 0 else np.asarray(a['s'])[mask]
         marks.points(c, self.pal, self._tx(a['x'][mask]), self._ty(a['y'][mask]), s, a['rgb'], a['alpha'], a['marker'],
                      a['edge'])
@@ -1661,7 +1737,8 @@ class Axes:
             px = x0 + a['x'] * w if a['frac'] else float(self._tx(a['x']))
             py = y0 + a['y'] * h if a['frac'] else float(self._ty(a['y']))
             ty, gap = placed.get(id(a), (py + a['dy'], 0.0))
-            if abs(ty - py - a['dy']) > 0.3 * gap:
+            # Only a spread label that had to move gets a leader
+            if id(a) in placed and abs(ty - py - a['dy']) > 0.3 * gap:
                 way = 1.0 if a['_ha'] == 'left' else -1.0
                 k = pal.spacing
                 marks.polyline(c, [px + way * 2.0 * k, px + a['_dx'] - way * 1.5 * k], [py, ty], a['rgb'], 0.5 * k, 0.6,
@@ -1774,5 +1851,5 @@ def _recorded(method):
 
 # All that only asks or converts is left out; a method that fails records nothing, as it changed nothing to replay
 for _name, _method in list(vars(Axes).items()):
-    if callable(_method) and _name[0] != '_' and _name not in ('get_xlim', 'get_ylim', 'page', 'data'):
+    if callable(_method) and _name[0] != '_' and _name not in ('get_xlim', 'get_ylim', 'page', 'data', 'boxes'):
         setattr(Axes, _name, _recorded(_method))

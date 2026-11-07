@@ -109,7 +109,7 @@ fig, heat = vc.clustermap(df, palette = 'aura', title = 'Glycan abundance by tis
 | **Axes** | `set_xscale` takes `linear`, `log`, `sqrt`, or any pair of functions; `fmt` on `set_xticks` and `set_yticks` writes the ticks, as `'{:.0%}'` or a function; `tick_params` sets each axis's tick length, pad, label size, and labels, puts x labels on top, or keeps labels exactly as set; `emphasis` sets chosen tick labels bold in a color; `set_spines` shows or hides each axis line |
 | **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, long axis names shrink, and the page grows for anything that needs it |
 | **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window |
-| **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, for placing things yourself or answering a mouse |
+| **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, and `ax.boxes()` gives the page boxes of everything drawn, for placing things yourself clear of it or answering a mouse |
 | **Display** | `fig.show()` works inline in Jupyter and slate, and in the system's image viewer from a terminal, with CI and coding agents kept silent |
 | **SVG hooks** | `gid` on `arrow` and `scatter` names elements for hover text and scripting |
 | **Names** | `names` on `scatter` labels each point, and on `heatmap` each row and column, which draws nothing but lets slate show what is under the mouse |

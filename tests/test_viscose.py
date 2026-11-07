@@ -2180,3 +2180,51 @@ def test_a_title_pad_moves_the_title_and_its_room():
 def test_nice_ticks_take_quarter_steps():
     assert nice_ticks(0, 0.8, 4) == [0, 0.2, 0.4, 0.6, 0.8]
     assert nice_ticks(0, 0.8, 4, steps = (1, 2, 2.5, 5, 10)) == [0, 0.25, 0.5, 0.75]
+
+
+def test_an_offset_label_that_is_not_spread_has_no_leader():
+    fig, ax = vc.subplots(figsize = (3, 3), palette = 'couture')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    for v in np.linspace(0.1, 0.9, 7):
+        ax.annotate('n', (v, v * 0.731), offset = (2.2, -2.2), va = 'top', halo = 0)
+    assert not [o for o in fig._canvas().ops if o['kind'] == 'path' and o.get('stroke')
+                and o['line_width'] == pytest.approx(0.5 * fig.pal.spacing)]
+
+
+def test_boxes_cover_points_lines_bars_and_text():
+    fig, ax = vc.subplots(figsize = (4, 4), palette = 'poster')
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.scatter([2, 50], [2, 2], s = 100)
+    ax.plot([0, 10], [5, 5], lw = 2)
+    ax.bar([8], [3], width = 1)
+    ax.text(5, 8, 'label', size = 10, ha = 'center', va = 'center')
+    fig.layout()
+    boxes = ax.boxes()
+    px, py = ax.page(2, 2)
+    r = np.sqrt(100 * fig.pal.point_scale) / 2
+    assert [px - r, py - r, px + r, py + r] in boxes.tolist()
+    assert not np.any(boxes[:, 0] > ax.page(10, 0)[0] + 20)
+    line = boxes[np.isclose(boxes[:, 3] - boxes[:, 1], 2)]
+    assert len(line) > 50 and np.allclose((line[:, 1] + line[:, 3]) / 2, ax.page(0, 5)[1])
+    bx0, by0 = ax.page(7.5, 0)
+    assert any(np.allclose(b, [bx0, by0, ax.page(8.5, 3)[0], ax.page(8.5, 3)[1]]) for b in boxes)
+    tx, ty = ax.page(5, 8)
+    label = [b for b in boxes if abs((b[0] + b[2]) / 2 - tx) < 1e-6 and b[1] < ty < b[3]]
+    assert label and label[0][2] - label[0][0] == pytest.approx(width('label', 10, fig.pal.text_bold))
+    # Asking records nothing for in_palette
+    assert len(fig._calls) == 6
+
+
+def test_placed_text_keeps_its_side_where_an_annotation_turns():
+    def ha(method):
+        fig = vc.Figure(80, 40, unit = 'mm')
+        ax = fig.add_axes((5, 5, 70, 30), unit = 'mm')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        args = ('name near the edge', (0.98, 0.5)) if method == 'annotate' else (0.98, 0.5, 'name near the edge')
+        getattr(ax, method)(*args)
+        fig.layout()
+        return ax.artists[-1]['_ha']
+    assert ha('annotate') == 'right' and ha('text') == 'left'
