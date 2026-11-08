@@ -1,4 +1,6 @@
+import os
 import re
+import subprocess
 import sys
 import warnings
 from io import BytesIO
@@ -259,6 +261,146 @@ def test_every_plot_draws_seared_in_every_format(tmp_path):
             vc.Palette('x', pal.a, pal.b, '#000000', '#111111', '#222222', bar = 'seared')
     finally:
         del vc.palettes['seared']
+
+
+@pytest.fixture
+def qt():
+    # Never a window: offscreen, and no widget is shown
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    pytest.importorskip('PySide6.QtWidgets')
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    from viscose import qt
+    yield qt
+    app.processEvents()
+
+
+def test_importing_viscose_does_not_load_qt():
+    code = ("import sys, viscose; assert not any(m.startswith('PySide6') for m in sys.modules); "
+            "assert 'viscose.qt' not in sys.modules")
+    subprocess.run([sys.executable, '-c', code], check = True)
+
+
+def test_qt_paints_what_the_rasterizer_draws(qt):
+    from PySide6.QtGui import QColor
+    fig, axes = vc.subplots(palette = _seared())
+    axes.bar([0, 1], [1.0, 3.0], color = 'a1')
+    axes.plot([0, 1], [3.5, 3.5], color = 'b1', lw = 6.0)
+    axes.set_ylim(0, 4)
+    fig.layout()
+    image = qt.paint_page(fig, 200, False)
+    rgba = fig.to_rgba(200)
+    assert (image.height(), image.width()) == rgba.shape[:2]
+    # The middles of the bars at several heights, of the line, and of the empty plot
+    for x, y in ((0, 0.5), (1, 0.5), (1, 2.9), (0.5, 3.5), (0.5, 2.0)):
+        px, py = axes.page(x, y)
+        col, row = int(px * 200 / 72), rgba.shape[0] - 1 - int(py * 200 / 72)
+        color = QColor(image.pixel(col, row))
+        assert np.abs(np.array([color.red(), color.green(), color.blue()]) - rgba[row, col, :3].astype(int)).max() <= 3
+
+
+def test_qt_paints_every_kind_of_mark_as_the_rasterizer_does(qt):
+    from PySide6.QtGui import QImage
+    # Lines, dashes, sticks, bands, transparent points with edges, markers, text with subscripts, a gradient color bar,
+    # a legend, and an image with alpha
+    figure = vc.Figure(6, 4, _seared())
+    ax = figure.add_axes([0.12, 0.15, 0.68, 0.75])
+    rng = np.random.default_rng(0)
+    ax.plot([0.0, 1.0, 2.0, 3.0], [1.0, 3.0, 2.0, 4.0], color = 'a1', lw = 1.5, label = 'line')
+    ax.plot([0.0, 3.0], [0.5, 0.5], color = 'b1', dash = (3.0, 1.3), label = 'dashed')
+    ax.vlines([0.5, 1.5, 2.5], 0.0, [1.0, 2.0, 3.0], color = ['a0', 'a2', 'b1'], lw = 1.2)
+    ax.axvspan(1.0, 1.4, color = 'a2')
+    ax.scatter(rng.uniform(0, 3, 40), rng.uniform(0, 4, 40), s = rng.uniform(10, 80, 40), c = rng.uniform(0, 1, 40),
+               edge = ('white', 0.5), alpha = 0.9)
+    ax.scatter([0.3, 0.6], [3.5, 3.5], s = 40, color = 'b1', marker = 'v', edge = ('white', 0.6))
+    ax.annotate('^{1,3}A_{2α}', (2.0, 1.0), size = 9, rotation = 90.0, halo = 0.0)
+    ax.text(0.5, 1.02, 'A title', size = 11, ha = 'center', va = 'baseline', axes_fraction = True)
+    square = np.zeros((20, 20, 4), np.uint8)
+    square[..., 2], square[5:15, 5:15, 3] = 200, 255
+    ax.image(square, 2.5, 1.1, 20 * 72 / 200, 20 * 72 / 200, y_fraction = True)
+    ax.set_xlim(0, 3)
+    ax.set_ylim(0, 4)
+    ax.set_xlabel('m/z')
+    ax.legend('upper right')
+    ax.colorbar('Scale')
+    painted = qt.paint_page(figure, 200).convertToFormat(QImage.Format_RGBA8888)
+    rows = np.frombuffer(painted.constBits(), np.uint8).reshape(painted.height(), painted.bytesPerLine())
+    pixels = rows[:, :4 * painted.width()].reshape(painted.height(), painted.width(), 4)[..., :3].astype(float)
+    raster = figure.to_rgba(200)[..., :3].astype(float)
+    assert pixels.shape == raster.shape
+    # Nearly the same everywhere, once a pixel of antialiasing is forgiven: a shifted, mirrored, or missing mark would
+    # stand out. This palette's darkest shade makes its edges the costliest, about 46 levels at most
+    assert np.abs(pixels - raster).mean() < 1.5
+    blurred = lambda image: sum(np.roll(np.roll(image, dx, 0), dy, 1) for dx in (-2, -1, 0, 1, 2)
+                                for dy in (-2, -1, 0, 1, 2)) / 25
+    assert np.abs(blurred(pixels) - blurred(raster)).max() < 50
+
+
+def test_qt_paints_a_dark_page_in_its_own_color(qt):
+    from PySide6.QtGui import QColor
+    pal = _seared().dark()
+    fig, axes = vc.subplots(palette = pal)
+    axes.plot([0, 1], [0, 1])
+    assert QColor(qt.paint_page(fig, 72).pixel(2, 2)).name().upper() == pal.css('paper')
+
+
+def test_a_target_gives_the_nearest_point_first(qt):
+    fig, axes = vc.subplots()
+    axes.scatter([1.0, 1.1, 5.0], [1.0, 1.0, 1.0])
+    axes.set_xlim(0, 6)
+    axes.set_ylim(0, 2)
+    fig.layout()
+    x, y = axes.page(1.08, 1.0)
+    found, details = qt.Target(axes, [1.0, 1.1, 5.0], [1.0, 1.0, 1.0], radius = 60.0).contains(qt.ChartEvent(x, y))
+    assert found and details['ind'] == [1, 0]
+    assert not qt.Target(axes, [5.0], [1.0]).contains(qt.ChartEvent(x, y))[0]
+    # A stick answers along its length, from zero up to its point
+    x, y = axes.page(5.0, 0.5)
+    assert qt.Target(axes, [5.0], [1.0], stick = True).contains(qt.ChartEvent(x, y))[0]
+    assert not qt.Target(axes, [5.0], [1.0]).contains(qt.ChartEvent(x, y))[0]
+
+
+def test_a_canvas_answers_the_mouse_and_its_toolbar_keeps_views(qt):
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    view = qt.ChartView(palette = 'poster')
+    fig, axes = vc.subplots(palette = 'poster')
+    axes.plot([0, 10], [0, 10])
+    canvas = qt.Canvas(fig)
+    canvas.resize(600, 400)
+    canvas.grab()
+    fig.layout()
+    pressed, spans = [], []
+    canvas.pressed.connect(pressed.append)
+    x, y = canvas.to_widget(*axes.page(5.0, 5.0))
+    QTest.mouseClick(canvas, Qt.LeftButton, pos = QPoint(round(x), round(y)))
+    assert len(pressed) == 1 and pressed[0].button == 1
+    assert np.allclose(axes.data(pressed[0].x, pressed[0].y), (5.0, 5.0), atol = 0.1)
+    # With a span, a drag across the axes gives its range in data coordinates instead of a press
+    canvas.span = lambda lo, hi: spans.append((lo, hi))
+    x2, _ = canvas.to_widget(*axes.page(8.0, 5.0))
+    QTest.mousePress(canvas, Qt.LeftButton, pos = QPoint(round(x), round(y)))
+    QTest.mouseMove(canvas, QPoint(round(x2), round(y)))
+    QTest.mouseRelease(canvas, Qt.LeftButton, pos = QPoint(round(x2), round(y)))
+    assert len(pressed) == 1 and np.allclose(spans[0], (5.0, 8.0), atol = 0.1)
+    bar = qt.Toolbar(canvas)
+    home = axes.get_xlim()
+    bar.zoom.setChecked(True)
+    assert bar.mode == 'zoom'
+    bar.begin()
+    axes.set_xlim(2, 4)
+    bar.push_current()
+    bar.move_by(-1)
+    assert axes.get_xlim() == home
+    bar.move_by(1)
+    assert axes.get_xlim() == (2, 4)
+    bar.home()
+    assert axes.get_xlim() == home
+    bar.pan.setChecked(True)
+    assert bar.mode == 'pan' and not bar.zoom.isChecked()
+    # A chart view's new figures keep its palette
+    assert view.figure.pal.name == 'poster' and view.new_figure().pal.name == 'poster'
+    assert view.canvas.figure is view.figure
 
 
 def test_ticks_and_number_format():
