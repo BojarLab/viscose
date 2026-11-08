@@ -1754,6 +1754,95 @@ def test_a_page_of_any_color():
     assert fig.to_png(72.0)[:4] == b'\x89PNG' and fig.to_pdf()[:4] == b'%PDF' and '<svg' in fig.to_svg()
 
 
+@pytest.mark.parametrize('name', NAMES)
+def test_every_palette_has_a_dark_version(name):
+    from viscose.palettes import DARK_L, _oklch
+    light = vc.get_palette(name)
+    dark = light.dark()
+    assert dark.is_dark and not light.is_dark and dark.name == name + '-dark' and light.paper == '#FFFFFF'
+    assert dark.dark() is dark and light.dark() is dark and vc.get_palette(name + '-dark') is dark
+    lum = lambda c: float(np.dot(dark.color(c), (0.2126, 0.7152, 0.0722)))
+    # Shades run from the strongest against the page to the faintest, all clear of it, and the text is lighter still
+    for k in 'ab':
+        shades = [lum(f'{k}{i}') for i in range(4)]
+        assert shades == sorted(shades, reverse = True) and shades[3] > 4 * lum('paper')
+        assert all(_oklch(dark.color(f'{k}{i}'))[0] > DARK_L[0] - 0.01 for i in range(4))
+    assert lum('ink') > lum('muted') > lum('faint') > lum('paper') and dark.on('ink') == 'black'
+    assert np.allclose(dark.diverging(0.5), dark.color('paper'))
+    # The page is a near-black in the main hue, or the color given, such as an app's own surface
+    assert light.dark('#1E1E1E').css('paper') == '#1E1E1E' and lum('paper') < 0.1
+    # No orange or gold darkens into olive or brown: warm shades keep a red share well above their blue one
+    for c in dark.b if name != 'aura' else ():
+        r, g, b = dark.color(c)
+        assert r > g > b and r - b > 0.3
+    fig, ax = vc.subplots(figsize = (3, 2), palette = dark)
+    ax.bar([0, 1, 2], [1, 2, 3], color = ['a1', 'b1', 'a3'])
+    ax.scatter([0, 1, 2], [2, 1, 3], s = 60)
+    ax.plot([0, 1, 2], [1, 3, 2], label = 'line')
+    ax.legend()
+    px = fig.to_rgba(72.0)
+    assert px[0, 0, :3].tolist() == [int(dark.css('paper')[i:i + 2], 16) for i in (1, 3, 5)]
+    assert fig.to_pdf()[:4] == b'%PDF' and f'fill="{dark.paper}"' in fig.to_svg()
+
+
+def test_dark_settings_replace_what_is_derived():
+    pal = vc.Palette('mine', ['#14213D', '#27477E', '#5C85C5', '#C4D5EE'], ['#8F5B00', '#D08C00', '#F2B83B', '#FBE5B0'],
+                     '#14213D', '#5A6478', '#E6EAF1',
+                     dark_settings = {'b': ['#FFE2A0', '#F2B83B', '#C98A1A', '#8F6010'], 'title_color': '#F2B83B'})
+    dark = pal.dark()
+    assert dark.b == ['#FFE2A0', '#F2B83B', '#C98A1A', '#8F6010'] and dark.title_color == '#F2B83B'
+    assert dark.a != pal.a and dark.dark_settings == {} and dark.is_dark
+    # An already dark palette stays as it is
+    night = vc.Palette('night', dark.a, dark.b, dark.ink, dark.muted, dark.faint, paper = '#101010')
+    assert night.dark() is night
+
+
+def test_dark_mode_turns_every_palette_dark():
+    module = sys.modules['viscose.palettes']
+    before, library, mode = list(module._default), list(module._library), list(module._dark)
+    try:
+        module._default[:] = ['lumen', False]
+        vc.default_palette('aura')
+        vc.dark_mode(True)
+        assert vc.subplots()[0].pal.name == 'aura-dark' and vc.subplots(palette = 'poster')[0].pal.name == 'poster-dark'
+        # A user's choice made in dark mode is the light palette's, so that it stays when the mode ends
+        vc.set_palette('couture')
+        assert module._default[0] == 'couture' and vc.subplots()[0].pal.name == 'couture-dark'
+        assert vc.get_palette(None, vc.get_palette('lumen')).name == 'couture-dark'
+        vc.dark_mode(True, paper = '#202124')
+        assert vc.subplots()[0].pal.paper == '#202124'
+        # A library's own palette, passed as an instance, turns dark too
+        vc.set_palette(None)
+        assert vc.get_palette(None, module.LUMEN).name == 'lumen-dark'
+        vc.dark_mode(False)
+        assert vc.subplots()[0].pal.name == 'aura' and vc.subplots(palette = 'lumen-dark')[0].pal.is_dark
+        with pytest.raises(ValueError, match = 'each also with -dark'):
+            vc.get_palette('dusk-dark')
+    finally:
+        module._default[:], module._library[:], module._dark[:] = before, library, mode
+
+
+def test_a_figure_in_dark_mode_equals_one_drawn_in_the_dark_palette():
+    module = sys.modules['viscose.palettes']
+    mode = list(module._dark)
+    try:
+        vc.dark_mode(True)
+        fig = all_marks('lumen')
+        vc.dark_mode(False)
+        assert fig.to_png(72.0) == all_marks('lumen-dark').to_png(72.0)
+        assert fig.in_palette('aura-dark').to_png(72.0) == all_marks('aura-dark').to_png(72.0)
+    finally:
+        module._dark[:] = mode
+
+
+def test_a_dark_sphere_is_lit_from_above():
+    pal = vc.get_palette('lumen').dark()
+    rim, base, spot = (layer[3] for layer in marks._layers(pal, np.zeros(1), np.zeros(1), np.full(1, 5.0),
+                                                           pal.color('a1'), None))
+    lum = lambda c: float(np.dot(c, (0.2126, 0.7152, 0.0722)))
+    assert lum(rim) < lum(base) < lum(spot)
+
+
 @pytest.mark.parametrize('n, dpi', [(10, 72.0), (200, 72.0), (200, None)])
 def test_hollow_rings(n, dpi):
     rng = np.random.default_rng(0)

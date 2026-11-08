@@ -1,5 +1,5 @@
 """Palettes: a few colors in shades, plus the special effects that belong to each palette."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import numpy as np
 
 
@@ -54,6 +54,50 @@ def mix(c, f, to = (1.0, 1.0, 1.0)):
     return tuple(t + (v - t) * f for v, t in zip(c, to))
 
 
+# OKLab (Ottosson 2020): linear sRGB to cone responses, and their cube roots to lightness and two opponent axes
+_LMS = np.array([[0.4122214708, 0.5363325363, 0.0514459929], [0.2119034982, 0.6806995451, 0.1073969566],
+                 [0.0883024619, 0.2817188501, 0.6299787005]])
+_LAB = np.array([[0.2104542553, 0.7936177850, -0.0040720468], [1.9779984951, -2.4285922050, 0.4505937099],
+                 [0.0259040371, 0.7827717662, -0.8086757660]])
+# Lightness a dark page's colors span, from the faintest shade to the ink, and the page's own; below about 0.52 an
+# orange turns brown
+DARK_L = (0.52, 0.93)
+DARK_PAPER_L = 0.19
+
+
+def _oklch(rgb):
+    """Lightness, chroma, and hue in radians of an sRGB triple."""
+    c = np.asarray(rgb, dtype = float)
+    lab = _LAB @ np.cbrt(_LMS @ np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4))
+    return float(lab[0]), float(np.hypot(lab[1], lab[2])), float(np.arctan2(lab[2], lab[1]))
+
+
+def _from_oklch(L, C, h):
+    """'#RRGGBB' of a lightness, chroma, and hue, with chroma reduced until the color fits in sRGB."""
+    inv = np.linalg.inv(_LAB)
+    while True:
+        rgb = np.linalg.solve(_LMS, (inv @ np.array([L, C * np.cos(h), C * np.sin(h)])) ** 3)
+        if (rgb.min() >= -1e-4 and rgb.max() <= 1 + 1e-4) or C < 1e-4:
+            break
+        C *= 0.95
+    rgb = np.clip(rgb, 0.0, 1.0)
+    rgb = np.where(rgb <= 0.0031308, 12.92 * rgb, 1.055 * rgb ** (1 / 2.4) - 0.055)
+    return '#%02X%02X%02X' % tuple(int(round(v * 255)) for v in rgb)
+
+
+def _night(c, chroma = None):
+    """A color for a dark page: its lightness mirrored into DARK_L, so that what stood out most on white stands out
+    most on the dark page, with its hue kept, except that an orange or yellow made darker turns towards red, as a
+    darkened marigold would read as olive."""
+    L, C, h = _oklch(_hex(c) if isinstance(c, str) else c)
+    lo, hi = DARK_L
+    L2 = float(np.clip(hi - (L - 0.25) * (hi - lo) / 0.70, lo, hi))
+    deg = np.degrees(h) % 360
+    if 50 < deg < 115:
+        deg -= (deg - 50) * float(np.clip((0.80 - L2) / 0.28, 0.0, 1.0))
+    return _from_oklch(L2, C if chroma is None else chroma, np.radians(deg))
+
+
 def ramp(colors, t):
     """Piecewise linear color scale at t in [0, 1], for scalars and arrays alike; the result has shape (..., 3)."""
     rgb = np.array([_hex(c) if isinstance(c, str) else c for c in colors], dtype = float)
@@ -78,6 +122,7 @@ class Palette:
     six points sits as close to its axes as a journal page wants. `minus` is the sign numbers on axes are written
     with, such as a true minus, '−', in a font that has one. `sequential` and `diverging` take stops of their own,
     pale to dark and from the second pole through the middle to the first, in place of the ones made from the hues.
+    `dark_settings` replaces settings of the palette that `dark` makes from this one, such as shades picked by hand.
     """
     name: str
     a: list
@@ -124,6 +169,7 @@ class Palette:
     spacing: float = 1.0
     sequential_stops: tuple = ()
     diverging_stops: tuple = ()
+    dark_settings: dict = field(default_factory = dict)
     extra: dict = field(default_factory = dict)
 
     def __post_init__(self):
@@ -212,6 +258,38 @@ class Palette:
         light = lambda v: np.dot(self.color(v), (0.2126, 0.7152, 0.0722)) >= 0.5
         return 'white' if not light(c) else 'black' if light('ink') else 'ink'
 
+    @property
+    def is_dark(self):
+        """Whether the page is dark, so that its shades run from light to dark."""
+        return float(np.dot(self.color('paper'), (0.2126, 0.7152, 0.0722))) < 0.5
+
+    def dark(self, paper = None):
+        """This palette for a dark page, such as an app's dark theme: every color keeps its hue, and its lightness is
+        mirrored, so that the shade that stood out most on white stands out most on the dark page, and the effects
+        follow. `paper` is the page's color, by default a near-black in the main hue; a palette's `dark_settings`
+        replace what is derived here. A dark palette is returned as it is."""
+        if self.is_dark:
+            return self
+        key = (id(self), paper)
+        if key not in _darks:
+            out = {}
+            for k in ('a', 'b'):
+                hue = getattr(self, k)
+                cs = [_oklch(_hex(s))[1] for s in hue]
+                # Pale shades carry little chroma, so the light shades they turn into borrow their mirror's
+                out[k] = [_night(s, max(cs[i], cs[3 - i]) * 0.92) for i, s in enumerate(hue)]
+            for k in ('ink', 'muted', 'spine_color', 'tick_color', 'label_color', 'title_color', 'subtitle_color'):
+                if getattr(self, k):
+                    out[k] = _night(getattr(self, k))
+            for k in ('sequential_stops', 'diverging_stops'):
+                out[k] = tuple(_night(self.color(s)) for s in getattr(self, k))
+            _, C, h = _oklch(_hex(self.a[0]))
+            L, C, h = _oklch(self.color(paper)) if paper else (DARK_PAPER_L, min(C, 0.015), h)
+            out['paper'], out['faint'] = _from_oklch(L, C, h), _from_oklch(L + 0.07, C, h)
+            _darks[key] = (self, replace(self, name = self.name + '-dark', **{**out, **self.dark_settings},
+                                         dark_settings = {}))
+        return _darks[key][1]
+
     def shades(self, c):
         """The (dark, mid, light) neighbors of a color: its own hue's shades if it is in the palette, else mixes."""
         rgb = self.color(c)
@@ -259,18 +337,30 @@ AURA = Palette('aura', ['#5A0F2E', '#A3214E', '#DB4F7A', '#F6BFD0'], ['#0C4A4F',
 palettes = {p.name: p for p in (LUMEN, COUTURE, POSTER, AURA)}
 _default = ['lumen', False]
 _library = ['lumen']
+_dark = [False, None]
+# Dark palettes made by Palette.dark, by (id of the light one, page color), each kept with its light one so that the id
+# stays its own
+_darks = {}
+
+
+def _named(name):
+    """A palette by instance or name, where a shipped or registered name with '-dark' gives its dark version."""
+    if isinstance(name, Palette):
+        return name
+    if name in palettes:
+        return palettes[name]
+    if name.endswith('-dark') and name[:-5] in palettes:
+        return palettes[name[:-5]].dark(_dark[1])
+    raise ValueError(f'Unknown palette {name!r}; available: {", ".join(palettes)}, each also with -dark')
 
 
 def get_palette(name = None, default = None):
     """A palette by name or instance; None gives the current default. A library with a palette of its own passes it as
-    `default`, which gives way only to a palette chosen with set_palette, not to another library's default_palette."""
+    `default`, which gives way only to a palette chosen with set_palette, not to another library's default_palette. In
+    dark mode, every palette comes as its dark version."""
     name = default if name is None and not _default[1] else name
-    if isinstance(name, Palette):
-        return name
-    key = _default[0] if name is None else name
-    if key not in palettes:
-        raise ValueError(f'Unknown palette {key!r}; available: {", ".join(palettes)}')
-    return palettes[key]
+    pal = _named(_default[0] if name is None else name)
+    return pal.dark(_dark[1]) if _dark[0] else pal
 
 
 palette = get_palette
@@ -278,14 +368,21 @@ palette = get_palette
 
 def set_palette(name):
     """Choose the palette that new figures use; None leaves the choice to a library's default_palette again."""
-    _default[:] = (_library[0], False) if name is None else (get_palette(name).name, True)
+    _default[:] = (_library[0], False) if name is None else (_named(name).name, True)
 
 
 def default_palette(name):
     """A library's choice of palette: it applies unless the user has called set_palette, before or after."""
-    _library[0] = get_palette(name).name
+    _library[0] = _named(name).name
     if not _default[1]:
         _default[0] = _library[0]
+
+
+def dark_mode(on = True, paper = None):
+    """Draw new figures for a dark page, as for an app or a console in a dark theme: every palette, whether chosen by
+    name, passed as an instance, or a library's default, comes as its dark version (Palette.dark), on `paper` if given,
+    such as the theme's own surface color. dark_mode(False) goes back to light pages."""
+    _dark[:] = (bool(on), paper if on else None)
 
 
 def register_palette(pal):

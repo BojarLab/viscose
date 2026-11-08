@@ -187,5 +187,7 @@ if __name__ == '__main__':
     arrange([[fit(Image.open(BytesIO(gallery.subgroups('couture').to_png(200))).convert('RGB'), 1400, 840)]],
             'subgroups.png')
     arrange([[tile(gallery.heatmap('aura'), 1100)]], 'clustermap.png')
+    arrange([[tile(figures[k](p + '-dark'), 640) for k, p in zip(('trial', 'volcano', 'stacked', 'embedding'), names)]],
+            'dark.png')
     for path in sorted(OUT.glob('*.png')):
         print(path.name, path.stat().st_size // 1024, 'kB')

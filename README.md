@@ -176,10 +176,22 @@ fig, ax = vc.subplots(palette = 'midnight')
 
 A palette can also bring a house or journal font (`font = ('Arial', 'arial.ttf', 'arialbd.ttf')`), a true minus sign (`minus = '−'`), `spacing` that tightens every gap, pad, and legend row for six-point type, and color scales of its own (`sequential_stops`, `diverging_stops`), so a journal's figure style is one palette.
 
-A palette's `paper` is the color of its page, white unless you say otherwise, and every format draws on it. For a dark page, give it a light
-`ink` and order its shades from the strongest against the page to the faintest, so that rings, halos, and scales follow.
-
 Century Gothic is used where it is installed, and glycorender's bundled Comfortaa elsewhere.
+
+### Dark pages
+
+Every palette has a dark version, for an app's or a notebook's dark theme. `vc.dark_mode()` turns every palette dark for new figures,
+whether chosen by name, passed in, or a library's default, and `vc.dark_mode(paper = '#1E1E1E')` sets them on the theme's own
+surface. `palette = 'lumen-dark'` names one directly, and `pal.dark()` makes one from any palette, your own included. Each color keeps
+its hue and mirrors its lightness, so the shade that stood out most on white stands out most on the dark page, and oranges and golds
+stay warm. Spheres keep their light from above, Lumen's lines glow brighter, and Aura's soft shadows become a glow in each mark's own
+color. `fig.save('plot.png', background = None)` leaves the page transparent, so a figure sits on any dark surface.
+
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/dark.png" alt="A line and bar figure, a volcano plot, stacked bars, and an embedding in the dark versions of Lumen, Couture, Poster, and Aura" width="100%"></p>
+
+A palette's `paper` is the color of its page, white unless you say otherwise, and every format draws on it. A palette made for a dark
+page takes a light `ink` and orders its shades from the strongest against the page to the faintest, so that rings, halos, and scales
+follow; `dark_settings` sets a palette's dark shades by hand, such as `dark_settings = {'b': [...]}`.
 
 ## More
 

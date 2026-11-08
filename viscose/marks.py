@@ -321,6 +321,9 @@ def _layers(pal, xs, ys, r, rgb, edge):
         return [(xs, ys, r, rgb, edge[0], edge[1])]
     if pal.point == 'sphere':
         dark, base, light = pal.shades(rgb)
+        # Light falls on a sphere the same way on any page, while a dark palette's next shade is a lighter one
+        if pal.is_dark:
+            dark, light = light, dark
         big = r > 2.0
         return [(xs, ys, r * 1.2, dark, None, 0.0), (xs, ys, r, base, None, 0.0),
                 (xs[big] - r[big] * 0.22, ys[big] + r[big] * 0.22, r[big] * 0.5, light, None, 0.0)]
