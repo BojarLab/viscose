@@ -185,6 +185,82 @@ def test_set_and_register_palette():
         del vc.palettes['mine']
 
 
+def _seared():
+    return vc.Palette('seared', ['#4A1D0A', '#A34E12', '#E2972E', '#F9E2AE'],
+                      ['#1B2F3B', '#3C6478', '#7DA8BA', '#D3E4EA'], '#2E1508', '#8C6B55', '#F6EEE2', point = 'crust',
+                      bar = 'sear', ridge = 'sear', crust = 1.75)
+
+
+def _pixel(fig, ax, x, y, dpi = 200):
+    fig.layout()
+    rgba = fig.to_rgba(dpi)
+    px, py = ax.page(x, y)
+    return rgba[rgba.shape[0] - 1 - int(py * dpi / 72), int(px * dpi / 72), :3].astype(int)
+
+
+def test_seared_bars_brown_with_height_on_one_scale():
+    fig, axes = vc.subplots(palette = _seared())
+    axes.bar([0, 1], [1.0, 3.0], color = 'a1')
+    axes.set_ylim(0, 4)
+    # Equal heights have equal colors whatever the bar's own height, so the tall bar's tip is the browner one
+    assert np.abs(_pixel(fig, axes, 0, 0.5) - _pixel(fig, axes, 1, 0.5)).max() <= 2
+    assert _pixel(fig, axes, 1, 2.9).sum() < _pixel(fig, axes, 0, 0.95).sum()
+
+
+def test_seared_stems_and_bars_brown_away_from_zero_on_both_sides():
+    fig, axes = vc.subplots(palette = _seared())
+    axes.stem([1.0, 2.0], [3.0, -3.0], color = 'a1', lw = 12.0)
+    axes.bar([3], [-3.0], color = 'a1')
+    axes.set_ylim(-4, 4)
+    for x, tip, near in ((1.0, 2.9, 0.2), (2.0, -2.9, -0.2), (3, -2.9, -0.2)):
+        assert _pixel(fig, axes, x, tip).sum() < _pixel(fig, axes, x, near).sum()
+
+
+def test_a_crust_rims_points_and_lies_under_lines():
+    pal = _seared()
+    fig, axes = vc.subplots(palette = pal)
+    axes.scatter([1.0], [1.0], s = 900, color = 'a2')
+    axes.set_xlim(0, 2)
+    axes.set_ylim(0, 2)
+    fig.layout()
+    middle = _pixel(fig, axes, 1.0, 1.0)
+    assert np.abs(middle - np.array(pal.color('a2')) * 255).max() <= 2
+    rgba, (px, py) = fig.to_rgba(200), axes.page(1.0, 1.0)
+    # 900 points squared is a radius of 15 points, and the rim is the outer 1.3 of them
+    rim = rgba[rgba.shape[0] - 1 - int(py * 200 / 72), int((px + 14.4) * 200 / 72), :3].astype(int)
+    assert np.abs(rim - np.array(pal.color('a1')) * 255).max() <= 2
+    fig, axes = vc.subplots(palette = pal)
+    axes.plot([0, 2], [1, 1], color = 'a2', lw = 8.0)
+    axes.set_ylim(0, 2)
+    fig.layout()
+    rgba, (px, py) = fig.to_rgba(200), axes.page(1.0, 1.0)
+    row, col = rgba.shape[0] - 1 - int(py * 200 / 72), int(px * 200 / 72)
+    assert np.abs(rgba[row, col, :3].astype(int) - np.array(pal.color('a2')) * 255).max() <= 2
+    assert np.abs(rgba[row - int(5.5 * 200 / 72), col, :3].astype(int) - np.array(pal.color('a1')) * 255).max() <= 2
+
+
+def test_every_plot_draws_seared_in_every_format(tmp_path):
+    pal = vc.register_palette(_seared())
+    rng = np.random.default_rng(3)
+    try:
+        fig, axes = vc.subplots(2, 3, palette = 'seared')
+        axes[0, 0].bar(['a', 'b'], [1.0, 2.0])
+        axes[0, 1].barh(['a', 'b'], [1.0, 2.0])
+        axes[0, 2].boxplot([rng.normal(size = 20), rng.normal(size = 20)])
+        axes[1, 0].violinplot([rng.normal(size = 20), rng.normal(size = 20)])
+        axes[1, 1].stacked_bar(['a', 'b'], [[1.0, 2.0], [2.0, 1.0]], labels = ['x', 'y'])
+        axes[1, 2].ridgeline(np.linspace(0, 1, 30), [np.sin(np.linspace(0, 3, 30))] * 3)
+        for suffix in ('png', 'pdf', 'svg'):
+            fig.save(tmp_path / f'seared.{suffix}')
+            assert (tmp_path / f'seared.{suffix}').stat().st_size > 1000
+        dendro = vc.clustermap(rng.normal(size = (6, 5)), palette = 'seared')[0]
+        assert dendro.to_png(72)[:4] == b'\x89PNG'
+        with pytest.raises(ValueError):
+            vc.Palette('x', pal.a, pal.b, '#000000', '#111111', '#222222', bar = 'seared')
+    finally:
+        del vc.palettes['seared']
+
+
 def test_ticks_and_number_format():
     assert nice_ticks(0, 14.2) == [0, 2, 4, 6, 8, 10, 12, 14]
     assert nice_ticks(0, 1.08) == [0, .2, .4, .6, .8, 1.0]

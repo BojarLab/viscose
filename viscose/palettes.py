@@ -112,17 +112,20 @@ def ramp(colors, t):
 class Palette:
     """Two hues in four shades each (dark to pale), with text colors and effect settings.
 
-    `point` is flat, ring, cut, or sphere. `bar` is flat, deep (gradient from the dark base), soft (gradient from the
-    pale base), or needle. `ridge` is flat, deep, or tint. `shadow` is the strength of a soft shadow that every mark
-    casts in its own color. `caps` sets axis names in small spaced capitals. `paper` is the page's color, for a dark
-    page with a light `ink`, where shades run from the strongest against the page to the faintest. `font` is a family
-    as (name, regular file, bold file), found among the system's fonts, for a house or journal style; without it, or
-    where its files are missing, Century Gothic or the bundled Comfortaa. `spacing` scales the gaps, pads, legend
-    rows, and color bars that the plot code sets itself, which suit type of about ten points, so that type of five or
-    six points sits as close to its axes as a journal page wants. `minus` is the sign numbers on axes are written
-    with, such as a true minus, '−', in a font that has one. `sequential` and `diverging` take stops of their own,
-    pale to dark and from the second pole through the middle to the first, in place of the ones made from the hues.
-    `dark_settings` replaces settings of the palette that `dark` makes from this one, such as shades picked by hand.
+    `point` is flat, ring, cut, sphere, or crust (a darker rim around the point's color). `bar` is flat, deep (gradient
+    from the dark base), soft (gradient from the pale base), needle, or sear (browning from a pale base with height, on
+    one scale across the plot, so that a taller bar reaches a darker tip). `ridge` is flat, deep, tint, or sear.
+    `crust` is the width, in line widths, of a darker line under every line, 0 for none. `shadow` is the strength of a
+    soft shadow that every mark casts in its own color. `caps` sets axis names in small spaced capitals. `paper` is the
+    page's color, for a dark page with a light `ink`, where shades run from the strongest against the page to the
+    faintest. `font` is a family as (name, regular file, bold file), found among the system's fonts, for a house or
+    journal style; without it, or where its files are missing, Century Gothic or the bundled Comfortaa. `spacing` scales
+    the gaps, pads, legend rows, and color bars that the plot code sets itself, which suit type of about ten points, so
+    that type of five or six points sits as close to its axes as a journal page wants. `minus` is the sign numbers on
+    axes are written with, such as a true minus, '−', in a font that has one. `sequential` and `diverging` take stops
+    of their own, pale to dark and from the second pole through the middle to the first, in place of the ones made from
+    the hues. `dark_settings` replaces settings of the palette that `dark` makes from this one, such as shades picked
+    by hand.
     """
     name: str
     a: list
@@ -171,11 +174,13 @@ class Palette:
     diverging_stops: tuple = ()
     dark_settings: dict = field(default_factory = dict)
     extra: dict = field(default_factory = dict)
+    crust: float = 0.0
 
     def __post_init__(self):
         # A misspelled effect would otherwise quietly draw the flat one
-        for setting, allowed in (('point', ('flat', 'ring', 'cut', 'sphere')),
-                                 ('bar', ('flat', 'deep', 'soft', 'needle')), ('ridge', ('flat', 'deep', 'tint'))):
+        for setting, allowed in (('point', ('flat', 'ring', 'cut', 'sphere', 'crust')),
+                                 ('bar', ('flat', 'deep', 'soft', 'needle', 'sear')),
+                                 ('ridge', ('flat', 'deep', 'tint', 'sear'))):
             if getattr(self, setting) not in allowed:
                 raise ValueError(f"A palette's {setting} has to be one of {', '.join(allowed)}, "
                                  f'got {getattr(self, setting)!r}')

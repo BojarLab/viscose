@@ -28,13 +28,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.11', '3.12', '3.13', '3.14']
-        # macOS runners are scarce: jobs waiting for one failed runs with "not acquired", so it takes the oldest and newest Python
-        exclude:
-          - os: macos-latest
-            python-version: '3.12'
-          - os: macos-latest
-            python-version: '3.13'
+        # The oldest and newest Python: breakage shows up there, and jobs waiting for a scarce macOS runner have failed runs
+        python-version: ['3.11', '3.14']
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

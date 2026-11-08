@@ -327,6 +327,9 @@ def _layers(pal, xs, ys, r, rgb, edge):
         big = r > 2.0
         return [(xs, ys, r * 1.2, dark, None, 0.0), (xs, ys, r, base, None, 0.0),
                 (xs[big] - r[big] * 0.22, ys[big] + r[big] * 0.22, r[big] * 0.5, light, None, 0.0)]
+    if pal.point == 'crust':
+        # The rim keeps its width on large points, as a share of the radius would turn them into targets
+        return [(xs, ys, r, pal.shades(rgb)[0], None, 0.0), (xs, ys, r - np.minimum(0.3 * r, 1.3), rgb, None, 0.0)]
     if pal.point == 'ring':
         return [(xs, ys, r, rgb, pal.color('paper'), 0.35)]
     if pal.point == 'cut':
@@ -395,6 +398,8 @@ def line(c, pal, xs, ys, rgb, lw = None, alpha = 1.0, dash = None):
     elif pal.glow:
         for k, a in GLOW:
             polyline(c, xs, ys, rgb, lw * k, a * alpha)
+    if pal.crust:
+        polyline(c, xs, ys, pal.shades(rgb)[0], lw * pal.crust, alpha, cap = cap, dash = dash)
     polyline(c, xs, ys, rgb, lw, alpha, cap = cap, dash = dash)
 
 
@@ -435,6 +440,12 @@ def bar(c, pal, x, y, w, h, rgb, horizontal = False, alpha = 1.0, flip = False, 
         polygon(c, xs, ys, None, alpha, (axis, (dark, base, light)))
     elif pal.bar == 'soft':
         polygon(c, xs, ys, None, alpha, (axis, (light, base)))
+    elif pal.bar == 'sear':
+        # One scale from the bar's base to the far side of the plot, so that its height sets how brown its tip gets
+        (bx, by, bw, bh), _ = c.state['clip'][0] if c.state['clip'] else ((x, y, w, h), None)
+        along = (axis[0], axis[1], bx if flip else bx + bw, axis[3]) if horizontal else (
+            axis[0], axis[1], axis[2], by if flip else by + bh)
+        polygon(c, xs, ys, None, alpha, (along, (light, base, dark)))
     elif pal.bar == 'needle':
         polygon(c, xs, ys, rgb, alpha)
         if horizontal:
@@ -466,6 +477,10 @@ def box(c, pal, x, w, stats, rgb, alpha = 1.0, horizontal = False):
     # A needle's wide top would read as part of the data here
     if pal.bar == 'needle':
         polygon(c, *turn(horizontal, [x, x + w, x + w, x], [q1, q1, q3, q3]), rgb, alpha)
+    elif pal.bar == 'sear' and q3 > q1:
+        # A box's place on the axis is its data, and on the plot's scale one low down would lose its group's color
+        polygon(c, *turn(horizontal, [x, x + w, x + w, x], [q1, q1, q3, q3]), None, alpha,
+                ((q1, x, q3, x) if horizontal else (x, q1, x, q3), pal.shades(rgb)[1:][::-1]))
     else:
         bar(c, pal, *((q1, x, q3 - q1, w) if horizontal else (x, q1, w, q3 - q1)), rgb, horizontal, alpha)
     polyline(c, *turn(horizontal, [x, x + w], [median, median]), pal.color(pal.on(rgb)), max(lw, 1.4), alpha, cap = 0)
@@ -478,7 +493,7 @@ def violin(c, pal, xs, ys, cx, half, rgb, alpha = 1.0, horizontal = False):
     dark, base, light = pal.shades(rgb)
     across = (ys[0], cx - half, ys[0], cx + half) if horizontal else (cx - half, ys[0], cx + half, ys[0])
     xs, ys = turn(horizontal, xs, ys)
-    if pal.bar == 'deep':
+    if pal.bar in ('deep', 'sear'):
         polygon(c, xs, ys, None, alpha, (across, (dark, light, dark)))
     elif pal.bar == 'soft':
         polygon(c, xs, ys, None, alpha, (across, (light, base, light)))
@@ -520,6 +535,8 @@ def segment(c, pal, x, y, w, h, rgb, gap, alpha = 1.0):
     xs, ys = [x, x + w, x + w, x], [y0, y0, y0 + h0, y0 + h0]
     if pal.bar in ('deep', 'soft'):
         polygon(c, xs, ys, None, alpha, ((x, y0, x, y0 + h0), (base, light)))
+    elif pal.bar == 'sear':
+        polygon(c, xs, ys, None, alpha, ((x, y0, x, y0 + h0), (base, dark)))
     else:
         polygon(c, xs, ys, rgb, alpha)
 
@@ -533,6 +550,10 @@ def ridge(c, pal, xs, base, ys, rgb, top_rgb, peak):
         polygon(c, px, py, paper)
         polygon(c, px, py, None, 1.0, ((xs[0], base, xs[0], base + peak), (rgb, top_rgb)))
         polyline(c, xs, ys, paper, pal.ridge_crest)
+    elif pal.ridge == 'sear':
+        polygon(c, px, py, paper)
+        polygon(c, px, py, None, 1.0, ((xs[0], base, xs[0], base + peak), (top_rgb, rgb)))
+        polyline(c, xs, ys, pal.shades(rgb)[0], pal.ridge_crest)
     elif pal.ridge == 'tint':
         polygon(c, px, py, top_rgb)
         polyline(c, xs, ys, rgb, pal.ridge_crest)

@@ -2061,6 +2061,14 @@ class Axes:
                 hw = a['lw'] / 2.0
                 grad = ((x, zero, x, y), (dark, light) if pal.bar == 'deep' else (light, base))
                 marks.polygon(c, [x - hw, x + hw, x + hw, x - hw], [zero, zero, y, y], None, 1.0, grad)
+            elif pal.bar == 'sear':
+                dark, base, light = pal.shades(a['rgb'])
+                hw = a['lw'] / 2.0
+                # As a bar: one scale across the plot, on either side of zero, so that a tall stem browns at its tip
+                (_, by, _, bh), _ = c.state['clip'][0] if c.state['clip'] else ((0.0, min(zero, y), 0.0, abs(y - zero)),
+                                                                                None)
+                grad = ((x, zero, x, by if y < zero else by + bh), (light, base, dark))
+                marks.polygon(c, [x - hw, x + hw, x + hw, x - hw], [zero, zero, y, y], None, 1.0, grad)
             else:
                 marks.polyline(c, [x, x], [zero, y], a['rgb'], a['lw'] * scale, cap = 0)
         if a['cap']:
@@ -2185,9 +2193,9 @@ class Axes:
 
     def _d_dendro(self, c, a):
         pal = self.pal
-        lw = {'deep': 1.2, 'needle': 0.45, 'flat': 2.6, 'soft': 1.5}[pal.bar]
-        rgb = {'deep': pal.color('a1'), 'needle': pal.color('ink'), 'flat': pal.color('a0'),
-               'soft': pal.color('a2')}[pal.bar]
+        lw = {'deep': 1.2, 'needle': 0.45, 'flat': 2.6, 'soft': 1.5, 'sear': 1.3}[pal.bar]
+        rgb = {'deep': pal.color('a1'), 'needle': pal.color('ink'), 'flat': pal.color('a0'), 'soft': pal.color('a2'),
+               'sear': pal.color('a1')}[pal.bar]
         lines = {}
         for k, (ic, dc) in enumerate(zip(a['ic'], a['dc'])):
             pos, dep = np.asarray(ic) / 10.0, np.asarray(dc, dtype = float)
