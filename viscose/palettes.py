@@ -381,8 +381,11 @@ def default_palette(name):
 def dark_mode(on = True, paper = None):
     """Draw new figures for a dark page, as for an app or a console in a dark theme: every palette, whether chosen by
     name, passed as an instance, or a library's default, comes as its dark version (Palette.dark), on `paper` if given,
-    such as the theme's own surface color. dark_mode(False) goes back to light pages."""
+    such as the theme's own surface color. dark_mode(False) goes back to light pages. Returns the setting it replaced,
+    as (on, paper), so that dark_mode(*previous) restores it, as when saving a figure for print from a dark console."""
+    previous = tuple(_dark)
     _dark[:] = (bool(on), paper if on else None)
+    return previous
 
 
 def register_palette(pal):

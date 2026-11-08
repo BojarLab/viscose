@@ -850,6 +850,44 @@ def test_svg_label_is_written_for_annotate_figure():
     assert b'%PDF' == fig.to_pdf()[:4]
 
 
+def test_svg_lines_can_be_read_for_placing_glycans():
+    # glycowork's _figure_ink reads what a figure has drawn from these lines, to keep glycan drawings clear of it
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'aura')
+    ax.scatter([1, 2], [1, 2])
+    ax.scatter([1.5], [1.5], s = 100, edge = ('muted', 1.0), gid = 'node')
+    ax.axhline(1.5)
+    ax.plot([1, 2], [2, 1])
+    ax.set(title = 'A title', xlabel = 'x')
+    ax.annotate('Gal(b1-3)GalNAc', (1, 1), svg_label = True)
+    svg = fig.to_svg()
+    lines = svg.split('\n')
+    # y runs up from the page's foot, and the smallest clip is the plot area, a point wider all around
+    assert f'<g transform="matrix(1 0 0 -1 0 {fig.height:g})">' in lines
+    clips = [[float(v) for v in m] for m in re.findall(
+        r'<clipPath[^>]*><rect x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"', svg)]
+    x0, y0, w, h = min(clips, key = lambda c: c[2] * c[3])
+    assert np.allclose((x0 + 1, y0 + 1, w - 2, h - 2), ax.rect, atol = 0.01)
+    numbers = lambda d: np.array(re.findall(r'-?\d*\.?\d+', d), dtype = float).reshape(-1, 2)
+    # Marks stand in absolute page coordinates: points are filled paths within a clip, flat ones one subpath each
+    point = next(line for line in lines if 'clip-path' in line and 'fill="none"' not in line)
+    parts = [numbers(part) for part in re.search(r'<path d="([^"]*)"', point).group(1).split('M')[1:]]
+    middles = [(xy.min(0) + xy.max(0)) / 2 for xy in parts]
+    assert np.allclose(middles, [(ax._tx(1), ax._ty(1)), (ax._tx(2), ax._ty(2))], atol = 0.05)
+    # a line is a stroke without a fill, and a guide also has dashes
+    strokes = [line for line in lines if 'clip-path' in line and 'fill="none"' in line]
+    assert sorted('stroke-dasharray' in line for line in strokes) == [False, True]
+    # a node with a gid has no clip, and its fill and its stroke on one line
+    assert re.search(r'<g id="node">\n<path d="[^"]*" fill="#[^"]*" stroke="#[^"]*" stroke-width="[^"]*" />', svg)
+    # text is outlines, each with a transform and no clip
+    text = [line for line in lines if re.match(r'<path d="[^"]*" transform="matrix\(', line)]
+    assert len(text) > 2 and not any('clip-path' in line or 'stroke=' in line for line in text)
+    title = numbers(re.search(r'<path d="([^"]*)"', text[-1]).group(1))
+    a, b, c, d, _e, f = (float(v) for v in re.search(r'matrix\(([^)]*)\)', text[-1]).group(1).split())
+    assert (a, b, c, d) == (1, 0, 0, 1) and f + title[:, 1].min() > y0 + h
+    # A label left as text says how far it reaches, in page coordinates
+    assert re.search(r'<g transform="translate\([\d.]+ [\d.]+\) matrix\([^)]*\)" data-right="[\d.]+">', svg)
+
+
 def test_a_glycan_label_near_the_edge_keeps_its_side_and_grows_the_page():
     fig, ax = vc.subplots(figsize = (4, 3), palette = 'poster')
     ax.set_xlim(0, 1)
@@ -1809,7 +1847,11 @@ def test_dark_mode_turns_every_palette_dark():
         vc.set_palette('couture')
         assert module._default[0] == 'couture' and vc.subplots()[0].pal.name == 'couture-dark'
         assert vc.get_palette(None, vc.get_palette('lumen')).name == 'couture-dark'
-        vc.dark_mode(True, paper = '#202124')
+        assert vc.dark_mode(True, paper = '#202124') == (True, None)
+        assert vc.subplots()[0].pal.paper == '#202124'
+        previous = vc.dark_mode(False)
+        assert previous == (True, '#202124') and not vc.subplots()[0].pal.is_dark
+        vc.dark_mode(*previous)
         assert vc.subplots()[0].pal.paper == '#202124'
         # A library's own palette, passed as an instance, turns dark too
         vc.set_palette(None)
