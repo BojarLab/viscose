@@ -1,6 +1,7 @@
 """Figure: lays out axes, draws through glycorender's display list and writes PNG, PDF, or SVG."""
 import base64
 import builtins
+import difflib
 import functools
 import importlib
 import json
@@ -22,8 +23,8 @@ import numpy as np
 from glycorender import pdfwrite, raster
 from . import marks, text
 from .axes import Axes, LABEL_MIN
-from .palettes import (AURA, COUTURE, CVD_MIN, LC_LARGE, LC_MARK, LC_TEXT, LUMEN, POSTER, Palette, _from_oklch, _hex,
-                       _named, _oklab, _oklch, apart, apca, get_palette, legible, press as _press)
+from .palettes import (AURA, COUTURE, CVD_MIN, LC_LARGE, LC_MARK, LC_TEXT, LUMEN, POSTER, Palette, _darks, _from_oklch,
+                       _hex, _named, _oklab, _oklch, apart, apca, dark_mode, get_palette, legible, press as _press)
 
 
 # Shadow offset and blur in points; a blur cannot stay vector, so the PDF and SVG carry it as an image at this
@@ -56,6 +57,10 @@ _legibles = {}
 SOURCE_FORMAT, SOURCE_NAME, SOURCE_MIME, SOURCE_CHUNK = 1, 'figure-source.json', 'application/vnd.viscose+json', b'vcSc'
 SOURCE_JSON, SOURCE_FLOOR = 10000, 1 << 16
 SOURCE_ABOUT = 'The calls and data that drew this figure, which viscose.open brings back as a figure'
+# An SVG in both themes: what of an op's state is its paint, the classes of what only one theme draws, and what the
+# drawing's id, which scopes its rules, and its own gradients' ids start with until its text is known
+THEME_PAINT = ('fill_rgb', 'fill_alpha', 'fill_grad', 'stroke_rgb', 'stroke_alpha')
+THEME_LIGHT, THEME_DARK, THEME_PREFIX = 'vl', 'vd', '\x01'
 
 
 def show_png(png, viewer = True):
@@ -127,14 +132,16 @@ def _label_groups(c, ops, height):
         a, b, cc, d, e, f = members[0]['ctm']
         paths, right = [], 0.0
         for op in members:
+            # The class that turns it dark, in an SVG of both themes
+            cls = ' class="%s"' % op['theme'] if op.get('theme') else ''
             if op['kind'] == 'path':
                 segments = op['path']
                 paths.append('<path d="%s" fill="none" stroke="%s" stroke-width="%.2f" stroke-linecap="round" '
-                             'stroke-linejoin="round" />'
-                             % (_path_data(segments), _css(op['stroke_rgb']), op['line_width']))
+                             'stroke-linejoin="round"%s />'
+                             % (_path_data(segments), _css(op['stroke_rgb']), op['line_width'], cls))
             else:
                 segments = text.outline(c, op['ttf'], op['text'], op['x'], op['y'], op['size']).ops
-                paths.append('<path d="%s" fill="%s" />' % (_path_data(segments), _css(op['fill_rgb'])))
+                paths.append('<path d="%s" fill="%s"%s />' % (_path_data(segments), _css(op['fill_rgb']), cls))
             right = max([right] + [x for s in segments for x in s[1::2]])
         comment = '<!-- %s -->\n' % key[2] if '--' not in key[2] else ''
         out.append('%s<g transform="translate(%.2f %.2f) matrix(%.6g %.6g %.6g %.6g 0 0)" data-right="%.2f">%s</g>'
@@ -144,8 +151,7 @@ def _label_groups(c, ops, height):
 
 def _with_ids(svg, ops):
     """Wrap each element's run of output in a group with its `gid`. The emitted body has one line per drawn op."""
-    named = [o.get('gid') for o in ops if (o['fill'] or o['stroke'] if o['kind'] == 'path' else
-                                           o['kind'] == 'image' or o['text'].strip())]
+    named = [o.get('gid') for o in _drawn(ops)]
     start = svg.index('\n', svg.index('<g transform="matrix(')) + 1
     end = svg.rindex('\n</g>\n</svg>')
     lines = svg[start:end].split('\n')
@@ -162,6 +168,110 @@ def _with_ids(svg, ops):
         out.append(line)
     if current:
         out.append('</g>')
+    return svg[:start] + '\n'.join(out) + svg[end:]
+
+
+def _drawn(ops):
+    """The ops that svgout.emit writes a line for, in order: it skips paths without paint and text without ink."""
+    return [o for o in ops if (o['fill'] or o['stroke'] if o['kind'] == 'path' else o['kind'] == 'image' or
+                               o['text'].strip())]
+
+
+def _frozen(v):
+    return tuple(_frozen(u) for u in v) if isinstance(v, (list, tuple)) else v
+
+
+def _shape_key(op):
+    """What an op draws, apart from its paint, which is all that differs between a figure and its twin in another
+    palette as long as they draw the same shapes; an image's pixels are its shape, and a gradient's stops its paint."""
+    key = tuple((k, _frozen(v)) for k, v in sorted(op.items()) if k not in THEME_PAINT + ('ttf', 'label', 'mark'))
+    return key + (op['fill_grad'][:2] if op.get('fill_grad') else None, )
+
+
+def _paints(op):
+    """An op's fill and stroke as svgout.emit writes them, with their opacities: a color, or a gradient's key."""
+    fill = op['kind'] == 'text' or op['kind'] == 'path' and op['fill']
+    stroke = op['kind'] == 'path' and op['stroke']
+    return ((op['fill_grad'] or _css(op['fill_rgb']), op['fill_alpha']) if fill else None,
+            (_css(op['stroke_rgb']), op['stroke_alpha']) if stroke else None)
+
+
+def _gradient_def(key, name):
+    """A gradient as svgout.emit writes one, under its own name."""
+    kind, geo, stops = key
+    inner = ''.join('<stop offset="%s" stop-color="%s" stop-opacity="%s" />' % (pdfwrite._fmt(o), _css(c[:3]),
+                                                                                 pdfwrite._fmt(c[3])) for o, c in stops)
+    tag, axes = ('radialGradient', ('cx', 'cy', 'r')) if kind == 'radial' else ('linearGradient', ('x1', 'y1', 'x2',
+                                                                                                   'y2'))
+    return '<%s id="%s" gradientUnits="userSpaceOnUse" %s>%s</%s>' % (
+        tag, name, ' '.join('%s="%s"' % (a, pdfwrite._fmt(v)) for a, v in zip(axes, geo)), inner, tag)
+
+
+class _Themes:
+    """How a page in its light palette turns into its dark version: each op of one paired with the op of the other
+    that draws the same shape, a class for each pair whose paint differs, naming the dark paint as CSS custom
+    properties, and the ops only one of them draws, shown only in its theme."""
+    def __init__(self, light, dark):
+        ids, own = {}, lambda ops: [ids.setdefault(_shape_key(o), len(ids)) for o in ops]
+        a, b = own(light), own(dark)
+        self.ops, self.colors, self.rules, self.grads = [], {}, {}, {}
+        if a == b:
+            blocks = [('equal', 0, len(a), 0, len(b))]
+        else:
+            blocks = difflib.SequenceMatcher(None, a, b, autojunk = False).get_opcodes()
+        for tag, i0, i1, j0, j1 in blocks:
+            if tag == 'equal':
+                self.ops += [dict(o, theme = self.pair(o, p)) for o, p in zip(light[i0:i1], dark[j0:j1])]
+                continue
+            # A shape of one theme alone, such as a sticker's cut on the dark page or a shadow, which glows there
+            self.ops += [dict(o, theme = THEME_LIGHT) for o in light[i0:i1]]
+            self.ops += [dict(o, theme = THEME_DARK) for o in dark[j0:j1]]
+
+    def pair(self, light, dark):
+        """The class that turns `light`'s paint into `dark`'s, or None where they are the same."""
+        was, now = _paints(light), _paints(dark)
+        if was == now:
+            return None
+        rule = []
+        for prop, old, new in zip(('fill', 'stroke'), was, now):
+            if new is None or old == new:
+                continue
+            if isinstance(new[0], tuple):
+                grad = self.grads.setdefault(new[0], '%sg%d' % (THEME_PREFIX, len(self.grads)))
+                rule.append('%s:url(#%s)' % (prop, grad))
+            else:
+                rule.append('%s:var(%s)' % (prop, self.colors.setdefault(new[0], '--c%d' % len(self.colors))))
+            if new[1] != old[1]:
+                rule.append('%s-opacity:%s' % (prop, pdfwrite._fmt(new[1])))
+        return self.rules.setdefault(';'.join(rule), 'k%d' % len(self.rules)) if rule else None
+
+    def style(self):
+        """The rules, scoped to the drawing's own id, as a page may hold several drawings inline."""
+        scope = '#' + THEME_PREFIX
+        props = ';'.join('%s:%s' % (name, color) for color, name in self.colors.items())
+        body = ''.join('%s .%s{%s}' % (scope, cls, rule) for rule, cls in self.rules.items())
+        return ('<style>@media (prefers-color-scheme:dark){%s{%s}%s%s .%s{display:none}%s .%s{display:inline}}'
+                '</style>\n' % (scope, props, body, scope, THEME_LIGHT, scope, THEME_DARK))
+
+    def defs(self):
+        return ''.join(_gradient_def(key, name) for key, name in self.grads.items())
+
+
+def _classed(svg, ops):
+    """Each drawn op's line of svgout.emit's output with its theme's class, and an op of the dark theme alone hidden
+    unless the dark rule shows it, so that a reader without CSS sees the light page whole."""
+    start = svg.index('\n', svg.index('<g transform="matrix(')) + 1
+    end = svg.rindex('\n</g>\n</svg>')
+    lines, drawn = svg[start:end].split('\n'), _drawn(ops)
+    if len(lines) != len(drawn):
+        raise RuntimeError(f'An SVG in both themes needs a line per drawn op, got {len(lines)} for {len(drawn)}')
+    out = []
+    for line, op in zip(lines, drawn):
+        cls = op.get('theme')
+        if cls:
+            at = line.index(' />')
+            line = line[:at] + ' class="%s"%s' % (cls, ' display="none"' if cls == THEME_DARK else '') + line[at:]
+        out.append(line)
     return svg[:start] + '\n'.join(out) + svg[end:]
 
 
@@ -353,6 +463,8 @@ class Figure:
         # Every text and mark meets APCA's contrast and every color of a plot stays apart for every reader, by shades
         # adjusted where they fail, which `adjusted` lists as (was, is, why)
         self.legible, self.adjusted = True, []
+        # Glyphs take the room of a dark page's sticker cut on a light page too, as in an SVG of both themes
+        self._stickers = False
 
     def suptitle(self, title, subtitle = ''):
         """The figure's title in the palette's manner, with an optional line under it."""
@@ -376,8 +488,28 @@ class Figure:
             twin._align = {axis: twins[id(other)] for axis, other in ax._align.items()}
             fig.axes.append(twin)
         swap = lambda v: twins[id(v)] if isinstance(v, Axes) else v
+        # A color the caller took from this palette, such as fig.pal.groups(3, 2), is that shade of the other one, as
+        # it would have been had the figure been drawn there; the page's color stays, as white text means white
+        was = next((asked for asked, made, _ in _legibles.values() if made is self.pal), self.pal)
+        own = {was.color(n): n for n in ('ink', 'muted', 'faint', *(h + str(i) for h in 'ba' for i in range(4)))}
+        def shade(v):
+            if not (isinstance(v, str) and v.startswith('#') or isinstance(v, tuple) and len(v) in (3, 4)):
+                return v
+            try:
+                return own.get(was.color(v), v)
+            except (ValueError, TypeError):
+                return v
+        def tinted(k, v):
+            if k == 'edge' and isinstance(v, tuple) and len(v) == 2:
+                return shade(v[0]), v[1]
+            if k in ('color', 'colors'):
+                return ({u: shade(w) for u, w in v.items()} if isinstance(v, dict) else [shade(w) for w in v]
+                        if isinstance(v, list) else shade(v))
+            if k == 'emphasis' and isinstance(v, dict):
+                return {u: shade(w) for u, w in v.items()}
+            return swap(v)
         for ax, name, args, kwargs in self._calls:
-            getattr(twins[id(ax)], name)(*map(swap, args), **{k: swap(v) for k, v in kwargs.items()})
+            getattr(twins[id(ax)], name)(*map(swap, args), **{k: tinted(k, v) for k, v in kwargs.items()})
         if hasattr(self, 'row_order'):
             fig.row_order, fig.col_order = self.row_order, self.col_order
         return fig
@@ -547,6 +679,9 @@ class Figure:
             # Each color an axes shows, with what it must reach, and those that tell its data apart, in order
             need, kinds = {}, []
             for a in ax.artists:
+                # Labels that name a series take its color, made legible as they are drawn
+                if a['kind'] == 'text' and a.get('direct'):
+                    continue
                 if a['kind'] == 'text' and not a.get('glyph'):
                     size, bold = a['size'] or ax.pal.tick_size, pal.text_bold if a['bold'] is None else a['bold']
                     found, target = [a['rgb']], LC_LARGE if size >= 24 or bold and size >= 16 else LC_TEXT
@@ -878,26 +1013,81 @@ class Figure:
         c.save()
         return target.getvalue(), why
 
-    def to_svg(self):
-        """SVG text on the palette's page, with text as outlines and images embedded."""
+    def _svg_page(self):
+        """The display list that to_svg writes, the shadow under everything, and apart from it the glycan labels."""
         op = self._shadow_op(SHADOW_DPI)
         c = self._canvas()
         if op is not None:
             c.ops.insert(0, op)
         labels = [o for o in c.ops if o.get('label')]
         c.ops = [o for o in c.ops if not o.get('label')]
-        svg = _with_ids(c.to_svg(), c.ops)
+        return c, labels
+
+    def _themes(self, themes):
+        """The figure in its light palette and in that palette's dark version, on the page color `themes` names or the
+        dark version's own, both drawn again by in_palette, which dark mode must leave alone while it runs, and both
+        with the room of the dark page's sticker cuts around glyphs, so that they share one page."""
+        pal = next((was for was, made, _ in _legibles.values() if made is self.pal), self.pal)
+        paper = None if themes is True else themes
+        light = next((was for was, made in _darks.values() if made is pal), None) if pal.is_dark else pal
+        if light is None:
+            raise ValueError(f'An SVG in both themes needs the light palette that {pal.name!r} is the dark version '
+                             'of, and this one was made by hand; draw the figure in a light palette instead')
+        previous = dark_mode(False)
+        try:
+            # A figure drawn dark keeps its own page, such as a console's surface, unless given another
+            dark = pal if pal.is_dark and paper is None else light.dark(paper)
+            pair = self.in_palette(light), self.in_palette(dark)
+        finally:
+            dark_mode(*previous)
+        # One page for both, so the light one leaves the room of the dark one's sticker cuts too
+        for fig in pair:
+            fig._stickers = True
+        return pair
+
+    def to_svg(self, themes = False):
+        """SVG text on the palette's page, with text as outlines and images embedded. themes = True writes the figure
+        in its palette and that palette's dark version (Palette.dark) at once, as one drawing whose colors follow the
+        reader's light or dark mode through CSS, on a website, on GitHub, or in docs alike; a color for `themes` is the
+        dark page's, such as the site's own dark background. Whatever reads no CSS, as most editors, sees the light
+        page."""
+        figure = self
+        if themes:
+            figure, dark = self._themes(themes)
+            d, dark_labels = dark._svg_page()
+        c, labels = figure._svg_page()
+        if themes:
+            theme = _Themes(c.ops, d.ops)
+            c.ops = theme.ops
+            sheet = lambda f: dict(c.state, kind = 'path', fill = True, stroke = False, fill_rgb = f.pal.color('paper'))
+            paper = theme.pair(sheet(figure), sheet(dark))
+            # Glycan labels are the same text in either theme
+            flat = lambda op: dict(op, fill = False) if op['kind'] == 'path' else op
+            for op, other in zip(labels, dark_labels):
+                op['theme'] = theme.pair(flat(op), flat(other))
+        svg = _with_ids(_classed(c.to_svg(), c.ops) if themes else c.to_svg(), c.ops)
         # With glycan labels, the width the page needs without them, down to which annotate_figure can crop it
-        bare = ' data-width-unlabeled="%.2f"' % self._width_unlabeled() if labels else ''
-        page = '<rect width="%g" height="%g" fill="%s"%s />\n' % (self.width, self.height, self.pal.css('paper'), bare)
+        bare = ' data-width-unlabeled="%.2f"' % figure._width_unlabeled() if labels else ''
+        page = '<rect width="%g" height="%g" fill="%s"%s%s />\n' % (
+            figure.width, figure.height, figure.pal.css('paper'), bare, ' class="%s"' % paper if themes and paper
+            else '')
         svg = svg.replace('<g transform="matrix(', page + '<g transform="matrix(', 1)
         # Tells slate this is a figure, ahead of the gradients' long <defs> and through annotate_figure. It cannot be a
         # comment, as annotate_figure takes every comment and all that follows up to the next </g> for a label
         top = svg.index('\n', svg.index('<svg')) + 1
-        svg = svg[:top] + '<metadata>viscose</metadata>\n' + svg[top:]
-        return svg.replace('</svg>', _label_groups(c, labels, self.height) + '\n</svg>') if labels else svg
+        svg = svg[:top] + '<metadata>viscose</metadata>\n' + (theme.style() if themes else '') + svg[top:]
+        if labels:
+            svg = svg.replace('</svg>', _label_groups(c, labels, figure.height) + '\n</svg>')
+        if not themes:
+            return svg
+        if theme.grads:
+            # The dark theme's own gradients, beside the light one's, which svgout.emit wrote
+            svg = (svg.replace('</defs>', theme.defs() + '</defs>', 1) if '</defs>' in svg else
+                   svg.replace('<rect ', '<defs>%s</defs>\n<rect ' % theme.defs(), 1))
+        svg = svg.replace('<svg ', '<svg id="%s" ' % THEME_PREFIX, 1)
+        return svg.replace(THEME_PREFIX, 'vc%08x' % zlib.crc32(svg.encode()))
 
-    def save(self, path, dpi = 300.0, background = 'paper', press = None, source = None):
+    def save(self, path, dpi = 300.0, background = 'paper', press = None, source = None, themes = False):
         """Write the file format that the path's suffix names: png, pdf, or svg. `dpi` and `background` are for PNG, as
         PDF and SVG are vector on the palette's page. `press` makes a PDF a PDF/X-4 in that press's CMYK, and a PNG its
         soft proof (see to_pdf), which SVG, a screen format, has no place for. The file carries the figure's source, the
@@ -905,9 +1095,13 @@ class Figure:
         dark, or at a journal's column width, and anyone can read its numbers. A figure's source takes a few kB, and is
         written while the page draws. source = False leaves it out, as a PDF/X does, which is the page alone for print;
         a source past 64 kB that is larger than the rest of the file, such as of 100,000 points, stays out with a
-        warning, unless source = True."""
+        warning, unless source = True. themes = True makes an SVG follow its reader's light or dark mode (see
+        to_svg)."""
         path = Path(path)
         suffix = path.suffix.lower()
+        if themes and suffix != '.svg':
+            raise ValueError('Only an SVG carries both themes, as CSS; a PNG or a PDF is one page, so draw it in the '
+                             "palette's dark version for a dark one")
         if press and suffix == '.svg':
             raise ValueError('SVG is for screens and has no CMYK; for print, save a PDF with press, or a PNG for its '
                              'proof')
@@ -927,7 +1121,7 @@ class Figure:
                     data = data[:-12] + struct.pack('>I', len(carried[1])) + chunk + struct.pack(
                         '>I', zlib.crc32(chunk)) + data[-12:]
             else:
-                data = self.to_svg()
+                data = self.to_svg(themes)
                 carried, why = _carried(made, force, lambda: len(data))
                 if carried:
                     end = data.rindex('</svg>')
@@ -1352,7 +1546,8 @@ def open(file, palette = None, size = None, unit = 'in', functions = None):
     if 'order' in found:
         stub.row_order, stub.col_order = dec(found['order'])
     spec = head['palette']
-    if palette is None:
-        palette = (spec if isinstance(spec, str) else _named(spec['dark']).dark(spec['paper']) if 'dark' in spec else
-                   Palette(**{k: dec(v) for k, v in spec['settings'].items()}))
-    return stub.in_palette(palette)
+    # The palette it was drawn in, whose shades the calls may name by color, as in_palette carries them over
+    stub.pal = (_named(spec) if isinstance(spec, str) else _named(spec['dark']).dark(spec['paper']) if 'dark' in spec
+                else Palette(**{k: dec(v) for k, v in spec['settings'].items()}))
+    return stub.in_palette(stub.pal.name if palette is None and isinstance(spec, str) else
+                           stub.pal if palette is None else palette)

@@ -6,14 +6,17 @@ from io import BytesIO
 import numpy as np
 from glycorender import pdfwrite, raster
 from . import marks, text
-from .palettes import mix
+from .palettes import LC_TEXT, legible, mix
 
 
 # Past this many cells a heatmap is one image, as matplotlib's rasterized heatmaps are, not thousands of shapes
 HEAT_IMAGE_CELLS = 2500
 LEGEND_ROW = 16.0
 COLORBAR_WIDTH = 11.0
-LEGEND_SPOTS = ('below', 'right', 'upper left', 'upper right', 'lower left', 'lower right')
+LEGEND_SPOTS = ('direct', 'below', 'right', 'upper left', 'upper right', 'lower left', 'lower right')
+# A group of points is named at its middle only where this share of its points lies nearer its own middle than any other
+# group's, as the middle of groups that mingle names no place of theirs
+DIRECT_OWN = 0.7
 # Axis names shrink to fit their cell down to this size, and past it the page grows
 LABEL_MIN = 6.5
 # Brackets may stretch the y axis by up to this factor, which leaves the data at least this share of the height
@@ -182,7 +185,8 @@ def _spread_glyphs(placements, canvas, marks = (), ports = None, pad = 4.0, step
     pos, ends = P[:, :2].copy(), np.full((n, 2), np.nan)
     placed = np.zeros(n, dtype = bool)
     edge, radii = min(2.0, pad), np.zeros(n) if radii is None else np.asarray(radii, dtype = float)
-    soft = np.array(list(marks) + [(ax, ay, 150.0) for ax, ay in P[:, 4:6]], dtype = float).reshape(-1, 3)
+    soft = np.concatenate([np.asarray(marks, dtype = float).reshape(-1, 3),
+                           np.column_stack([P[:, 4:6], np.full(n, 150.0)])])
     grid_w, grid_h = int(cw * 3 / step) + 8, int(ch / step) + 8
     cover = np.zeros((grid_h + 1, grid_w + 1))
     inside = ((soft[:, 0] >= 0) & (soft[:, 1] >= 0) & (soft[:, 0] < (grid_w - 1) * step) &
@@ -393,6 +397,10 @@ class Axes:
         self.figure, self.pal = figure, pal
         self.artists, self.legend_items, self._legend_opts = [], [], None
         self._legend_size = None
+        # The artists each legend entry names, by its index, for naming them directly; where the legend's entries go
+        # once that is settled, those it still shows, and how far labels at line ends reach past the plot
+        self._sources, self._legend_fallback = {}, 'below'
+        self._legend_loc, self._legend_keep, self._direct_room, self._direct_spots = None, [], 0.0, (None, {})
         self._xlim, self._ylim = None, None
         self.xlabel, self.ylabel, self.title_text = '', '', ''
         self._title_fixed, self._title_pad = None, None
@@ -454,10 +462,13 @@ class Axes:
     def _add(self, kind, z, **kw):
         self.artists.append(dict(kind = kind, z = z, order = len(self.artists), **kw))
 
-    def _labeled(self, label, rgb, kind = 'patch', marker = 'o', area = 36.0):
-        """A legend entry; `marker` holds a point's shape, or a line's dash."""
+    def _labeled(self, label, rgb, kind = 'patch', marker = 'o', area = 36.0, source = None):
+        """A legend entry; `marker` holds a point's shape, or a line's dash, and `source` the artists it names, where a
+        label beside them can name them instead."""
         if label is not None and rgb is not None:
             self.legend_items.append((str(label), rgb, kind, marker, area))
+            if source:
+                self._sources[len(self.legend_items) - 1] = source
 
     # --- plotting ---
     def plot(self, x, y = None, color = None, lw = None, label = None, marker = False, alpha = 1.0, dash = None,
@@ -472,12 +483,13 @@ class Axes:
         rgb = self._next_color(color)
         self._add('line', z, x = x, y = y, rgb = rgb, lw = lw, alpha = alpha, dash = dash, clip = clip,
                   frac = y_fraction, offset = None if offset is None else np.asarray(offset, dtype = float))
+        line = self.artists[-1]
         if marker:
             marker = 'o' if marker is True else marker
             _check_marker(marker)
             self._add('points', z + 1, x = x, y = y, s = ms, rgb = rgb, alpha = alpha, marker = marker, edge = None,
                       gid = None)
-        self._labeled(label, rgb, 'line', dash)
+        self._labeled(label, rgb, 'line', dash, source = [line])
         return self
 
     def step(self, x, y, where = 'pre', color = None, lw = None, label = None, alpha = 1.0, dash = None, z = 4,
@@ -502,9 +514,11 @@ class Axes:
     def scatter(self, x, y, s = 30, color = None, c = None, label = None, alpha = 1.0, cmap = 'sequential', vmin = None,
                 vmax = None, z = 3, marker = 'o', edge = None, gid = None, hue = None, style = None, size = None,
                 sizes = (20.0, 160.0), colors = None, markers = None, hue_label = None, style_label = None,
-                size_label = None, legend = 'right', names = None, rasterized = False, density = True):
+                size_label = None, legend = 'direct', names = None, rasterized = False, density = True):
         """Points, as in seaborn's scatterplot. `hue`, `style`, and `size` hold one value per point and map to color,
-        marker shape, and area, with a legend. Numeric `hue` with many values, or `c`, maps through a palette scale;
+        marker shape, and area. Each color's points are named in its color at their middle, where they hold together
+        apart from the others, and the rest in a legend at the right, or all of it in a legend at `legend`, a legend's
+        place. Numeric `hue` with many values, or `c`, maps through a palette scale;
         call `colorbar` to show it. `colors` and `markers` are lists or {value: name} dicts. `edge` is (color, width),
         which with color = 'none' draws hollow rings. `names` holds one label per point, which draws nothing but tells a
         viewer such as slate what the point under the mouse is. `rasterized` makes all the points one image in PDF and
@@ -531,7 +545,7 @@ class Axes:
             rgb = self._next_color(color)
             self._add('points', z, x = x, y = y, s = s, rgb = rgb, alpha = alpha, marker = marker, edge = edge,
                       gid = gid, names = names, raster = raster, crowd = crowd)
-            self._labeled(label, rgb, 'point', marker)
+            self._labeled(label, rgb, 'point', marker, source = [self.artists[-1]])
             return self
         n = len(x)
         if c is not None:
@@ -578,6 +592,7 @@ class Axes:
                 steps = np.linspace(sizes[0], sizes[1], max(len(kinds), 2))
                 area = np.array([steps[kinds.index(str(u))] for u in size], dtype = float)
                 size_key = [(k, float(steps[i])) for i, k in enumerate(kinds)]
+        by_hue = {}
         for h in hue_levels:
             for st in style_levels:
                 m = (hues == h) & (styles == st)
@@ -591,13 +606,14 @@ class Axes:
                                   marker = style_marker[st], edge = edge, gid = gid,
                                   names = None if names is None else names[chosen], raster = raster, crowd = crowd,
                                   mapped = c is not None)
+                        by_hue.setdefault(h, []).append(self.artists[-1])
         sections = (hue is not None) + (style is not None) + (size is not None)
         plain = self.pal.color(self.pal.muted) if hue is not None else hue_rgb['']
         if hue is not None:
             if sections > 1:
                 self.legend_items.append((hue_label or 'Color', None, 'header', 'o', 0.0))
             for h in hue_levels:
-                self._labeled(h, hue_rgb[h], 'point', marker)
+                self._labeled(h, hue_rgb[h], 'point', marker, source = by_hue.get(h))
         if style is not None:
             if sections > 1:
                 self.legend_items.append((style_label or 'Shape', None, 'header', 'o', 0.0))
@@ -610,6 +626,7 @@ class Axes:
                 self._labeled(name, plain, 'point', marker, a)
         if legend and sections:
             self.legend('right' if legend is True else legend)
+            self._legend_fallback = 'right'
         return self
 
     def bar(self, x, height, width = None, bottom = 0.0, color = None, label = None, alpha = 1.0, stacked = False,
@@ -623,7 +640,7 @@ class Axes:
         cols = [self.pal.color(k) for k in color] if isinstance(color, list) else [self._next_color(color)] * len(x)
         self._add('bars', z, x = x, h = h, b = b, w = width, rgb = cols, alpha = alpha, horizontal = False,
                   stacked = stacked)
-        self._labeled(label, cols[0] if cols else None)
+        self._labeled(label, cols[0] if cols else None, source = [self.artists[-1]] if stacked else None)
         return self
 
     def barh(self, y, width, height = None, left = 0.0, color = None, label = None, alpha = 1.0, stacked = False,
@@ -657,8 +674,12 @@ class Axes:
         `frequency` gives counts per unit of x."""
         x = np.asarray(x, dtype = float)
         counts, edges = np.histogram(x[np.isfinite(x)], bins = bins, density = density)
+        n = len(self.legend_items)
         self.bar(edges[:-1] + np.diff(edges) / 2, counts / np.diff(edges) if frequency else counts,
                  width = np.diff(edges) * 0.94, color = color, label = label, alpha = alpha)
+        # Named over its highest bar
+        if len(self.legend_items) > n:
+            self._sources[n] = [self.artists[-1]]
         return self
 
     def fill_between(self, x, y1, y2 = 0.0, color = None, alpha = 0.22, label = None, z = 2):
@@ -668,7 +689,7 @@ class Axes:
         y2 = np.broadcast_to(np.asarray(y2, dtype = float), x.shape)
         rgb = self._next_color(color)
         self._add('band', z, x = x, y1 = y1, y2 = y2, rgb = rgb, alpha = alpha)
-        self._labeled(label, rgb)
+        self._labeled(label, rgb, source = [self.artists[-1]])
         return self
 
     def contour(self, x, y, values, levels = 5, color = 'muted', lw = 0.7, alpha = 1.0, dash = None, label = None,
@@ -1007,12 +1028,12 @@ class Axes:
 
     def axhline(self, y = 0.0, color = 'muted', lw = 0.8, dash = (1, 3), label = None, z = 1):
         self._add('hline', z, v = float(y), rgb = self.pal.color(color), lw = lw, dash = dash)
-        self._labeled(label, self.pal.color(color), 'line', dash)
+        self._labeled(label, self.pal.color(color), 'line', dash, source = [self.artists[-1]])
         return self
 
     def axvline(self, x = 0.0, color = 'muted', lw = 0.8, dash = (1, 3), label = None, z = 1):
         self._add('vline', z, v = float(x), rgb = self.pal.color(color), lw = lw, dash = dash)
-        self._labeled(label, self.pal.color(color), 'line', dash)
+        self._labeled(label, self.pal.color(color), 'line', dash, source = [self.artists[-1]])
         return self
 
     def heatmap(self, data, xticklabels = None, yticklabels = None, cmap = 'diverging', vmin = None, vmax = None,
@@ -1312,13 +1333,19 @@ class Axes:
         self.grid_on = on
         return self
 
-    def legend(self, loc = 'below', glyphs = None):
-        """Show a legend: below or right of the axes, or inside at upper left, upper right, lower left, or lower
-        right. `glyphs` draws its entries' names as glyphs where it can, such as 'glycan' (see tick_params)."""
+    def legend(self, loc = 'direct', glyphs = None):
+        """Name what the plot shows. By default directly, each label in its series' color beside what it names: at a
+        line's or a band's right end, moving apart as little as it takes, with a hairline to each one that moved; at
+        the middle of a group of points, wherever the groups hold together, on the free spot nearest it; over a
+        histogram's highest bar; at the right of stacked bars; and along reference lines. Whatever has no such place
+        goes into a legend below the axes. A place, below or right of the axes, or inside at upper left, upper right,
+        lower left, or lower right, puts everything into one legend there. `glyphs` draws the entries' names as glyphs
+        where it can, such as 'glycan' (see tick_params), in a legend."""
         # Any other name would quietly land at the lower left
         if loc not in LEGEND_SPOTS:
             raise ValueError(f"A legend's place has to be one of {', '.join(LEGEND_SPOTS)}, got {loc!r}")
         self._legend_opts, self._legend_glyphs = loc, text.check_glyphs(glyphs)
+        self._legend_fallback = 'below'
         return self
 
     def off(self):
@@ -1338,6 +1365,7 @@ class Axes:
 
     def _boxes(self, skip):
         """boxes(), without the artists whose ids are in `skip`."""
+        # Single boxes as rows, and those of many points or line pieces as arrays, which stay arrays, all in order
         pal, out = self.pal, []
         x0, y0, w, h = self.rect
         lo_x, hi_x = sorted(self.xlim)
@@ -1354,7 +1382,7 @@ class Axes:
                 r = np.sqrt(np.maximum(area, 0) * pal.point_scale) / 2
                 r = r[keep] + (a['edge'][1] / 2 if a['edge'] else 0.0)
                 px, py = self._tx(x[keep]), self._ty(y[keep])
-                out += list(np.column_stack([px - r, py - r, px + r, py + r]))
+                out.append(np.column_stack([px - r, py - r, px + r, py + r]))
             elif k == 'line':
                 px, py = self._tx(a['x']), y0 + a['y'] * h if a['frac'] else self._ty(a['y'])
                 if a['offset'] is not None:
@@ -1424,6 +1452,9 @@ class Axes:
             elif k == 'text' and not a['rotation'] and math.isfinite(a['x'] + a['y']):
                 px = x0 + a['x'] * w if a['frac'] else float(self._tx(a['x']))
                 py = y0 + a['y'] * h if a['frac'] else float(self._ty(a['y']))
+                if a.get('direct') in ('cloud', 'peak'):
+                    with text.family(pal.font):
+                        px, py = self._place_direct().get(id(a), (px, py))
                 size, bold = a['size'] or pal.tick_size, pal.text_bold if a['bold'] is None else a['bold']
                 lines = str(a['s']).split('\n')
                 # As text.draw sets them: the block's lift, then each line's baseline and its glyphs' reach
@@ -1432,7 +1463,7 @@ class Axes:
                          'bottom': 0.22 * size}[a['va']]
                 with text.family(pal.font):
                     for i, line in enumerate(lines):
-                        tw = text.width(line, size, bold)
+                        tw = text.width(line, size, bold, a.get('tracking', 0.0))
                         ha = a.get('_ha', a['ha'])
                         left = px + a.get('_dx', a['dx']) - {'left': 0.0, 'center': tw / 2, 'right': tw}[ha]
                         base = py + a['dy'] - (i - lift) * size * a['linespacing'] + shift
@@ -1442,8 +1473,8 @@ class Axes:
                 if np.isfinite([xa, ya, xb, yb]).all():
                     t = np.linspace(0.0, 1.0, max(2, int(math.hypot(xb - xa, yb - ya)) + 1))
                     sx, sy = xa + t * (xb - xa), ya + t * (yb - ya)
-                    out += list(np.column_stack([sx - lw / 2, sy - lw / 2, sx + lw / 2, sy + lw / 2]))
-        return np.array(out, dtype = float).reshape(-1, 4)
+                    out.append(np.column_stack([sx - lw / 2, sy - lw / 2, sx + lw / 2, sy + lw / 2]))
+        return np.concatenate([np.reshape(np.asarray(v, dtype = float), (-1, 4)) for v in out] + [np.zeros((0, 4))])
 
     def get_xlim(self):
         """The x limits as drawn, whether set or automatic."""
@@ -1522,7 +1553,7 @@ class Axes:
                 sticky.extend(np.unique(a['b']).tolist())
             elif k == 'hline' and axis == 'y' or k == 'vline' and axis == 'x':
                 vals = np.array([a['v']])
-            elif k == 'text' and not a['frac']:
+            elif k == 'text' and not a['frac'] and not a.get('direct'):
                 vals = np.array([a[axis]])
             elif k == 'bracket' and axis == 'x':
                 vals = np.array([a['x0'], a['x1']])
@@ -1595,6 +1626,102 @@ class Axes:
         self._range()
         self._ticks('x')
         self._ticks('y')
+        self._direct()
+
+    def _direct(self):
+        """Labels that name what the legend's entries name, beside it, for the limits as they stand, as text artists
+        made anew at each layout, and the entries a legend still shows: those with no such place, and the headers of
+        their sections."""
+        self.artists = [a for a in self.artists if not a.get('direct')]
+        items, self._direct_room, self._direct_spots = self.legend_items, 0.0, (None, {})
+        self._legend_keep, self._legend_loc = list(range(len(items))), self._legend_opts
+        if self._legend_opts != 'direct':
+            return
+        pal, k = self.pal, self.pal.spacing
+        size, track, _ = self._legend_entries(())
+        fx, fy = self._xwarp[0], self._ywarp[0]
+        # Where on the axes a value lies, from 0 at the left or bottom to 1 at the right or top, however turned
+        across = lambda v, f, lim: (f(np.asarray(v, dtype = float)) - f(np.float64(lim[0]))) / (
+            f(np.float64(lim[1])) - f(np.float64(lim[0])))
+        seen = lambda x, y: (np.isfinite(across(x, fx, self.xlim)) & np.isfinite(across(y, fy, self.ylim)) &
+                             (across(x, fx, self.xlim) >= 0) & (across(x, fx, self.xlim) <= 1) &
+                             (across(y, fy, self.ylim) >= 0) & (across(y, fy, self.ylim) <= 1))
+        clouds, made = {}, []
+        for i, (s, rgb, kind, marker, area) in enumerate(items):
+            source = self._sources.get(i)
+            if not source or self._legend_glyphs or self._yright:
+                continue
+            a = source[0]
+            spot = None
+            if a['kind'] == 'line' and a['clip'] and not a['frac'] and a['offset'] is None:
+                ok = seen(a['x'], a['y']) & (a['x'] > 0 if self._xscale == 'log' else True) & (
+                    a['y'] > 0 if self._yscale == 'log' else True)
+                if ok.any():
+                    j = np.flatnonzero(ok)[np.argmax(across(a['x'][ok], fx, self.xlim))]
+                    # Clear of the line's own width and of a marker at its end
+                    lw = pal.line_width if a['lw'] is None else a['lw']
+                    spot = ('end', a['x'][j], a['y'][j], lw / 2 + 4.0 * k)
+            elif a['kind'] == 'band':
+                mid = (np.asarray(a['y1'], dtype = float) + np.asarray(a['y2'], dtype = float)) / 2
+                ok = seen(a['x'], mid)
+                if ok.any():
+                    j = np.flatnonzero(ok)[np.argmax(across(np.asarray(a['x'])[ok], fx, self.xlim))]
+                    spot = ('end', a['x'][j], mid[j], 4.0 * k)
+            elif a['kind'] == 'hline' and seen(self.xlim[1], a['v']):
+                spot = ('end', self.xlim[1], a['v'], 4.0 * k)
+            elif a['kind'] == 'vline' and seen(a['v'], self.ylim[1]):
+                spot = ('top', a['v'], self.ylim[1], a['lw'] / 2 + 3.0 * k)
+            elif a['kind'] == 'bars' and a['stacked'] and not a['horizontal']:
+                top = np.asarray(a['b']) + np.asarray(a['h']) / 2
+                ok = seen(a['x'], top) & (np.asarray(a['h']) != 0)
+                if ok.any():
+                    j = np.flatnonzero(ok)[np.argmax(across(np.asarray(a['x'])[ok], fx, self.xlim))]
+                    spot = ('end', a['x'][j] + a['w'][j] / 2, top[j], 4.0 * k)
+            elif a['kind'] == 'bars' and not a['horizontal']:
+                tops = np.asarray(a['b']) + np.asarray(a['h'])
+                ok = seen(a['x'], tops)
+                if ok.any():
+                    j = np.flatnonzero(ok)[np.argmax(across(tops[ok], fy, self.ylim))]
+                    spot = ('peak', a['x'][j], tops[j], 0.0)
+            elif a['kind'] == 'points' and not a.get('mapped'):
+                xs = np.concatenate([np.atleast_1d(b['x']) for b in source])
+                ys = np.concatenate([np.atleast_1d(b['y']) for b in source])
+                ok = seen(xs, ys)
+                if ok.any():
+                    u, v = across(xs[ok], fx, self.xlim), across(ys[ok], fy, self.ylim)
+                    clouds[i] = np.column_stack([u, v])
+                    mx, my = float(np.median(u)), float(np.median(v))
+                    # The middle on the axes as drawn, back in data
+                    back = lambda t, warp, lim: float(warp[1](np.array([warp[0](np.float64(lim[0])) + t * (
+                        warp[0](np.float64(lim[1])) - warp[0](np.float64(lim[0])))]))[0])
+                    spot = ('cloud', back(mx, self._xwarp, self.xlim), back(my, self._ywarp, self.ylim), 0.0)
+            if spot is not None:
+                made.append((i, spot))
+        # Groups of points that mingle have no middle of their own, so all of them keep the legend
+        if len(clouds) > 1:
+            middles = np.array([np.median(c, axis = 0) for c in clouds.values()])
+            for n, c in enumerate(clouds.values()):
+                near = np.argmin(((c[:, None, :] - middles[None]) ** 2).sum(-1), axis = 1)
+                if (near == n).mean() < DIRECT_OWN:
+                    made = [(i, spot) for i, spot in made if i not in clouds]
+                    break
+        for i, (where, x, y, gap) in made:
+            # Groups' names stand centered where _place_direct puts them, and the others start beside their mark
+            ha, gap = ('center', 0.0) if where in ('cloud', 'peak') else ('left', gap)
+            self.artists.append(dict(
+                kind = 'text', z = 20, order = 10 ** 9 + i, x = float(x), y = float(y),
+                s = text.spaced(pal, items[i][0]), size = size, rgb = items[i][1], bold = pal.text_bold, ha = ha,
+                va = 'top' if where == 'top' else 'center', rotation = 0.0, halo = 2.6 * k, dx = gap,
+                dy = -2.0 * k if where == 'top' else 0.0, frac = False, tag = False, clip = False,
+                spread = where == 'end', linespacing = 1.25, placed = True, glyph = None, tracking = track,
+                direct = where, _ha = ha, _dx = gap))
+        named = {i for i, _ in made}
+        keep = [i for i in range(len(items)) if i not in named]
+        # A header stays with the entries of its section that the legend still shows
+        heads = [i for i in keep if items[i][2] == 'header']
+        self._legend_keep = [i for i in keep if items[i][2] != 'header' or any(
+            j > i and items[j][2] != 'header' and not any(i < h < j for h in heads) for j in keep)]
+        self._legend_loc = self._legend_fallback if self._legend_keep else None
 
     def _ticks(self, axis):
         """An axis's ticks and their labels, for its limits as they stand."""
@@ -1689,24 +1816,30 @@ class Axes:
         maker = self._tick_opts[axis].get('glyphs')
         return text.glyph(maker, s, axis == 'x' and bool(self.xrot)) if maker else None
 
+    @property
+    def _cut(self):
+        """Whether glyphs take the room of a sticker's cut: on a dark page, and on a light one laid out with its dark
+        version, as an SVG of both themes has one page for both."""
+        return self.pal.is_dark or getattr(self.figure, '_stickers', False)
+
     def _glyph_extent(self, axis, g):
         """A tick label's glyph's (left, bottom, right, top) around its tick on the page, as drawn: its symbols as tall
         as the labels' type, by how far they shrank, and cut out as a sticker on a dark page."""
         size = self._tick_sizes()['xy'.index(axis)]
-        return g.extent(size * text.GLYPH_SYMBOL * self._gscale[axis], self.pal.is_dark)
+        return g.extent(size * text.GLYPH_SYMBOL * self._gscale[axis], self._cut)
 
     def _note(self, a):
-        """A text artist's glyph, its points per symbol, and whether it is cut out, as a halo or a sticker on a dark
-        page; no glyph where it stays text."""
+        """A text artist's glyph, its points per symbol, and whether it takes the room of a cut, a halo or a sticker
+        on a dark page; no glyph where it stays text."""
         g = text.glyph(a['glyph'], a['s']) if a.get('glyph') else None
-        return g, (a['size'] or self.pal.tick_size) * text.GLYPH_SYMBOL, self.pal.is_dark or a['halo'] > 0
+        return g, (a['size'] or self.pal.tick_size) * text.GLYPH_SYMBOL, self._cut or a['halo'] > 0
 
     def _note_size(self, a):
         """A text artist's width on the page, and a glyph's (left, bottom, right, top) around its anchor, or None."""
         g, pts, cut = self._note(a)
         if g is None:
             return text.width(a['s'], a['size'] or self.pal.tick_size,
-                              self.pal.text_bold if a['bold'] is None else a['bold']), None
+                              self.pal.text_bold if a['bold'] is None else a['bold'], a.get('tracking', 0.0)), None
         box = g.extent(pts, cut)
         return box[2] - box[0], box
 
@@ -1780,6 +1913,54 @@ class Axes:
         self._glyph_spots = (key, spots)
         return spots
 
+    def _place_direct(self):
+        """Where labels that name groups of points or a histogram go, as {id: (x, y)}, the middle of their line on the
+        page: each at the free spot nearest the middle of its group, or over its highest bar, by `_spread_glyphs`, clear
+        of each other, of the other groups' middles, and of as many marks as it can. Kept for the page as laid out."""
+        x0, y0, w, h = self.rect
+        key = (self.rect, tuple(self.xlim), tuple(self.ylim))
+        if self._direct_spots[0] == key:
+            return self._direct_spots[1]
+        notes = [a for a in self.artists if a.get('direct') in ('cloud', 'peak')]
+        spots, top, k = {}, y0 + h, self.pal.spacing
+        if notes:
+            own = {id(a) for a in notes}
+            points = {id(a) for a in self.artists if a['kind'] == 'points'}
+            # A label had rather move off its group than hide its points, so a point weighs more than for a glyph,
+            # however small it is drawn
+            dots = self._boxes({id(a) for a in self.artists if id(a) not in points})
+            dots = np.column_stack([(dots[:, 0] + dots[:, 2]) / 2 - x0, top - (dots[:, 1] + dots[:, 3]) / 2,
+                                    np.full(len(dots), 40.0)])
+            marks = []
+            for l, b, r, t in self._boxes(own | points):
+                if r - l > 3.0 and t - b > 3.0 and max(r - l, t - b) <= 24.0:
+                    marks.append(((l + r) / 2 - x0, top - (b + t) / 2, 40.0))
+                elif max(r - l, t - b) <= 24.0:
+                    marks.append(((l + r) / 2 - x0, top - (b + t) / 2, 0.25))
+                else:
+                    marks += [(u - x0, top - v, 3.0) for u in np.arange(l, r, 6.0) for v in np.arange(b, t, 6.0)]
+            # Text already on the plot, such as a reference line's label, is no place for a label at all, nor right
+            # beside it, where the two would read as one
+            for l, b, r, t in self._boxes({id(a) for a in self.artists if a['kind'] != 'text' or id(a) in own}):
+                em = notes[0]['size']
+                marks += [(u - x0, top - v, 150.0) for u in np.arange(l - 2.0 * em, r + 2.0 * em + 3.0, 3.0)
+                          for v in np.arange(b - 0.3 * em, t + 0.3 * em + 3.0, 3.0)]
+            placements = []
+            for a in notes:
+                tw, size = self._note_size(a)[0], a['size']
+                bh = (text.CAP_HEIGHT + 0.22) * size
+                px, py = float(self._tx(a['x'])), float(self._ty(a['y']))
+                # Over its middle, or standing on its bar
+                lift = bh / 2 + 3.0 * k if a['direct'] == 'peak' else 0.0
+                placements.append((px - tw / 2 - x0, top - (py + lift + bh / 2), tw, bh, px - x0, top - py))
+            corners, _, _ = _spread_glyphs(placements, (w, h), np.concatenate([dots, np.reshape(marks, (-1, 3))]),
+                                           pad = 3.0 * k)
+            for a, (cx, cy), (_, _, tw, bh, _, _) in zip(notes, corners, placements):
+                # The line's middle, as va = 'center' sets it, a little above the box's middle for the descenders
+                spots[id(a)] = (cx + x0 + tw / 2, top - cy - bh + 0.22 * a['size'] + text.CAP_HEIGHT * a['size'] / 2)
+        self._direct_spots = (key, spots)
+        return spots
+
     def _ytick_width(self, s, size):
         g = self._tick_glyph('y', s)
         if g is None:
@@ -1831,7 +2012,7 @@ class Axes:
             if g is None:
                 reach.append((0.6 * size, 0.6 * size))
                 continue
-            left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL * text.GLYPH_MIN, self.pal.is_dark)
+            left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL * text.GLYPH_MIN, self._cut)
             low, high = (bottom, top) if axis == 'y' else (left, right) if self.xrot else ((left - right) / 2,
                                                                                           (right - left) / 2)
             reach.append((-low, high))
@@ -1864,7 +2045,7 @@ class Axes:
                     half = text.width(s, size, pal.tick_bold) / 2 if axis == 'x' and not turned else 0.6 * size
                     reach.append((0.0, 0.0, half, half))
                     continue
-                left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL, pal.is_dark)
+                left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL, self._cut)
                 reach.append((-bottom, top, 0.0, 0.0) if axis == 'y' else (-left, right, 0.0, 0.0) if turned else
                              ((right - left) / 2, (right - left) / 2, 0.0, 0.0))
             share, need, least, step = math.inf, 0.0, math.inf, self._gcols if axis == 'y' else 1
@@ -1985,24 +2166,26 @@ class Axes:
         if self.title_text:
             pad = 8.0 * k if self._title_pad is None else self._title_pad
             top += 13.0 * k + pad + 1.25 * self._title_size() * _extra_lines(self.title_text)
-        if self.legend_items and self._legend_opts in ('below', 'right'):
+        if self._legend_keep and self._legend_loc in ('below', 'right'):
             tw, th = self._legend_size or self._legend_natural()
-            if self._legend_opts == 'below':
+            if self._legend_loc == 'below':
                 bottom += th + 8.0 * k
             else:
                 right += tw + 18.0 * k
+        # Labels at line ends reach past the plot on its right, ahead of a legend or a color bar there
+        right += self._direct_room
         if self._cbar and self._cbar['loc'] == 'right':
             right += self._colorbar_width()
         return left, right, bottom, top
 
-    def _legend_entries(self):
+    def _legend_entries(self, items = None):
         """Each item's text size, tracking, shown text, width, glyph or None, and how much taller than a row it is, in
-        legend order."""
+        legend order: of the items the legend shows, or of `items`."""
         pal = self.pal
         size = 7.4 * pal.spacing if pal.caps else pal.tick_size - 0.5 * pal.spacing
         track = 0.7 if pal.caps else 0.0
         out = []
-        for s, rgb, kind, marker, area in self.legend_items:
+        for s, rgb, kind, marker, area in [self.legend_items[i] for i in self._legend_keep] if items is None else items:
             # Its rows are of one height, but where a glyph needs more
             shown = text.spaced(pal, s).replace('\n', ' ')
             header = kind == 'header'
@@ -2011,7 +2194,7 @@ class Axes:
                 out.append((shown, rgb, kind, marker, area, text.width(shown, size, pal.text_bold or header, track)
                             + (0.0 if header else 18.0 * pal.spacing), None, 0.0))
                 continue
-            left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL, self._legend_cut() is not None)
+            left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL, self._legend_cut() is not None or self._cut)
             out.append((shown, rgb, kind, marker, area, right - left + 18.0 * pal.spacing, g,
                         max(0.0, top - bottom + 4.0 * pal.spacing - LEGEND_ROW * pal.spacing)))
         return size, track, out
@@ -2021,13 +2204,13 @@ class Axes:
         halo inside the axes, or None."""
         if self.pal.is_dark:
             return 1.0, 1.0, 1.0
-        return None if self._legend_opts in ('right', 'below') else self.pal.color('paper')
+        return None if self._legend_loc in ('right', 'below') else self.pal.color('paper')
 
     def _legend_natural(self):
         """Legend size before the axes are placed: one row or one column."""
         _, _, entries = self._legend_entries()
         widths, row, extra = [e[5] for e in entries], LEGEND_ROW * self.pal.spacing, [e[7] for e in entries]
-        return ((max(widths), row * len(widths) + sum(extra)) if self._legend_opts == 'right' else
+        return ((max(widths), row * len(widths) + sum(extra)) if self._legend_loc == 'right' else
                 (sum(widths), row + max(extra)))
 
     def _legend_grid(self):
@@ -2037,7 +2220,7 @@ class Axes:
         _, _, entries = self._legend_entries()
         widths, k, extra = [e[5] for e in entries], self.pal.spacing, [e[7] for e in entries]
         row = LEGEND_ROW * k
-        if self._legend_opts == 'below':
+        if self._legend_loc == 'below':
             spots, lines, x, y = [], [0.0], 0.0, 0.0
             for v, more in zip(widths, extra):
                 if x and x + v > w:
@@ -2049,8 +2232,8 @@ class Axes:
             # A line takes what its tallest glyph adds, and those above it push it down
             spots = [(x, y + sum(lines[:n]) + lines[n] / 2) for x, y, n in spots]
             return spots, (w if y else sum(widths) + 14.0 * k * (len(widths) - 1), y + row + sum(lines))
-        per = max(1, int(h // row)) if self._legend_opts == 'right' else len(widths)
-        tall = any(extra) and self._legend_opts == 'right'
+        per = max(1, int(h // row)) if self._legend_loc == 'right' else len(widths)
+        tall = any(extra) and self._legend_loc == 'right'
         spots, offset, total_h, start = [], 0.0, 0.0, 0
         while start < len(widths):
             end = start + 1
@@ -2091,11 +2274,17 @@ class Axes:
                 k = int(math.ceil(sy * 1.05 / gap))
                 self.yticks, self.ylabels = self.yticks[::k], self.ylabels[::k]
                 changed = True
-        if self.legend_items and self._legend_opts:
+        if self._legend_keep and self._legend_loc:
             size = self._legend_grid()[1]
             if self._legend_size is None or max(abs(u - v) for u, v in zip(size, self._legend_size)) > 0.5:
                 self._legend_size = size
                 changed = True
+        # Labels at line ends take the room they reach past the plot's right
+        room = max([float(self._tx(a['x'])) + a['dx'] + self._note_size(a)[0] - self.rect[0] - self.rect[2]
+                    for a in self.artists if a.get('direct') == 'end'] + [0.0])
+        if abs(room - self._direct_room) > 0.5:
+            self._direct_room = room
+            changed = True
         page = self.figure.width
         over = [0.0, 0.0]
         # What the right side lacks for all but glycan labels, whose drawings replace them, for Figure._width_unlabeled
@@ -2105,7 +2294,7 @@ class Axes:
             self._over_plain = over[1]
         for a in self.artists:
             if (a['kind'] != 'text' or a['rotation'] or a['frac'] or a['ha'] == 'center' or not math.isfinite(a['x'])
-                    or a['spread'] and a.get('glyph')):
+                    or a['spread'] and a.get('glyph') or a.get('direct')):
                 continue
             tw = self._note_size(a)[0]
             px, gap = float(self._tx(a['x'])), abs(a['dx']) + 3.0
@@ -2894,10 +3083,11 @@ class Axes:
                 gx, gy, leader, pts = spots[id(a)]
                 if leader:
                     marks.polyline(c, leader[::2], leader[1::2], a['rgb'], 0.5 * pal.spacing, 0.6, cap = 0)
-                g, _, cut = self._note(a)
-                text.draw_glyph(c, g, gx, gy, pts, (1.0, 1.0, 1.0) if pal.is_dark else pal.color('paper') if cut else
-                                None)
+                text.draw_glyph(c, self._note(a)[0], gx, gy, pts, (1.0, 1.0, 1.0) if pal.is_dark else
+                                pal.color('paper') if a['halo'] > 0 else None)
                 continue
+            if a.get('direct') in ('cloud', 'peak'):
+                px, py = self._place_direct()[id(a)]
             ty, gap = placed.get(id(a), (py + a['dy'], 0.0))
             # Only a spread label that had to move gets a leader
             if id(a) in placed and abs(ty - py - a['dy']) > 0.3 * gap:
@@ -2911,13 +3101,16 @@ class Axes:
                 gx = px + a['_dx'] - {'left': left, 'center': (left + right) / 2, 'right': right}[a['_ha']]
                 # Its root level with the point, or its edge at it
                 gy = ty - {'top': top, 'bottom': bottom, 'baseline': bottom}.get(a['va'], 0.0)
-                text.draw_glyph(c, g, gx, gy, pts, (1.0, 1.0, 1.0) if pal.is_dark else pal.color('paper') if cut else
-                                None)
+                text.draw_glyph(c, g, gx, gy, pts, (1.0, 1.0, 1.0) if pal.is_dark else pal.color('paper') if
+                                a['halo'] > 0 else None)
                 continue
             n = len(c.ops)
-            text.draw(c, px + a['_dx'], ty, a['s'], a['size'] or size, a['rgb'], bold, ha = a['_ha'],
+            # A label that names a series takes its color, as dark or light as text must be to read
+            rgb = (legible(a['rgb'], pal.color('paper'), LC_TEXT) if a.get('direct') and self.figure.legible else
+                   a['rgb'])
+            text.draw(c, px + a['_dx'], ty, a['s'], a['size'] or size, rgb, bold, ha = a['_ha'],
                       va = a['va'], rotation = a['rotation'], halo = a['halo'], halo_color = pal.color('paper'),
-                      linespacing = a['linespacing'])
+                      linespacing = a['linespacing'], tracking = a.get('tracking', 0.0))
             if a['tag']:
                 for op in c.ops[n:]:
                     op['label'] = (a['order'], id(self), a['s'])
@@ -2952,7 +3145,7 @@ class Axes:
                 text.draw(c, x0, by + bh + 4.0 * k, text.spaced(pal, label), (7.8 if pal.caps else 8.6) * k, ink,
                           ha = 'left')
             return
-        right += self._legend_grid()[1][0] + 18.0 * k if self.legend_items and self._legend_opts == 'right' else 0.0
+        right += self._legend_grid()[1][0] + 18.0 * k if self._legend_keep and self._legend_loc == 'right' else 0.0
         bx = x0 + w + right + 12.0 * k
         bh = min(h * 0.6, 170.0 * k)
         by = y0 + h - bh
@@ -2974,13 +3167,13 @@ class Axes:
 
     def _draw_legend(self, c, right):
         pal = self.pal
-        if not self.legend_items or self._legend_opts is None:
+        if not self._legend_keep or self._legend_loc is None:
             return
         u, row = pal.spacing, LEGEND_ROW * pal.spacing
         x0, y0, w, h = self.rect
         size, track, entries = self._legend_entries()
         spots, (tw, th) = self._legend_grid()
-        loc = self._legend_opts
+        loc = self._legend_loc
         if loc == 'right':
             left, top = x0 + w + right + 16.0 * u, y0 + h - 8.0 * u
         elif loc == 'below':
@@ -3005,7 +3198,7 @@ class Axes:
                 marks.polygon(c, [x, x + 12.0 * u, x + 12.0 * u, x], [lo, lo, hi, hi], rgb)
             if g is not None:
                 cut = self._legend_cut()
-                gl, gb, _, gt = g.extent(size * text.GLYPH_SYMBOL, cut is not None)
+                gl, gb, _, gt = g.extent(size * text.GLYPH_SYMBOL, cut is not None or self._cut)
                 text.draw_glyph(c, g, x + 17.0 * u - gl, y - (gb + gt) / 2, size * text.GLYPH_SYMBOL, cut)
                 continue
             text.draw(c, x + 17.0 * u, y, s, size, pal.color(pal.ink), pal.text_bold, va = 'center', tracking = track,

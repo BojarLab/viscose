@@ -148,6 +148,28 @@ def markers():
     return fig
 
 
+def labels(palette):
+    """Every series named where it is: at the ends of lines, beside groups of points, and right of stacked bars."""
+    rng = np.random.default_rng(11)
+    fig, axes = vc.subplots(1, 3, figsize = (15, 4.6), palette = palette)
+    t = np.linspace(0, 48, 49)
+    for name, rate, top in [('Wild type', 0.11, 1.0), ('ΔFUT8', 0.09, 0.94), ('ST6GAL1 KO', 0.06, 0.72),
+                            ('MGAT5 KO', 0.035, 0.55)]:
+        axes[0].plot(t, top * (1 - np.exp(-rate * t)) + rng.normal(0, 0.006, t.size), label = name)
+    axes[0].axhline(0.5, label = 'Half-maximal')
+    axes[0].set(xlabel = 'Time (h)', ylabel = 'Sialylation', title = 'Cell lines')
+    axes[0].legend()
+    centers = {'Plasma': (-3, 1), 'Liver': (2, 4), 'Colon': (3, -2), 'Brain': (-1, -4)}
+    xy = np.concatenate([rng.normal(c, 0.9, (90, 2)) for c in centers.values()])
+    axes[1].scatter(*xy.T, hue = np.repeat(list(centers), 90), s = 16)
+    axes[1].set(xlabel = 'UMAP 1', ylabel = 'UMAP 2', title = 'Tissues')
+    axes[2].stacked_bar(['Healthy', 'Adenoma', 'Carcinoma'], [[38, 30, 22, 10], [30, 31, 25, 14], [21, 30, 31, 18]],
+                        labels = ['High-mannose', 'Complex', 'Hybrid', 'Paucimannose'], colors = fig.pal.groups(3, 1))
+    axes[2].set(ylabel = 'Share (%)', title = 'N-glycan classes')
+    axes[2].legend()
+    return fig
+
+
 def crowd(density):
     """100,000 cells from two populations, as points alone or with the field that takes over where they pile up."""
     rng = np.random.default_rng(3)
@@ -178,6 +200,9 @@ if __name__ == '__main__':
     arrange([[fit(Image.open(BytesIO(gallery.groups('lumen').to_png(200))).convert('RGB'), 1400, 840)]], 'groups.png')
     arrange([[fit(Image.open(BytesIO(gallery.subgroups('couture').to_png(200))).convert('RGB'), 1400, 840)]],
             'subgroups.png')
+    arrange([[fit(Image.open(BytesIO(labels('lumen').to_png(200))).convert('RGB'), 2400, 740)]], 'labels.png')
+    # One file that follows the reader's light or dark mode, as GitHub and PyPI show it
+    labels('poster').save(OUT / 'themes.svg', themes = True)
     arrange([[tile(gallery.heatmap('aura'), 1100)]], 'clustermap.png')
     arrange([[tile(crowd(False), 900), tile(crowd(True), 900)]], 'crowd.png')
     arrange([[tile(figures[k](p + '-dark'), 640) for k, p in zip(('trial', 'volcano', 'stacked', 'embedding'), names)]],

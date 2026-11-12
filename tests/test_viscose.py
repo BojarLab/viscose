@@ -892,8 +892,13 @@ def test_hue_style_and_size_map_to_color_shape_and_area():
     assert pts[0]['s'][0] < pts[-1]['s'][0]
     labels = [i[0] for i in ax.legend_items]
     assert labels[:4] == ['Color', 'a', 'b',
-                          'c'] and 'Shape' in labels and 'Size' in labels and ax._legend_opts == 'right'
+                          'c'] and 'Shape' in labels and 'Size' in labels and ax._legend_opts == 'direct'
     assert fig.to_png(72)[:4] == b'\x89PNG'
+    # The colors are named where their points lie, and shapes and sizes, which have no such place, keep the legend
+    shown = [ax.legend_items[i][0] for i in ax._legend_keep]
+    assert ax._legend_loc == 'right' and shown[0] == 'Shape' and 'Size' in shown
+    assert not {'Color', 'a', 'b'} & set(shown)
+    assert sorted(a['s'] for a in ax.artists if a.get('direct')) == ['a', 'b', 'c']
 
 
 def _every_plot(palette):
@@ -3728,3 +3733,161 @@ def test_a_pdf_for_a_press_is_a_pdf_x_in_cmyk(tmp_path):
         fig.save(tmp_path / 'print.svg', press = True)
     proof = fig.to_png(dpi = 40, press = True)
     assert proof[:8] == b'\x89PNG\r\n\x1a\n' and proof != fig.to_png(dpi = 40)
+
+
+def _in_theme(svg, dark):
+    """An SVG of both themes as a reader without the dark rule, or with it, sees it: what only the other theme draws
+    gone, and each class's dark paint in place of the light one, with each gradient and clip as what it is, as their
+    ids hold a checksum of the text."""
+    style = re.search(r'<style>(.*?)</style>\n', svg)
+    props = dict(re.findall(r'(--c\d+):(#[0-9A-F]{6})', style.group(1))) if style else {}
+    rules = {cls: [p.split(':', 1) for p in rule.split(';')]
+             for cls, rule in re.findall(r' \.(k\d+)\{([^}]*)\}', style.group(1))} if style else {}
+    out = []
+    for line in (svg.replace(style.group(0), '') if style else svg).split('\n'):
+        found = re.search(r' class="([^"]+)"', line)
+        if found:
+            cls, line = found.group(1), line.replace(found.group(0), '')
+            if cls == ('vl' if dark else 'vd'):
+                continue
+            line = line.replace(' display="none"', '')
+            for prop, value in rules.get(cls, []) if dark else []:
+                value = re.sub(r'var\((--c\d+)\)', lambda m: props[m.group(1)], value)
+                at = line.index(' />')
+                head, start = line[:at], max(line[:at].rfind('<path '), line[:at].rfind('<rect '))
+                element = head[start:]
+                element = (re.sub(r' %s="[^"]*"' % prop, ' %s="%s"' % (prop, value), element)
+                           if ' %s="' % prop in element else element + ' %s="%s"' % (prop, value))
+                line = head[:start] + element + line[at:]
+        out.append(line)
+    text = '\n'.join(out)
+    defs = dict(re.findall(r'<(?:linearGradient|radialGradient|clipPath) id="([^"]+)"(.*?)</', text))
+    body = [line for line in text.split('\n') if not line.startswith(('<?xml', '<svg', '<defs>'))]
+    return [re.sub(r' (fill|stroke)-opacity="1"', '', re.sub(r'url\(#([^)]+)\)', lambda m: defs[m.group(1)], line))
+            for line in body]
+
+
+@pytest.mark.parametrize('palette', ['aura', 'couture'])
+def test_an_svg_in_both_themes_is_each_theme_exactly(palette):
+    fig, axes = vc.subplots(1, 2, figsize = (8, 4), palette = palette)
+    x = np.linspace(0, 6, 40)
+    axes[0].plot(x, np.sin(x), label = 'sine')
+    axes[0].bar([1, 2, 3], [0.5, 0.8, 0.3], color = fig.pal.groups(2, 1))
+    axes[0].legend()
+    axes[1].scatter(*_cloud(260).T, hue = ['a', 'b', 'c'] * 100)
+    axes[1].annotate('note', (0, 0))
+    both = fig.to_svg(themes = True)
+    assert both.startswith('<?xml') and re.search(r'<svg id="vc[0-9a-f]{8}" ', both)
+    assert '<metadata>viscose</metadata>' in both[:3000] and '@media (prefers-color-scheme:dark)' in both
+    # glycowork and slate read the page from the first rectangle, which keeps the light page's literal color
+    assert re.search(r'<rect width="[\d.]+" height="[\d.]+" fill="([^"]+)"', both).group(1) == fig.pal.css('paper')
+    assert _in_theme(both, False) == _in_theme(fig.to_svg(), False)
+    assert _in_theme(both, True) == _in_theme(fig.in_palette(fig.pal.dark()).to_svg(), False)
+    # A figure drawn dark gives the same file, and the dark page can take a site's own color
+    assert re.sub(r'vc[0-9a-f]{8}', '', fig.in_palette(fig.pal.dark()).to_svg(themes = True)) == re.sub(
+        r'vc[0-9a-f]{8}', '', both)
+    assert '#0D1117' in fig.to_svg(themes = '#0D1117')
+
+
+def test_both_themes_take_an_svg_and_a_palette_that_has_a_light_one(tmp_path):
+    fig, ax = vc.subplots(figsize = (3, 3), palette = 'poster')
+    ax.plot([0, 1], [0, 1])
+    with pytest.raises(ValueError, match = 'SVG'):
+        fig.save(tmp_path / 'f.png', themes = True)
+    path = fig.save(tmp_path / 'f.svg', themes = True)
+    assert b'prefers-color-scheme' in path.read_bytes() and vc.open(path).to_svg() == fig.to_svg()
+    night = dataclasses.replace(get_palette('poster'), name = 'night', paper = '#101010', ink = '#EEEEEE')
+    fig, ax = vc.subplots(figsize = (3, 3), palette = night)
+    ax.plot([0, 1], [0, 1])
+    with pytest.raises(ValueError, match = 'light palette'):
+        fig.to_svg(themes = True)
+    previous = vc.dark_mode(True)
+    try:
+        fig, ax = vc.subplots(figsize = (3, 3), palette = 'aura')
+        ax.plot([0, 1], [0, 1])
+        assert fig.pal.is_dark and 'prefers-color-scheme' in fig.to_svg(themes = True)
+    finally:
+        vc.dark_mode(*previous)
+
+
+def test_another_palette_takes_the_shades_a_caller_took_from_this_one():
+    def draw(name):
+        fig, ax = vc.subplots(figsize = (4, 3), palette = name)
+        ax.stacked_bar(['a', 'b'], [[1, 2], [3, 1]], colors = fig.pal.groups(1, 1))
+        ax.scatter([0, 1], [1, 2], color = fig.pal.css('b1'), edge = (fig.pal.color('a0'), 1.0))
+        ax.plot([0, 1], [0, 3], color = '#123456')
+        return fig
+    assert draw('lumen').in_palette('aura').to_png(72.0) == draw('aura').to_png(72.0)
+
+
+def test_lines_are_named_at_their_ends_instead_of_a_legend():
+    t = np.linspace(0, 10, 50)
+    figs = []
+    for named in (True, False):
+        fig, ax = vc.subplots(figsize = (5, 4), palette = 'lumen')
+        for name, top in [('Wild type', 1.0), ('Knockout', 0.97), ('Control', 0.3)]:
+            ax.plot(t, top * (1 - np.exp(-0.4 * t)), label = name)
+        ax.axhline(0.5, label = 'Half')
+        if named:
+            ax.legend()
+        figs.append((fig, ax))
+    (fig, ax), (plain, bare) = figs
+    fig.layout()
+    labels = {a['s']: a for a in ax.artists if a.get('direct')}
+    assert set(labels) == {'Wild type', 'Knockout', 'Control', 'Half'} and ax._legend_loc is None
+    # Naming leaves the limits to the data, and laying out again changes nothing
+    assert ax.get_xlim() == bare.get_xlim() and ax.get_ylim() == bare.get_ylim()
+    assert fig.to_png(72.0) == fig.to_png(72.0)
+    # Each label starts right of its line's end, on the page, and the two that end close together moved apart
+    x0, y0, w, h = ax.rect
+    spots = {op['text']: (op['ctm'][4] + op['x'], op['ctm'][5] + op['y']) for op in fig.display_list()
+             if op['kind'] == 'text' and op['text'] in labels}
+    assert all(x > x0 + 0.9 * w for x, _ in spots.values()) and max(x for x, _ in spots.values()) < fig.width
+    assert abs(spots['Wild type'][1] - spots['Knockout'][1]) >= 0.9 * labels['Wild type']['size']
+    # A pale line's label is as dark as text must be to read
+    from viscose.palettes import LC_TEXT, apca
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'aura')
+    ax.plot([0, 1], [0, 1], color = 'a3', label = 'pale')
+    ax.legend()
+    rgb = [op for op in fig.display_list() if op['kind'] == 'text' and op['text'] == 'pale'][0]['fill_rgb']
+    assert apca(rgb, (1.0, 1.0, 1.0)) >= LC_TEXT and apca(get_palette('aura').color('a3'), (1.0, 1.0, 1.0)) < LC_TEXT
+
+
+def test_groups_of_points_are_named_where_they_hold_together():
+    rng = np.random.default_rng(5)
+    centers = [(0, 0), (6, 0), (3, 6)]
+    xy = np.concatenate([rng.normal(c, 0.8, (80, 2)) for c in centers])
+    hue = np.repeat(['one', 'two', 'three'], 80)
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'couture')
+    ax.scatter(*xy.T, hue = hue)
+    fig.layout()
+    spots = ax._place_direct()
+    named = {a['s']: spots[id(a)] for a in ax.artists if a.get('direct') == 'cloud'}
+    assert list(named) == ['ONE', 'TWO', 'THREE'] and ax._legend_loc is None
+    # Each name lies nearer its own group than any other
+    for k, (px, py) in enumerate(named.values()):
+        assert np.argmin([np.hypot(px - ax._tx(u), py - ax._ty(v)) for u, v in centers]) == k
+    # Groups that mingle have no place of their own, so they keep the legend, as does a legend placed by hand
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'couture')
+    ax.scatter(*xy.T, hue = rng.permutation(hue))
+    fig.layout()
+    assert ax._legend_loc == 'right' and not [a for a in ax.artists if a.get('direct')]
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'couture')
+    ax.scatter(*xy.T, hue = hue, legend = 'below')
+    fig.layout()
+    assert ax._legend_loc == 'below' and len(ax._legend_keep) == 3
+
+
+def test_what_has_no_place_of_its_own_keeps_a_legend():
+    def draw(name):
+        fig, ax = vc.subplots(figsize = (5, 4), palette = name)
+        ax.bar(['a', 'b'], [1, 2], label = 'counts')
+        ax.stacked_bar(['a', 'b'], [[1, 2], [2, 1]], labels = ['low', 'high'])
+        ax.hist(np.random.default_rng(1).normal(0, 1, 200), label = 'spread')
+        ax.axvspan(0, 1, label = 'window')
+        ax.legend()
+        return fig.layout(), ax
+    fig, ax = draw('poster')
+    assert [ax.legend_items[i][0] for i in ax._legend_keep] == ['counts', 'window'] and ax._legend_loc == 'below'
+    assert sorted(a['s'] for a in ax.artists if a.get('direct')) == ['high', 'low', 'spread']
+    assert fig.in_palette('aura').to_png(36.0) == draw('aura')[0].to_png(36.0)

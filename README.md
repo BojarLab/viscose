@@ -90,7 +90,8 @@ a function that returns SVG for a label, for chemical structures, protein domain
 
 ## Everything you reach for
 
-`hue`, `style`, and `size` take one value per point and build the legend for you, as seaborn does.
+`hue`, `style`, and `size` take one value per point, as in seaborn. Each color's points are named right where they
+lie, and shapes and sizes get a legend.
 
 ```python
 ax.scatter(x, y, hue = stage, style = source, size = abundance,
@@ -98,7 +99,26 @@ ax.scatter(x, y, hue = stage, style = source, size = abundance,
 ax.text(0.02, 0.98, 'F = 4.2\np = 0.003', axes_fraction = True, va = 'top')
 ```
 
-<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/hue_style_size.png" alt="A scatter plot with color, shape, and size mapped to data, with a three-part legend" width="80%"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/hue_style_size.png" alt="A scatter plot with color, shape, and size mapped to data, each stage named beside its points, and a legend of shapes and sizes" width="80%"></p>
+
+### Labels where the data are
+
+Legends make the reader look away and match colors. viscose names each series beside it instead, in its own color: at
+the end of a line, moving labels apart exactly as little as it takes, with a hairline to each one that moved; on the
+free spot nearest a group of points, clear of the other groups; at the right of stacked bars; over a histogram's peak;
+and along reference lines. The plot makes room for the labels, the axis limits stay with the data, and every label
+stands out from the page as far as text has to, even for the palest line. Groups of points that mingle have no place of their own,
+so they keep a legend, as does anything else without one, such as plain bars. `ax.legend('right')` or any other place
+puts everything into one legend.
+
+```python
+for name, curve in curves.items():
+    ax.plot(t, curve, label = name)
+ax.axhline(0.5, label = 'Half-maximal')
+ax.legend()
+```
+
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/labels.png" alt="Four response curves named at their ends, four tissues named beside their clusters, and stacked bars of glycan classes named at their right, in Lumen" width="100%"></p>
 
 Group comparisons show every sample. `boxplot` spreads each value as a point over a paler box, `violinplot` draws each group's density with its quartiles inside, or its points spread as wide as the density, and `stripplot` gives the points alone. `bracket` marks a difference between two groups with a p-value or stars, above the data between them; several stack by themselves, narrower ones lower, and the axis grows to hold them. `sharex` and `sharey` put panels on one scale, with tick labels on the outer ones and the plot areas lined up.
 
@@ -161,7 +181,7 @@ fig.save('proof.png', press = True)
 |---|---|
 | **Plots** | `plot`, `step`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `boxplot`, `violinplot`, `stripplot`, `contour`, `stem`, `hlines`, `vlines`, `arrow`, `rectangle`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, `axline`, `axhspan`, `axvspan`, `image`, and `vc.clustermap` |
 | **Markers** | `o`, `s`, `D`, `^`, `v`, `>`, `<`, `X`, `P`, `*`, `h`, and `p`, all with the palette's effects |
-| **Annotation** | `text`, `annotate`, `bracket`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text; `annotate(spread = True)` names line ends directly, moving labels apart exactly as little as it takes, with a hairline to each one that moved |
+| **Annotation** | `text`, `annotate`, `bracket`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text; `legend()` names every line, group of points, stacked bar, histogram, and reference line where it is, and `annotate(spread = True)` does the same for any text, moving labels apart exactly as little as it takes, with a hairline to each one that moved |
 | **Pages** | `vc.Figure(183, 120, unit = 'mm')` is a journal page, `fig.add_axes((x, y, w, h), unit = 'mm')` places a panel from its top left, and `fig.letter(x, y, 'a', 'Heading')` and `fig.text` write panel letters and any other text on the page; `vc.subplot_mosaic('abc;ddd')` lets axes span cells of a grid |
 | **Axes** | `set_xscale` takes `linear`, `log`, `sqrt`, or any pair of functions; `fmt` on `set_xticks` and `set_yticks` writes the ticks, as `'{:.0%}'` or a function; `tick_params` sets each axis's tick length, pad, label size, and labels, puts x labels on top, or keeps labels exactly as set; `emphasis` sets chosen tick labels bold in a color; `set_spines` shows or hides each axis line |
 | **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, long axis names shrink, and the page grows for anything that needs it; `vc.subplots(sharex = True, sharey = 'row')` shares limits, scales, and ticks across all panels, rows, or columns, as in matplotlib |
@@ -170,7 +190,7 @@ fig.save('proof.png', press = True)
 | **Display** | `fig.show()` works inline in Jupyter and slate, and in the system's image viewer from a terminal, with CI and coding agents kept silent |
 | **SVG hooks** | `gid` on `arrow` and `scatter` names elements for hover text and scripting |
 | **Names** | `names` on `scatter` labels each point, and on `heatmap` each row and column, which draws nothing but lets slate show what is under the mouse |
-| **Palettes** | `fig.in_palette('aura')` gives the same figure in another palette, exactly as if it had been drawn in that one |
+| **Palettes** | `fig.in_palette('aura')` gives the same figure in another palette, exactly as if it had been drawn in that one, shades taken from `fig.pal` included |
 | **Source** | Every file `fig.save` writes carries the figure's own calls and data, a few kB of JSON, and `vc.open('fig3.pdf')` brings the figure back from that file alone: `vc.open('fig3.pdf', 'couture')` in another palette, `vc.open('fig3.pdf', 'aura-dark')` dark, `vc.open('fig3.pdf', size = (89, 70), unit = 'mm')` at a journal's column width, exactly as if drawn that way, and the numbers are there for anyone to read, as the PDF's attachment `figure-source.json`; `source = False` leaves it out |
 | **State** | None hidden: a figure is an object, with no current figure and nothing to close |
 
@@ -223,6 +243,16 @@ surface. `palette = 'lumen-dark'` names one directly, and `pal.dark()` makes one
 its hue and mirrors its lightness, so the shade that stood out most on white stands out most on the dark page, and oranges and golds
 stay warm. Spheres keep their light from above, Lumen's lines glow brighter, and Aura's soft shadows become a glow in each mark's own
 color. `fig.save('plot.png', background = None)` leaves the page transparent, so a figure sits on any dark surface.
+
+One SVG carries both: `fig.save('plot.svg', themes = True)` writes the figure and its dark version as one drawing whose
+colors follow the reader's light or dark mode, on a website, on GitHub, or in docs, with no second export. Only the
+colors that differ are written twice, as CSS custom properties under a `prefers-color-scheme` rule: over the gallery,
+the file is 1 to 10% larger than one theme alone in Couture and Poster, and 5 to 70% in Lumen and Aura, whose
+gradients and shadows turn too. Rendered in Chromium, each theme is pixel for pixel the SVG of that theme alone, and an
+editor that reads no CSS sees the light page. `themes = '#0D1117'` sets the dark page to a site's own background. The figure
+below is one such file: turn your system's dark mode on, and it turns with it.
+
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/themes.svg" alt="Response curves, tissue clusters, and stacked bars in Poster, as one SVG that turns dark with the reader's dark mode" width="100%"></p>
 
 <p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/dark.png" alt="A line and bar figure, a volcano plot, stacked bars, and an embedding in the dark versions of Lumen, Couture, Poster, and Aura" width="100%"></p>
 
