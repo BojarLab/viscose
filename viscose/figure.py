@@ -305,14 +305,15 @@ class Figure:
                     grow_h = max(grow_h, (name_h + b + t) / share_h + pad + head + gap * (nrows - 1))
                     self.width = min(max(self.width, grow_w), self._base[0] * 3)
                     self.height = min(max(self.height, grow_h), self._base[1] * 3)
-                    # Labels that must all show get the room they need, however much that is
-                    sx, sy = ax._tick_sizes()
-                    if ax.show_all[0] and ax.xrot:
-                        need = len(ax.xticks) * sx * 1.05 + l + r
-                        self.width = max(self.width, need / share_w + 2 * pad + gap * (ncols - 1))
-                    if ax.show_all[1]:
-                        need = len(ax.yticks) * sy * 1.05 + b + t
-                        self.height = max(self.height, need / share_h + pad + head + gap * (nrows - 1))
+                    # Labels that must all show get the room they need, however much that is, and glyphs as much as
+                    # the page may grow, before any is left out
+                    glyphs = [bool(ax._tick_opts[axis].get('glyphs')) for axis in 'xy']
+                    if ax.xrot and (ax.show_all[0] or glyphs[0]):
+                        need = (ax._tick_need('x') + l + r) / share_w + 2 * pad + gap * (ncols - 1)
+                        self.width = max(self.width, need if ax.show_all[0] else min(need, self._base[0] * 3))
+                    if ax.show_all[1] or glyphs[1]:
+                        need = (ax._tick_need('y') + b + t) / share_h + pad + head + gap * (nrows - 1)
+                        self.height = max(self.height, need if ax.show_all[1] else min(need, self._base[1] * 3))
             total_w = self.width - 2 * pad - gap * (ncols - 1)
             total_h = self.height - pad - head - gap * (nrows - 1)
             cw, ch = np.asarray(wr, float) / sum(wr) * total_w, np.asarray(hr, float) / sum(hr) * total_h
@@ -838,14 +839,16 @@ def _tree(z):
 def clustermap(data, xticklabels = None, yticklabels = None, method = 'average', metric = 'euclidean',
                cmap = 'diverging', figsize = (8.0, 8.0), palette = None, title = '', subtitle = '', show_all = False,
                row_linkage = None, col_linkage = None, row_cluster = True, col_cluster = True, vmin = None, vmax = None,
-               center = 0.0, xlabel = '', ylabel = '', colorbar = True, colorbar_label = ''):
+               center = 0.0, xlabel = '', ylabel = '', colorbar = True, colorbar_label = '', glyphs = None):
     """A heatmap with both dendrograms and a color bar, as in seaborn. A DataFrame brings its own labels, and
     xticklabels and yticklabels can be True for all, False for none, or an integer for every n-th. Rows and columns are
     clustered by `method` (single, complete, average, weighted, centroid, median, or ward) on the `metric` distance
     (euclidean, sqeuclidean, cityblock, chebyshev, cosine, correlation, braycurtis, canberra, jensenshannon, or a
     function of two rows), and each tree's links turned so that neighbors are as alike as the tree allows. Linkages
-    passed in scipy's format are drawn as they are. Returns the figure and the heatmap's axes; the figure's row_order
-    and col_order hold the data's rows and columns as drawn, first row at the top."""
+    passed in scipy's format are drawn as they are. `glyphs` draws the rows' labels as glyphs where it can, such as
+    'glycan' for SNFG drawings (see Axes.tick_params), or the (columns', rows') with a pair. Returns the figure and the
+    heatmap's axes; the figure's row_order and col_order hold the data's rows and columns as drawn, first row at the
+    top."""
     frame = hasattr(data, 'index') and hasattr(data, 'columns')
     m = np.asarray(data, dtype = float)
     x, x_step, x_all = _given_labels(xticklabels, list(data.columns) if frame else None, m.shape[1])
@@ -876,6 +879,9 @@ def clustermap(data, xticklabels = None, yticklabels = None, method = 'average',
                               center = center, names = names)
     heat.set_xlabel(xlabel)
     heat.set_ylabel(ylabel)
+    for axis, maker in zip('xy', glyphs if isinstance(glyphs, tuple) else (None, glyphs)):
+        if maker:
+            heat.tick_params(axis, glyphs = maker)
     top = axes[0][1].dendrogram(cols['icoord'], cols['dcoord'], 'top', m.shape[1]) if col_cluster else axes[0][1].off()
     left = axes[1][0].dendrogram(rows['icoord'], rows['dcoord'], 'left',
                                  m.shape[0]) if row_cluster else axes[1][0].off()

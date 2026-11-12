@@ -1,7 +1,6 @@
 """Draws every image in the README into examples/readme/: python examples/readme_figures.py
 Needs matplotlib and seaborn for the comparison, pillow for arranging the panels, and glycowork for the glycan
 drawings."""
-import tempfile
 from io import BytesIO
 from pathlib import Path
 import numpy as np
@@ -102,14 +101,14 @@ def glycan_volcano():
             (2.2, 9.9, 'Neu5Ac(a2-3)Gal(b1-3)GalNAc'), (-3.2, 9.0, 'GlcNAc(b1-2)Man(a1-3)Man'),
             (3.0, 8.2, 'Fuc(a1-3)[Gal(b1-4)]GlcNAc'), (-3.8, 5.6, 'Fuc(a1-2)Gal(b1-3)GalNAc')]
     fig, ax = vc.subplots(figsize = (7, 7), palette = 'aura')
-    fig.suptitle('Glycans as labels', 'Real SNFG drawings on a volcano plot')
+    fig.suptitle('Glycans as labels', 'SNFG drawings beside their points')
     sig = (np.abs(x) > 1) & (y > 2)
     ax.scatter(x[~sig], y[~sig], s = 22, color = 'a3', z = 2)
     ax.scatter(x[sig & (x < 0)], y[sig & (x < 0)], s = 30, color = 'b1')
     ax.scatter(x[sig & (x > 0)], y[sig & (x > 0)], s = 30, color = 'a1')
     for hx, hy, lab in hits:
         ax.scatter([hx], [hy], s = 120, color = 'b1' if hx < 0 else 'a1', z = 5)
-        ax.annotate(lab, (hx, hy), offset = (12, 0), svg_label = True)
+        ax.annotate(lab, (hx, hy), glyph = 'glycan', spread = True)
     ax.axvline(-1)
     ax.axvline(1)
     ax.axhline(2)
@@ -120,36 +119,18 @@ def glycan_volcano():
     return fig
 
 
-def glycan_network():
-    nodes = {'GlcNAc': (0.08, 0.1), 'Gal(b1-4)GlcNAc': (0.3, 0.38), 'Fuc(a1-3)GlcNAc': (0.38, 0.06),
-             'Neu5Ac(a2-6)Gal(b1-4)GlcNAc': (0.4, 0.78), 'Fuc(a1-3)[Gal(b1-4)]GlcNAc': (0.68, 0.3),
-             'Neu5Ac(a2-3)Gal(b1-4)[Fuc(a1-3)]GlcNAc': (0.85, 0.86)}
-    edges = [('GlcNAc', 'Gal(b1-4)GlcNAc'), ('GlcNAc', 'Fuc(a1-3)GlcNAc'),
-             ('Gal(b1-4)GlcNAc', 'Neu5Ac(a2-6)Gal(b1-4)GlcNAc'),
-             ('Gal(b1-4)GlcNAc', 'Fuc(a1-3)[Gal(b1-4)]GlcNAc'), ('Fuc(a1-3)GlcNAc', 'Fuc(a1-3)[Gal(b1-4)]GlcNAc'),
-             ('Fuc(a1-3)[Gal(b1-4)]GlcNAc', 'Neu5Ac(a2-3)Gal(b1-4)[Fuc(a1-3)]GlcNAc')]
+def glycan_bars():
+    from glycowork.glycan_data.loader import glycomics_data_loader
+    table = glycomics_data_loader.human_colorectal_N_PMID26085185
+    shares = table.iloc[:, 1:].astype(float)
+    shares = (shares / shares.sum() * 100).mean(axis = 1)
+    top = shares.sort_values().index[-8:]
     fig, ax = vc.subplots(figsize = (7, 7), palette = 'aura')
-    fig.suptitle('Glycans as nodes', 'A biosynthetic network, with a drawing at every step')
-    for i, (a, b) in enumerate(edges):
-        (x0, y0), (x1, y1) = nodes[a], nodes[b]
-        n = np.hypot(x1 - x0, y1 - y0)
-        ax.arrow(x0, y0, x1 - 0.04 * (x1 - x0) / n, y1 - 0.04 * (y1 - y0) / n, color = 'b1', lw = 0.9,
-                 gid = f'gwedge{i}')
-    for i, (name, (x, y)) in enumerate(nodes.items()):
-        ax.scatter([x], [y], s = 150, color = 'a1', gid = f'gwnode{i}', z = 5)
-        ax.annotate(name, (x, y), offset = (12, 0), svg_label = True)
-    ax.set_xlim(0, 1.25)
-    ax.set_ylim(-0.04, 1.04)
-    ax.off()
+    fig.suptitle('Glycans as ticks', 'The most abundant N-glycans of colorectal tissue')
+    ax.barh(list(table.iloc[top, 0]), shares[top].values)
+    ax.tick_params('y', glyphs = 'glycan')
+    ax.set_xlabel('Relative abundance (%)')
     return fig
-
-
-def with_glycans(fig):
-    from glycowork.motif.draw import annotate_figure
-    with tempfile.TemporaryDirectory() as tmp:
-        fig.save(Path(tmp) / 'plot.svg')
-        annotate_figure(str(Path(tmp) / 'plot.svg'), filepath = str(Path(tmp) / 'plot.png'), compact = True)
-        return Image.open(Path(tmp) / 'plot.png').convert('RGB').copy()
 
 
 def markers():
@@ -180,8 +161,7 @@ if __name__ == '__main__':
     for p in names:
         arrange([[tile(figures[k](p), 640) for k in STRIPS[p]]], f'{p}.png')
     arrange([[fit(seaborn_volcano(), 900, 900), tile(gallery.volcano('aura'), 900)]], 'versus.png')
-    arrange([[fit(with_glycans(glycan_volcano()), 900, 900), fit(with_glycans(glycan_network()), 900, 900)]],
-            'glycans.png')
+    arrange([[tile(glycan_volcano(), 900), tile(glycan_bars(), 900)]], 'glycans.png')
     arrange([[fit(Image.open(BytesIO(markers().to_png(200))).convert('RGB'), 1400, 1000)]], 'hue_style_size.png')
     arrange([[fit(Image.open(BytesIO(gallery.groups('lumen').to_png(200))).convert('RGB'), 1400, 840)]], 'groups.png')
     arrange([[fit(Image.open(BytesIO(gallery.subgroups('couture').to_png(200))).convert('RGB'), 1400, 840)]],

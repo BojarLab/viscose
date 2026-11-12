@@ -18,6 +18,8 @@ LEGEND_SPOTS = ('below', 'right', 'upper left', 'upper right', 'lower left', 'lo
 LABEL_MIN = 6.5
 # Brackets may stretch the y axis by up to this factor, which leaves the data at least this share of the height
 BRACKET_LIFT_MAX = 4.0
+# The sizes, as shares of their type's, that spread glyph annotations may take, from the largest that fits
+GLYPH_SIZES = (1.75, 1.5, 1.3, 1.15, 1.0, 0.9, 0.8, 0.72, 0.65, 0.58, 0.52, 0.46, 0.4)
 
 
 def nice_ticks(lo, hi, n = 6, steps = (1, 2, 5, 10)):
@@ -163,6 +165,229 @@ def _check_lengths(x, y):
         raise ValueError(f'x and y have to be of the same length, got {x.size} and {y.size} values')
 
 
+def _spread_glyphs(placements, canvas, marks = (), ports = None, pad = 4.0, step = 3.0, radii = None):
+    """Places each drawing at the free spot nearest its anchor, all clear of each other, with short leaders that do not
+    cross, from glycowork's _spread_glycans, which annotate_figure placed glycans with. `placements` holds (x, y, w, h,
+    anchor x, anchor y) per drawing, (x, y) being its ink's natural top left corner, in points with y running down
+    from the top of `canvas`, (width, height), the room they stay in; `marks` holds (x, y, weight) of what a drawing
+    should rather not hide, and `ports` per drawing the (dx, dy, radius) from its corner of the symbols a leader may
+    end on, its middle by default, and `radii` each anchor's own, a point's marker, from whose edge nearness counts.
+    Gives the corners, the leaders as (x0, y0, x1, y1) or None, and how many leaders cross another, run through a
+    drawing, run long, or a drawing that found room only past the canvas's right."""
+    P = np.array(placements, dtype = float).reshape(-1, 6)
+    n, (cw, ch) = len(P), canvas
+    width = cw
+    ports = [np.array([(w / 2, h / 2, min(w, h) / 2)]) if q is None or not len(q) else
+             np.array(q, dtype = float).reshape(-1, 3) for q, (_, _, w, h, _, _) in zip(ports or [None] * n, P)]
+    pos, ends = P[:, :2].copy(), np.full((n, 2), np.nan)
+    placed = np.zeros(n, dtype = bool)
+    edge, radii = min(2.0, pad), np.zeros(n) if radii is None else np.asarray(radii, dtype = float)
+    soft = np.array(list(marks) + [(ax, ay, 150.0) for ax, ay in P[:, 4:6]], dtype = float).reshape(-1, 3)
+    grid_w, grid_h = int(cw * 3 / step) + 8, int(ch / step) + 8
+    cover = np.zeros((grid_h + 1, grid_w + 1))
+    inside = ((soft[:, 0] >= 0) & (soft[:, 1] >= 0) & (soft[:, 0] < (grid_w - 1) * step) &
+              (soft[:, 1] < (grid_h - 1) * step))
+    np.add.at(cover, ((soft[inside, 1] / step).astype(int) + 1, (soft[inside, 0] / step).astype(int) + 1),
+              soft[inside, 2])
+    cover = cover.cumsum(0).cumsum(1)
+    def hits_box(x0, y0, x1, y1, left, top, right, bottom):
+        # Whether segments run through boxes, all broadcast together
+        dx, dy = x1 - x0, y1 - y0
+        lo = np.zeros(np.broadcast(dx, dy, left, right).shape)
+        hi, hit = np.ones_like(lo), np.ones_like(lo, dtype = bool)
+        for p, q in ((-dx, x0 - left), (dx, right - x0), (-dy, y0 - top), (dy, bottom - y0)):
+            with np.errstate(divide = 'ignore', invalid = 'ignore'):
+                r = q / p
+            hit &= (p != 0) | (q >= 0)
+            lo, hi = np.where(p < 0, np.maximum(lo, r), lo), np.where(p > 0, np.minimum(hi, r), hi)
+        return hit & (lo <= hi)
+    def crossed(x0, y0, x1, y1, u0, v0, u1, v1):
+        # Whether segments cross each other, all broadcast together
+        side = lambda ax, ay, bx, by, cx, cy: (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        return ((side(u0, v0, u1, v1, x0, y0) * side(u0, v0, u1, v1, x1, y1) < 0) &
+                (side(x0, y0, x1, y1, u0, v0) * side(x0, y0, x1, y1, u1, v1) < 0))
+    def port(i, xs, ys):
+        # The symbol a leader runs to from the ink at (xs, ys), and how far its edge lies
+        q = ports[i]
+        cx, cy = xs[:, None] + q[:, 0], ys[:, None] + q[:, 1]
+        gap = np.hypot(cx - P[i, 4], cy - P[i, 5]) - q[:, 2] - radii[i]
+        k, row = gap.argmin(1), np.arange(len(xs))
+        return cx[row, k], cy[row, k], np.maximum(gap[row, k], 0.0)
+    def solid(i, skip = -1):
+        # What the ink of drawing i has to keep clear of
+        others = np.flatnonzero(placed & (np.arange(n) != i) & (np.arange(n) != skip))
+        return others, np.column_stack([pos[others], pos[others] + P[others, 2:4]])
+    def held(i, X, Y):
+        # What the ink at (X, Y) would hide, leaving out its own anchor, which it may stand right beside
+        gx0 = np.clip(((X - 3.0) / step).astype(int) + 1, 0, grid_w)
+        gx1 = np.clip(((X + P[i, 2] + 3.0) / step).astype(int) + 1, 0, grid_w)
+        gy0 = np.clip(((Y - 3.0) / step).astype(int) + 1, 0, grid_h)
+        gy1 = np.clip(((Y + P[i, 3] + 3.0) / step).astype(int) + 1, 0, grid_h)
+        own_x, own_y = int(P[i, 4] / step), int(P[i, 5] / step)
+        near = ((gx0 <= own_x) & (own_x < gx1) & (gy0 <= own_y) & (own_y < gy1) if
+                0 <= P[i, 4] < (grid_w - 1) * step and 0 <= P[i, 5] < (grid_h - 1) * step else False)
+        return cover[gy1, gx1] - cover[gy0, gx1] - cover[gy1, gx0] + cover[gy0, gx0] - 150.0 * near
+    def place(i):
+        # The best spot for one drawing, given all others placed so far
+        x0, y0, w, h, ax, ay = P[i]
+        others, boxes = solid(i)
+        drawn = others[~np.isnan(ends[others, 0])]
+        a0, b0, a1, b1 = P[drawn, 4], P[drawn, 5], ends[drawn, 0], ends[drawn, 1]
+        low_x, high_x, low_y, high_y = np.minimum(a0, a1), np.maximum(a0, a1), np.minimum(b0, b1), np.maximum(b0, b1)
+        px, py = np.delete(P[:, 4], i), np.delete(P[:, 5], i)
+        hi_x, hi_y = max(edge, cw - w - edge), max(edge, ch - h - edge)
+        # Its natural spot, if free, right by its point, and hiding next to nothing, needs no search
+        at_x, at_y = np.array([x0]), np.array([y0])
+        if (edge <= x0 <= hi_x and edge <= y0 <= hi_y and port(i, at_x, at_y)[2][0] < 9.0 and
+                held(i, at_x, at_y)[0] <= 6.0 and not ((boxes[:, 0] - pad < x0 + w) & (boxes[:, 2] + pad > x0) &
+                                                       (boxes[:, 1] - pad < y0 + h) & (boxes[:, 3] + pad > y0)).any()
+                and not (len(drawn) and hits_box(a0, b0, a1, b1, x0 - 1.0, y0 - 1.0, x0 + w + 1.0,
+                                                 y0 + h + 1.0).any())):
+            return x0, y0
+        best, best_cost, inner = None, np.inf, -1.0
+        reach = 60.0 + max(w, h)
+        while True:
+            whole = edge >= ax - w - reach and hi_x <= ax + reach and edge >= ay - h - reach and hi_y <= ay + reach
+            # Far from its point a drawing needs no fine placing, so a wide search looks at about as many places as a
+            # narrow one
+            size = ((min(hi_x, ax + reach) - max(edge, ax - w - reach)) *
+                    (min(hi_y, ay + reach) - max(edge, ay - h - reach)) / step ** 2)
+            pitch = step * max(1, int(max(size / 12000.0, 0.0) ** 0.5))
+            xs = x0 + pitch * np.arange(np.ceil((max(edge, ax - w - reach) - x0) / pitch),
+                                        np.floor((min(hi_x, ax + reach) - x0) / pitch) + 1)
+            ys = y0 + pitch * np.arange(np.ceil((max(edge, ay - h - reach) - y0) / pitch),
+                                        np.floor((min(hi_y, ay + reach) - y0) / pitch) + 1)
+            xs = xs if len(xs) else np.array([min(max(x0, edge), hi_x)])
+            ys = ys if len(ys) else np.array([min(max(y0, edge), hi_y)])
+            free = np.ones((len(ys), len(xs)), dtype = bool)
+            lefts = np.searchsorted(xs, boxes[:, 0] - pad - w, 'right')
+            rights = np.searchsorted(xs, boxes[:, 2] + pad, 'left')
+            tops = np.searchsorted(ys, boxes[:, 1] - pad - h, 'right')
+            bottoms = np.searchsorted(ys, boxes[:, 3] + pad, 'left')
+            for k in np.flatnonzero((lefts < rights) & (tops < bottoms)):
+                free[tops[k]:bottoms[k], lefts[k]:rights[k]] = False
+            rows, columns = np.nonzero(free)
+            X, Y = xs[columns], ys[rows]
+            d = np.maximum(np.hypot(np.maximum(np.maximum(X - ax, ax - X - w), 0.0),
+                                    np.maximum(np.maximum(Y - ay, ay - Y - h), 0.0)) - radii[i], 0.0)
+            # What the last, narrower search looked at needs no second look
+            X, Y, d = X[d > inner], Y[d > inner], d[d > inner]
+            if len(X):
+                base = held(i, X, Y) + 0.02 * np.hypot(X - x0, Y - y0) + 30.0 * ((d < 3.0) & ((X != x0) | (Y != y0)))
+                bound = base + d + d * d / 60.0
+                # Beyond the best spots, a thin sample tells as much as all of them, as neighbors cross the same things
+                order = np.argsort(bound, kind = 'stable')
+                order = np.concatenate([order[:256], order[256::max(1, (len(order) - 256) // 512)]])
+                for start in range(0, len(order), 256):
+                    chunk = order[start:start + 256]
+                    if bound[chunk[0]] >= best_cost:
+                        break
+                    gx, gy, gap = port(i, X[chunk], Y[chunk])
+                    cost = base[chunk] + gap + gap * gap / 60.0
+                    # What already costs more than the best spot so far needs no further look
+                    keep = cost < best_cost
+                    if not keep.any():
+                        continue
+                    chunk, gx, gy, gap, cost = chunk[keep], gx[keep], gy[keep], gap[keep], cost[keep]
+                    hx, hy, lead = X[chunk], Y[chunk], gap >= 9.0
+                    # Only what lies within reach of these spots and their leaders can meet them
+                    x_lo, x_hi = min(hx.min(), ax) - 4.0, max(hx.max() + w, ax) + 4.0
+                    y_lo, y_hi = min(hy.min(), ay) - 4.0, max(hy.max() + h, ay) + 4.0
+                    seen = (low_x <= x_hi) & (high_x >= x_lo) & (low_y <= y_hi) & (high_y >= y_lo)
+                    if seen.any():
+                        u0, v0, u1, v1 = a0[seen][:, None], b0[seen][:, None], a1[seen][:, None], b1[seen][:, None]
+                        cost = cost + 1000.0 * (crossed(u0, v0, u1, v1, ax, ay, gx, gy) & lead).sum(0)
+                        cost = cost + 2000.0 * hits_box(u0, v0, u1, v1, hx - 1.0, hy - 1.0, hx + w + 1.0,
+                                                        hy + h + 1.0).sum(0)
+                    seen = (boxes[:, 0] <= x_hi) & (boxes[:, 2] >= x_lo) & (boxes[:, 1] <= y_hi) & (boxes[:, 3] >= y_lo)
+                    if seen.any():
+                        cost = cost + 2000.0 * (hits_box(ax, ay, gx, gy, boxes[seen, 0][:, None] - 1.0,
+                                                         boxes[seen, 1][:, None] - 1.0, boxes[seen, 2][:, None] + 1.0,
+                                                         boxes[seen, 3][:, None] + 1.0) & lead).sum(0)
+                    seen = (px >= x_lo) & (px <= x_hi) & (py >= y_lo) & (py <= y_hi)
+                    if seen.any():
+                        qx, qy, vx, vy = px[seen][:, None], py[seen][:, None], gx - ax, gy - ay
+                        k = np.clip(((qx - ax) * vx + (qy - ay) * vy) / np.maximum(vx * vx + vy * vy, 1e-9), 0, 1)
+                        cost = cost + 40.0 * ((np.hypot(ax + k * vx - qx, ay + k * vy - qy) < 3.5) & lead).sum(0)
+                    j = int(np.argmin(cost))
+                    if cost[j] < best_cost:
+                        best, best_cost = (hx[j], hy[j]), cost[j]
+            if best is not None and (whole or best_cost <= reach + reach * reach / 60.0):
+                return best
+            if whole:
+                # Nowhere left within the canvas: a column of its own to its right
+                return max([cw] + [box[2] for box in boxes]) + pad, max(edge, min(y0, ch - h - edge))
+            inner, reach = reach, reach * 2
+    def settle(i, x, y):
+        # Puts drawing i at (x, y), with its leader
+        pos[i], placed[i] = (x, y), True
+        ex, ey, gap = port(i, np.array([x]), np.array([y]))
+        ends[i] = (ex[0], ey[0]) if gap[0] >= 9.0 else (np.nan, np.nan)
+    def tangled():
+        # Pairs of drawings whose leaders cross, leaders running through another drawing by (drawing, drawing it runs
+        # through), and drawings whose leader runs long
+        have = np.flatnonzero(~np.isnan(ends[:, 0]))
+        a0, b0, a1, b1 = P[have, 4], P[have, 5], ends[have, 0], ends[have, 1]
+        crossing = crossed(a0[:, None], b0[:, None], a1[:, None], b1[:, None], a0, b0, a1, b1)
+        through = hits_box(a0[:, None], b0[:, None], a1[:, None], b1[:, None], pos[:, 0], pos[:, 1],
+                           pos[:, 0] + P[:, 2], pos[:, 1] + P[:, 3])
+        through[np.arange(len(have)), have] = False
+        return ([(have[i], have[j]) for i, j in zip(*np.nonzero(np.triu(crossing, 1)))],
+                [(have[i], j) for i, j in zip(*np.nonzero(through))],
+                have[np.hypot(a1 - a0, b1 - b0) > 0.25 * ch].tolist())
+    def score():
+        # Tangles first, with drawings past the canvas's right, then how far the leaders run
+        return (sum(map(len, tangled())) + int((pos[:, 0] + P[:, 2] > width + 0.5).sum()),
+                float(np.hypot(*(ends - P[:, 4:6]).T)[~np.isnan(ends[:, 0])].sum()))
+    for _ in range(3):
+        moved = False
+        for i in sorted(range(n), key = lambda i: (-P[i, 2] * P[i, 3], i)):
+            spot = place(i)
+            moved |= not (placed[i] and np.allclose(spot, pos[i]))
+            settle(i, *spot)
+            cw = max(cw, spot[0] + P[i, 2] + edge)
+        # Two crossing leaders uncross when their drawings trade places, if each fits where the other stood
+        for i, j in tangled()[0]:
+            spots = pos[[j, i]] + (P[[j, i], 2:4] - P[[i, j], 2:4]) / 2
+            fits = [edge <= x and x + P[k, 2] + edge <= cw and edge <= y and y + P[k, 3] + edge <= ch and not (
+                (boxes[:, 0] - pad < x + P[k, 2]) & (boxes[:, 2] + pad > x) & (boxes[:, 1] - pad < y + P[k, 3]) &
+                (boxes[:, 3] + pad > y)).any() for k, (x, y), boxes in ((i, spots[0], solid(i, j)[1]),
+                                                                       (j, spots[1], solid(j, i)[1]))]
+            (xi, yi), (xj, yj) = spots
+            if all(fits) and not (xi < xj + P[j, 2] + pad and xj < xi + P[i, 2] + pad and yi < yj + P[j, 3] + pad and
+                                  yj < yi + P[i, 3] + pad):
+                settle(i, xi, yi)
+                settle(j, xj, yj)
+                moved = True
+        if not moved:
+            break
+    best = (score(), pos.copy(), ends.copy())
+    # Whatever is still tangled, and what stands around a leader too long, starts over among the others, the farthest
+    # from its anchor first
+    stale = 0
+    for attempt in range(4):
+        if best[0][0] == 0 or stale == 2:
+            break
+        pairs, through, far = tangled()
+        again = {int(k) for pair in pairs + through for k in pair} | set(far)
+        for i in far:
+            again |= {int(k) for k in np.argsort(np.hypot(*(pos + P[:, 2:4] / 2 - P[i, 4:6]).T))[:4]}
+        again = sorted(again)
+        gaps = np.hypot(*(np.nan_to_num(ends, nan = 0.0) - P[:, 4:6]).T) * ~np.isnan(ends[:, 0])
+        placed[again], ends[again] = False, np.nan
+        for i in sorted(again, key = lambda i: ((-gaps[i] if attempt % 2 == 0 else gaps[i]), i)):
+            spot = place(i)
+            settle(i, *spot)
+            cw = max(cw, spot[0] + P[i, 2] + edge)
+        stale += 1
+        if (now := score()) < best[0]:
+            best, stale = (now, pos.copy(), ends.copy()), 0
+    (tangles, _), pos, ends = best
+    leaders = [None if np.isnan(ex) else (ax, ay, ex, ey) for (ax, ay), (ex, ey) in zip(P[:, 4:6].tolist(),
+                                                                                       ends.tolist())]
+    return pos.tolist(), leaders, tangles
+
+
 class Axes:
     def __init__(self, figure, pal):
         self.figure, self.pal = figure, pal
@@ -178,6 +403,10 @@ class Axes:
         self._xemph, self._yemph = {}, {}
         self._tick_opts, self._spine_set = {'x': {}, 'y': {}}, {}
         self._xrot, self._yright = 0.0, False
+        # How far glyph labels of each axis shrank to fit between their ticks, and what a legend's entries draw as
+        self._gscale, self._legend_glyphs = {'x': 1.0, 'y': 1.0}, None
+        # Glyph labels of y in one column, or staggered in two where neighbors would crowd
+        self._glyph_spots, self._gcols, self._full = (None, {}), 1, {'x': ([], []), 'y': ([], [])}
         self._xscale, self._yscale = 'linear', 'linear'
         self._xwarp, self._ywarp = WARPS['linear'], WARPS['linear']
         self._xinv, self._yinv = False, False
@@ -932,24 +1161,27 @@ class Axes:
         self._add('text', z, x = float(x), y = float(y), s = str(s), size = size, rgb = self.pal.color(color),
                   bold = bold, ha = ha, va = va, rotation = rotation, halo = halo, dx = 0.0, dy = 0.0,
                   frac = axes_fraction, tag = False, clip = False, spread = False, linespacing = linespacing,
-                  placed = True)
+                  placed = True, glyph = None)
         return self
 
     def annotate(self, s, xy, offset = (0.0, 0.0), size = None, color = 'ink', bold = None, ha = 'left', va = 'center',
                  rotation = 0.0, halo = None, z = 20, svg_label = False, clip = False, spread = False,
-                 linespacing = 1.25):
+                 linespacing = 1.25, glyph = None):
         """Text next to a data point, offset in points, with a halo of the page's color that keeps it readable over the
         marks. With svg_label = True, SVG output writes it the way matplotlib writes text, so that glycowork's
         annotate_figure can replace it with a glycan drawing. With clip = True it shows only while its point is within
         the limits. Labels with spread = True on one side of their points, such as names at the ends of lines, move
         apart vertically as little as it takes for none to overlap, within the axes' height, each joined to its point
         by a hairline where it had to move. Without a size it takes 8.6 points, and its halo 2.6, both scaled by the
-        palette's spacing."""
+        palette's spacing. `glyph` draws the label instead, such as 'glycan' for its SNFG drawing (see tick_params), its
+        root symbol level with the point, over a die-cut halo of the page's color, or white as a sticker on a dark
+        page."""
         k = self.pal.spacing
         self._add('text', z, x = float(xy[0]), y = float(xy[1]), s = str(s), size = 8.6 * k if size is None else size,
                   rgb = self.pal.color(color), bold = bold, ha = ha, va = va, rotation = rotation,
                   halo = 2.6 * k if halo is None else halo, dx = offset[0], dy = offset[1], frac = False,
-                  tag = svg_label, clip = clip, spread = spread, linespacing = linespacing)
+                  tag = svg_label, clip = clip, spread = spread, linespacing = linespacing,
+                  glyph = text.check_glyphs(glyph), grow = size is None)
         return self
 
     def bracket(self, x0, x1, text = '', color = None, lw = None, size = None, tip = None, z = 6):
@@ -1039,18 +1271,23 @@ class Axes:
         return self
 
     def tick_params(self, axis = 'both', length = None, labelsize = None, pad = None, labels = None, top = None,
-                    fit = None):
+                    fit = None, glyphs = None):
         """Ticks of the x axis, the y axis, or both, as in matplotlib: their `length` and the `pad` between them and
         their labels in points, the labels' size, and labels = False to leave the labels out, as beside a panel
         that shares them. top = True writes the x labels above the axes, as over a table of scores, where a positive
         `rotation` turns them up and to the right. fit = False keeps every label as set, level or turned as asked,
-        where viscose would otherwise turn or thin labels that crowd. What is not given stays as it was."""
+        where viscose would otherwise turn or thin labels that crowd. `glyphs` draws the labels instead, where it
+        can: 'glycan' as glycowork's SNFG drawings, or a name given to register_glyphs, or a function of (label,
+        vertical) returning SVG; glyphs = False turns it off. A glyph's root, such as a glycan's reducing end, sits
+        at its tick, its symbols as tall as the labels' type, shrinking to fit between ticks, while x labels that still
+        crowd run up the page, as text would turn. What is not given stays as it was."""
         if axis not in ('x', 'y', 'both'):
             raise ValueError(f"tick_params takes axis = 'x', 'y', or 'both', got {axis!r}")
         if top is not None and axis != 'x':
             raise ValueError("Only the x labels can go on top, with axis = 'x'")
         for name in ('x', 'y') if axis == 'both' else (axis, ):
-            given = dict(length = length, labelsize = labelsize, pad = pad, labels = labels, top = top, fit = fit)
+            given = dict(length = length, labelsize = labelsize, pad = pad, labels = labels, top = top, fit = fit,
+                         glyphs = text.check_glyphs(glyphs))
             self._tick_opts[name].update({k: v for k, v in given.items() if v is not None})
         return self
 
@@ -1101,13 +1338,13 @@ class Axes:
         self.grid_on = on
         return self
 
-    def legend(self, loc = 'below'):
+    def legend(self, loc = 'below', glyphs = None):
         """Show a legend: below or right of the axes, or inside at upper left, upper right, lower left, or lower
-        right."""
+        right. `glyphs` draws its entries' names as glyphs where it can, such as 'glycan' (see tick_params)."""
         # Any other name would quietly land at the lower left
         if loc not in LEGEND_SPOTS:
             raise ValueError(f"A legend's place has to be one of {', '.join(LEGEND_SPOTS)}, got {loc!r}")
-        self._legend_opts = loc
+        self._legend_opts, self._legend_glyphs = loc, text.check_glyphs(glyphs)
         return self
 
     def off(self):
@@ -1120,9 +1357,13 @@ class Axes:
     # --- positions ---
     def boxes(self):
         """What the axes draw, as rows of (left, bottom, right, top) in page points once `Figure.layout` has placed
-        them: one per point, per piece of a line or a bracket about a point long, per bar and rectangle, and per line
-        of text at its unspread place, for placing labels, keys, and cards clear of it all. Bands and spans are left
-        out, as the ground under the data."""
+        them: one per point, per piece of a line or a bracket about a point long, per bar and rectangle, per line of
+        text at its unspread place, and per glyph where it is drawn, for placing labels, keys, and cards clear of it
+        all. Bands and spans are left out, as the ground under the data."""
+        return self._boxes(set())
+
+    def _boxes(self, skip):
+        """boxes(), without the artists whose ids are in `skip`."""
         pal, out = self.pal, []
         x0, y0, w, h = self.rect
         lo_x, hi_x = sorted(self.xlim)
@@ -1130,6 +1371,8 @@ class Axes:
         pieces = []
         for a in self.artists:
             k = a['kind']
+            if id(a) in skip:
+                continue
             if k == 'points':
                 x, y = np.atleast_1d(a['x']), np.atleast_1d(a['y'])
                 keep = np.isfinite(x) & np.isfinite(y) & (x >= lo_x) & (x <= hi_x) & (y >= lo_y) & (y <= hi_y)
@@ -1191,6 +1434,19 @@ class Axes:
                 xs = [x0 + a['x'] * w, x0 + (a['x'] + a['w']) * w] if a['frac'] else self._tx([a['x'], a['x'] + a['w']])
                 ys = [y0 + a['y'] * h, y0 + (a['y'] + a['h']) * h] if a['frac'] else self._ty([a['y'], a['y'] + a['h']])
                 out.append([min(xs), min(ys), max(xs), max(ys)])
+            elif (k == 'text' and a.get('glyph') and math.isfinite(a['x'] + a['y'])
+                  and (box := self._note_size(a)[1]) is not None):
+                # A glyph as drawn: where spreading put it, or beside its point
+                left, bottom, right, top = box
+                if a['spread']:
+                    px, py, _, pts = self._place_glyphs()[id(a)]
+                    g, _, cut = self._note(a)
+                    left, bottom, right, top = g.extent(pts, cut)
+                else:
+                    px, py = float(self._tx(a['x'])) + a.get('_dx', a['dx']), float(self._ty(a['y'])) + a['dy']
+                    px -= {'left': left, 'center': (left + right) / 2, 'right': right}[a.get('_ha', a['ha'])]
+                    py -= {'top': top, 'bottom': bottom, 'baseline': bottom}.get(a['va'], 0.0)
+                out.append([px + left, py + bottom, px + right, py + top])
             elif k == 'text' and not a['rotation'] and math.isfinite(a['x'] + a['y']):
                 px = x0 + a['x'] * w if a['frac'] else float(self._tx(a['x']))
                 py = y0 + a['y'] * h if a['frac'] else float(self._ty(a['y']))
@@ -1358,6 +1614,7 @@ class Axes:
                              'have neither')
         # What fitting the labels turned or moved last time starts over, as limits or a size may have changed
         self.xrot = self._xrot
+        self._gscale, self._gcols = {'x': 1.0, 'y': 1.0}, 1
         for a in self.artists:
             if a['kind'] == 'text':
                 a['_ha'], a['_dx'] = a['ha'], a['dx']
@@ -1397,6 +1654,8 @@ class Axes:
         if self._tick_opts[axis].get('labels', True) is False or self._outer[axis]:
             labels = []
         setattr(self, axis + 'labels', _minus(self.pal, labels) if numbers else labels)
+        # All of them, as fitting may leave some out, while the page grows for all
+        self._full[axis] = (getattr(self, axis + 'ticks'), getattr(self, axis + 'labels'))
 
     def _tx(self, v):
         x0, y0, w, h = self.rect
@@ -1450,13 +1709,222 @@ class Axes:
         pal, track = self.pal, 0.9 if self.pal.caps else 0.0
         return [text.width(text.spaced(pal, s), size, pal.label_bold, track) for s in (self.xlabel, self.ylabel)]
 
+    def _tick_glyph(self, axis, s):
+        """The drawing a tick label shows, or None where it stays text; x labels run up the page once turned."""
+        maker = self._tick_opts[axis].get('glyphs')
+        return text.glyph(maker, s, axis == 'x' and bool(self.xrot)) if maker else None
+
+    def _glyph_extent(self, axis, g):
+        """A tick label's glyph's (left, bottom, right, top) around its tick on the page, as drawn: its symbols as tall
+        as the labels' type, by how far they shrank, and cut out as a sticker on a dark page."""
+        size = self._tick_sizes()['xy'.index(axis)]
+        return g.extent(size * text.GLYPH_SYMBOL * self._gscale[axis], self.pal.is_dark)
+
+    def _note(self, a):
+        """A text artist's glyph, its points per symbol, and whether it is cut out, as a halo or a sticker on a dark
+        page; no glyph where it stays text."""
+        g = text.glyph(a['glyph'], a['s']) if a.get('glyph') else None
+        return g, (a['size'] or self.pal.tick_size) * text.GLYPH_SYMBOL, self.pal.is_dark or a['halo'] > 0
+
+    def _note_size(self, a):
+        """A text artist's width on the page, and a glyph's (left, bottom, right, top) around its anchor, or None."""
+        g, pts, cut = self._note(a)
+        if g is None:
+            return text.width(a['s'], a['size'] or self.pal.tick_size,
+                              self.pal.text_bold if a['bold'] is None else a['bold']), None
+        box = g.extent(pts, cut)
+        return box[2] - box[0], box
+
+    def _place_glyphs(self):
+        """Where spread glyph annotations go, as {id: (x, y, leader, scale)}, with (x, y) the glyph's root on the page,
+        `leader` the segment drawn from the point to a drawing that stands apart, or None, and `scale` its points per
+        symbol. `_spread_glyphs` places them inside the axes, glycowork's way: each at the free spot nearest its point,
+        its root beside it to the left where that is free, clear of the other drawings and of what the axes draw, with
+        short leaders ending on a symbol that cross nothing. Drawings take the largest of `GLYPH_SIZES` at which no
+        leader is long or tangled, as annotate_figure's did, and never cover more than a fifth of the axes. Kept for
+        the page as laid out."""
+        x0, y0, w, h = self.rect
+        key = (self.rect, tuple(self.xlim), tuple(self.ylim))
+        if self._glyph_spots[0] == key:
+            return self._glyph_spots[1]
+        lo, hi = sorted(self.ylim)
+        notes = [a for a in self.artists if a['kind'] == 'text' and a['spread'] and a.get('glyph') and not a['frac']
+                 and math.isfinite(a['x'] + a['y']) and not (a['clip'] and not (self._in_x(a['x']) and lo <= a['y'] <=
+                                                                                  hi)) and self._note(a)[0] is not None]
+        spots = {}
+        if notes:
+            k, top = self.pal.spacing, y0 + h
+            gap = 4.0 * k
+            # Spreading works from the axes' top left with y running down, and what the axes draw weighs as
+            # annotate_figure weighed it: a point 12, a line 3 every 6 points
+            marks, drawn = [], self._boxes({id(a) for a in notes})
+            for l, b, r, t in drawn:
+                if r - l > 3.0 and t - b > 3.0 and max(r - l, t - b) <= 24.0:
+                    marks.append(((l + r) / 2 - x0, top - (b + t) / 2, 12.0))
+                elif max(r - l, t - b) <= 24.0:
+                    marks.append(((l + r) / 2 - x0, top - (b + t) / 2, 0.25))
+                else:
+                    marks += [(u - x0, top - v, 3.0) for u in np.arange(l, r, 6.0) for v in np.arange(b, t, 6.0)]
+            points = [(float(self._tx(a['x'])), float(self._ty(a['y']))) for a in notes]
+            # Unlike annotate_figure's anchors, which sat at a label beside its point, these are the points: each weighs
+            # enough that no drawing hides one, its own included, and a drawing's natural place starts past its marker
+            marks += [(px - x0, top - py, 60.0) for px, py in points]
+            reach = [max([(r - l) / 2 for l, b, r, t in drawn if l <= px <= r and b <= py <= t and r - l <= 24.0],
+                         default = 0.0) for px, py in points]
+            sizes = [v for v in GLYPH_SIZES if v <= 1.0 or all(a.get('grow') for a in notes)]
+            best = None
+            for share in sizes:
+                placements, ports, shapes = [], [], []
+                for a, (px, py), radius in zip(notes, points, reach):
+                    g, pts, cut = self._note(a)
+                    pts *= share
+                    left, bottom, right, top_ = g.extent(pts, cut)
+                    # Naturally beside its point on the left, its root level with it, as a reducing end faces it there
+                    gx = px - radius - gap - right
+                    placements.append((gx + left - x0, top - (py + top_), right - left, top_ - bottom, px - x0,
+                                       top - py))
+                    ports.append([(u * pts - left, top_ - v * pts, r * pts) for u, v, r in g.symbols])
+                    shapes.append((left, top_, pts))
+                # More ink than a fifth of the axes leaves no way through for leaders
+                if share != sizes[-1] and sum(p[2] * p[3] for p in placements) > 0.2 * w * h:
+                    continue
+                corners, leaders, tangles = _spread_glyphs(placements, (w, h), marks, ports, pad = gap, radii = reach)
+                if best is None or tangles < best[0]:
+                    best = (tangles, corners, leaders, shapes)
+                # A stray crossing among many drawings is not worth smaller ones
+                if tangles <= len(notes) // 25:
+                    break
+            _, corners, leaders, shapes = best
+            for a, (px, py), (cx, cy), line, (left, top_, pts) in zip(notes, points, corners, leaders, shapes):
+                leader = None
+                if line is not None:
+                    ex, ey = line[2] + x0, top - line[3]
+                    far = math.hypot(ex - px, ey - py)
+                    leader = (px + 2.0 * k * (ex - px) / far, py + 2.0 * k * (ey - py) / far, ex, ey)
+                spots[id(a)] = (cx + x0 - left, top - cy - top_, leader, pts)
+        self._glyph_spots = (key, spots)
+        return spots
+
+    def _ytick_width(self, s, size):
+        g = self._tick_glyph('y', s)
+        if g is None:
+            return text.width(s, size, self.pal.tick_bold)
+        left, _, right, _ = self._glyph_extent('y', g)
+        return right - left
+
+    def _ytick_columns(self, size):
+        """How wide the y tick labels run from their pad, and where each starts past it, in label order: all at once
+        in one column, or, staggered, every other label down the axis a column farther out, so that tall glyphs need
+        clear only the next label but one."""
+        widths = [self._ytick_width(s, size) for s in self.ylabels]
+        if self._gcols == 1 or len(widths) < 2:
+            return max(widths, default = 0.0), [0.0] * len(widths)
+        rank = np.argsort(np.argsort(self._ty(self.yticks), kind = 'stable'), kind = 'stable') % 2
+        near, far = (max((w for w, r in zip(widths, rank) if r == side), default = 0.0) for side in (0, 1))
+        return near + 0.5 * size + far, [near + 0.5 * size if r else 0.0 for r in rank]
+
+    def _tick_need(self, axis):
+        """How long an axis must be for all its tick labels to show, glyphs at their least size: the plot's length as it
+        stands, stretched until its closest ticks hold the most that any label reaches toward its neighbor and that
+        neighbor reaches back, as categories lie evenly apart. Pairs are what count, as a tall glycan beside a short one
+        needs less than two tall ones would."""
+        size = self._tick_sizes()['xy'.index(axis)]
+        ticks, labels = (self.xticks, self.xlabels) if axis == 'x' else (self.yticks, self.ylabels)
+        if not self._tick_opts[axis].get('glyphs') or len(labels) != len(ticks):
+            return len(ticks) * size * 1.05
+        # Fitting may have left labels out, but the page grows for all, or each pass would leave out more
+        ticks, labels = self._full[axis]
+        if len(labels) != len(ticks):
+            return len(ticks) * size * 1.05
+        pos = np.asarray(self._tx(ticks) if axis == 'x' else self._ty(ticks), dtype = float)
+        reach = []
+        for s in labels:
+            g = self._tick_glyph(axis, s)
+            if g is None:
+                reach.append((0.6 * size, 0.6 * size))
+                continue
+            left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL * text.GLYPH_MIN, self.pal.is_dark)
+            low, high = (bottom, top) if axis == 'y' else (left, right) if self.xrot else ((left - right) / 2,
+                                                                                          (right - left) / 2)
+            reach.append((-low, high))
+        # Staggered labels meet the next but one in their column, twice as far off
+        order, step = np.argsort(pos, kind = 'stable'), self._gcols if axis == 'y' else 1
+        need = max((reach[a][1] + reach[b][0] for a, b in zip(order[:-step], order[step:])), default = 1.2 * size)
+        closest, length = _gap(pos) * step, self.rect[2 if axis == 'x' else 3]
+        return (need + 0.35 * size) * (length / closest if math.isfinite(closest) else 1.0)
+
+    def _fit_glyphs(self, axis):
+        """Shrinks an axis's glyph labels to fit between their ticks, turns x's to run up the page and staggers y's in
+        two columns where they still crowd at their least size, and past that leaves out labels as text would, unless
+        all must show. True if anything changed."""
+        pal, i = self.pal, 'xy'.index(axis)
+        ticks, labels = (self.xticks, self.xlabels) if axis == 'x' else (self.yticks, self.ylabels)
+        if len(ticks) < 2 or not labels or not self._tick_opts[axis].get('fit', True):
+            return False
+        size, maker = self._tick_sizes()[i], self._tick_opts[axis]['glyphs']
+        pos = np.asarray(self._tx(ticks) if axis == 'x' else self._ty(ticks), dtype = float)
+        order = np.argsort(pos, kind = 'stable')
+        before = (self._gscale[axis], self.xrot, len(ticks), self._gcols)
+        def fits(turned):
+            # Each label's reach before and after its tick along the axis, the part that scales with the glyph and the
+            # part that does not, then the least share of their full size that fits between all neighbors, and the
+            # widest gap any pair needs at the least size
+            reach = []
+            for s in labels:
+                g = text.glyph(maker, s, turned)
+                if g is None:
+                    half = text.width(s, size, pal.tick_bold) / 2 if axis == 'x' and not turned else 0.6 * size
+                    reach.append((0.0, 0.0, half, half))
+                    continue
+                left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL, pal.is_dark)
+                reach.append((-bottom, top, 0.0, 0.0) if axis == 'y' else (-left, right, 0.0, 0.0) if turned else
+                             ((right - left) / 2, (right - left) / 2, 0.0, 0.0))
+            share, need, least, step = math.inf, 0.0, math.inf, self._gcols if axis == 'y' else 1
+            for a, b in zip(order[:-step], order[step:]):
+                gap = pos[b] - pos[a]
+                if gap <= 0:
+                    continue
+                scaled, fixed = reach[a][1] + reach[b][0], reach[a][3] + reach[b][2] + 0.35 * size
+                if scaled:
+                    share = min(share, (gap - fixed) / scaled)
+                need, least = max(need, scaled * text.GLYPH_MIN + fixed), min(least, gap)
+            return share, need, least
+        # A page grown to exactly what the labels need gives back their least size within rounding
+        floor = text.GLYPH_MIN * (1 - 1e-9)
+        share, need, least = fits(axis == 'x' and bool(self.xrot))
+        turned = share < floor and axis == 'x' and not self.xrot
+        if turned:
+            self.xrot = 90.0
+            share, need, least = fits(True)
+        staggered = share < floor and axis == 'y' and self._gcols == 1 and len(ticks) > 2
+        if staggered:
+            self._gcols = 2
+            share, need, least = fits(False)
+        self._gscale[axis] = min(1.0, max(share, text.GLYPH_MIN))
+        # Labels go only once the page has grown all it may, which it does for turned or staggered ones next pass
+        if share < floor and not self.show_all[i] and not turned and not staggered:
+            k = max(2, int(math.ceil(need / least)))
+            setattr(self, axis + 'ticks', ticks[::k])
+            setattr(self, axis + 'labels', labels[::k])
+        return (abs(self._gscale[axis] - before[0]) > 0.01 * before[0] or self.xrot != before[1]
+                or len(getattr(self, axis + 'ticks')) != before[2] or self._gcols != before[3])
+
     def _xtick_height(self):
         """How far the x tick labels reach below their start."""
         sx = self._tick_sizes()[0]
+        labels, tall = self.xlabels, 0.0
+        if self._tick_opts['x'].get('glyphs'):
+            glyphs = [self._tick_glyph('x', s) for s in labels]
+            tall = max((top - bottom for _, bottom, _, top in (self._glyph_extent('x', g) for g in glyphs if g)),
+                       default = 0.0)
+            labels = [s for s, g in zip(labels, glyphs) if g is None]
+            if not labels:
+                return tall
         if self.xrot:
             sin = abs(math.sin(math.radians(self.xrot)))
-            return max((text.width(s, sx, self.pal.tick_bold) for s in self.xlabels), default = 0.0) * sin + sx * 0.4
-        return sx * (1.0 + 1.25 * max(map(_extra_lines, self.xlabels), default = 0))
+            return max(tall, max((text.width(s, sx, self.pal.tick_bold) for s in labels), default = 0.0) * sin
+                       + sx * 0.4)
+        return max(tall, sx * (1.0 + 1.25 * max(map(_extra_lines, labels), default = 0)))
 
     def _ridge_width(self):
         """Room the ridges' names take left of the axes, or nothing without any."""
@@ -1493,7 +1961,7 @@ class Axes:
         off, xtl, xpad = self._tick_room('x')
         _, ytl, ypad = self._tick_room('y')
         sy = self._tick_sizes()[1]
-        yw = max((text.width(s, sy, pal.tick_bold) for s in self.ylabels), default = 0.0)
+        yw = self._ytick_columns(sy)[0]
         k = pal.spacing
         left, right, bottom, top = 3.0 * k, 3.0 * k, 3.0 * k, 3.0 * k
         # Ticks left without labels still reach out from their axis line
@@ -1536,46 +2004,73 @@ class Axes:
         return left, right, bottom, top
 
     def _legend_entries(self):
-        """Each item's text size, tracking, shown text, and width, in legend order."""
+        """Each item's text size, tracking, shown text, width, glyph or None, and how much taller than a row it is, in
+        legend order."""
         pal = self.pal
         size = 7.4 * pal.spacing if pal.caps else pal.tick_size - 0.5 * pal.spacing
         track = 0.7 if pal.caps else 0.0
         out = []
         for s, rgb, kind, marker, area in self.legend_items:
-            # Its rows are of one height
+            # Its rows are of one height, but where a glyph needs more
             shown = text.spaced(pal, s).replace('\n', ' ')
             header = kind == 'header'
-            out.append((shown, rgb, kind, marker, area, text.width(shown, size, pal.text_bold or header, track)
-                        + (0.0 if header else 18.0 * pal.spacing)))
+            g = None if header or not self._legend_glyphs else text.glyph(self._legend_glyphs, s)
+            if g is None:
+                out.append((shown, rgb, kind, marker, area, text.width(shown, size, pal.text_bold or header, track)
+                            + (0.0 if header else 18.0 * pal.spacing), None, 0.0))
+                continue
+            left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL, self._legend_cut() is not None)
+            out.append((shown, rgb, kind, marker, area, right - left + 18.0 * pal.spacing, g,
+                        max(0.0, top - bottom + 4.0 * pal.spacing - LEGEND_ROW * pal.spacing)))
         return size, track, out
+
+    def _legend_cut(self):
+        """The color of the cut under a legend's glyphs: a sticker's white on a dark page, the page's own color as a
+        halo inside the axes, or None."""
+        if self.pal.is_dark:
+            return 1.0, 1.0, 1.0
+        return None if self._legend_opts in ('right', 'below') else self.pal.color('paper')
 
     def _legend_natural(self):
         """Legend size before the axes are placed: one row or one column."""
         _, _, entries = self._legend_entries()
-        widths, row = [e[5] for e in entries], LEGEND_ROW * self.pal.spacing
-        return (max(widths), row * len(widths)) if self._legend_opts == 'right' else (sum(widths), row)
+        widths, row, extra = [e[5] for e in entries], LEGEND_ROW * self.pal.spacing, [e[7] for e in entries]
+        return ((max(widths), row * len(widths) + sum(extra)) if self._legend_opts == 'right' else
+                (sum(widths), row + max(extra)))
 
     def _legend_grid(self):
-        """Offsets of the legend's items from its top left, wrapped to the axes, and the legend's total size."""
+        """Offsets of the legend's items from its top left to the middle of their rows, less half a row, wrapped to the
+        axes, and the legend's total size."""
         _, _, w, h = self.rect
         _, _, entries = self._legend_entries()
-        widths, k = [e[5] for e in entries], self.pal.spacing
+        widths, k, extra = [e[5] for e in entries], self.pal.spacing, [e[7] for e in entries]
         row = LEGEND_ROW * k
         if self._legend_opts == 'below':
-            spots, x, y = [], 0.0, 0.0
-            for v in widths:
+            spots, lines, x, y = [], [0.0], 0.0, 0.0
+            for v, more in zip(widths, extra):
                 if x and x + v > w:
                     x, y = 0.0, y + row
-                spots.append((x, y))
+                    lines.append(0.0)
+                lines[-1] = max(lines[-1], more)
+                spots.append((x, y, len(lines) - 1))
                 x += v + 14.0 * k
-            return spots, (w if y else sum(widths) + 14.0 * k * (len(widths) - 1), y + row)
+            # A line takes what its tallest glyph adds, and those above it push it down
+            spots = [(x, y + sum(lines[:n]) + lines[n] / 2) for x, y, n in spots]
+            return spots, (w if y else sum(widths) + 14.0 * k * (len(widths) - 1), y + row + sum(lines))
         per = max(1, int(h // row)) if self._legend_opts == 'right' else len(widths)
-        spots, offset, total_h = [], 0.0, 0.0
-        for start in range(0, len(widths), per):
-            for i in range(start, min(start + per, len(widths))):
-                spots.append((offset, (i - start) * row))
-            total_h = max(total_h, (min(start + per, len(widths)) - start) * row)
-            offset += max(widths[start:start + per]) + 12.0 * k
+        tall = any(extra) and self._legend_opts == 'right'
+        spots, offset, total_h, start = [], 0.0, 0.0, 0
+        while start < len(widths):
+            end = start + 1
+            # A column holds as many rows as the axes' height does, fewer where glyphs make them taller
+            while end < len(widths) and ((end + 1 - start) * row + sum(extra[start:end + 1]) <= h if tall else
+                                         end - start < per):
+                end += 1
+            for i in range(start, end):
+                spots.append((offset, (i - start) * row + sum(extra[start:i]) + extra[i] / 2))
+            total_h = max(total_h, (end - start) * row + sum(extra[start:end]))
+            offset += max(widths[start:end]) + 12.0 * k
+            start = end
         return spots, (offset - 12.0 * k, total_h)
 
     def _fit_labels(self):
@@ -1584,7 +2079,10 @@ class Axes:
         pal = self.pal
         changed = False
         sx, sy = self._tick_sizes()
-        if len(self.xticks) > 1 and self.xlabels and self._tick_opts['x'].get('fit', True):
+        glyphs = {axis: bool(self._tick_opts[axis].get('glyphs')) for axis in 'xy'}
+        for axis in (axis for axis in 'xy' if glyphs[axis]):
+            changed = self._fit_glyphs(axis) or changed
+        if len(self.xticks) > 1 and self.xlabels and self._tick_opts['x'].get('fit', True) and not glyphs['x']:
             gap = _gap(self._tx(self.xticks))
             if not self.xrot and max(text.width(s, sx, pal.tick_bold) for s in self.xlabels) + 6.0 * pal.spacing > gap:
                 self.xrot = 90.0
@@ -1593,7 +2091,8 @@ class Axes:
                 k = int(math.ceil(sx * 1.05 / gap))
                 self.xticks, self.xlabels = self.xticks[::k], self.xlabels[::k]
                 changed = True
-        if len(self.yticks) > 1 and self.ylabels and not self.show_all[1] and self._tick_opts['y'].get('fit', True):
+        if (len(self.yticks) > 1 and self.ylabels and not self.show_all[1] and self._tick_opts['y'].get('fit', True)
+                and not glyphs['y']):
             gap = _gap(self._ty(self.yticks))
             if gap < sy * 1.05:
                 k = int(math.ceil(sy * 1.05 / gap))
@@ -1612,9 +2111,10 @@ class Axes:
             over[1] = self.rect[0] + text.width(self.title_text, self._title_size(), pal.title_bold) - (page - 3.0)
             self._over_plain = over[1]
         for a in self.artists:
-            if a['kind'] != 'text' or a['rotation'] or a['frac'] or a['ha'] == 'center' or not math.isfinite(a['x']):
+            if (a['kind'] != 'text' or a['rotation'] or a['frac'] or a['ha'] == 'center' or not math.isfinite(a['x'])
+                    or a['spread'] and a.get('glyph')):
                 continue
-            tw = text.width(a['s'], a['size'] or pal.tick_size, pal.text_bold if a['bold'] is None else a['bold'])
+            tw = self._note_size(a)[0]
             px, gap = float(self._tx(a['x'])), abs(a['dx']) + 3.0
             over_right, over_left = px + gap + tw - (page - 3.0), tw + gap - (px - 3.0)
             natural_right = a['ha'] == 'left'
@@ -1704,7 +2204,7 @@ class Axes:
         span or text it would meet, narrower brackets first. Like what else may leave the axes, a bracket shows while
         its ends are within the x limits, and, unless `every` asks for all of those, while it fits under the axes' top,
         which limits set by hand may not leave room for."""
-        pal, k = self.pal, self.pal.spacing
+        k = self.pal.spacing
         y0, h = self.rect[1], self.rect[3]
         brackets = [a for a in self.artists if a['kind'] == 'bracket']
         floors = self._bracket_floors() if floors is None else floors
@@ -2241,8 +2741,18 @@ class Axes:
         ink = pal.color(pal.ink)
         above = self._tick_opts['x'].get('top', False)
         rise = y0 + h + self._tick_opts['x'].get('pad', 5.0 * pal.spacing)
+        # Glyphs are cut out as stickers on a dark page, whose SNFG ink would vanish into it
+        sticker = (1.0, 1.0, 1.0) if pal.is_dark else None
         for v, s in zip(self.xticks, self.xlabels):
             x = float(self._tx(v))
+            g = self._tick_glyph('x', s)
+            if g is not None:
+                left, bottom, right, top = self._glyph_extent('x', g)
+                pts = small * text.GLYPH_SYMBOL * self._gscale['x']
+                # Its root at the tick once it runs up the page, else centered on it, and its edge facing the axis
+                text.draw_glyph(c, g, x if self.xrot else x - (left + right) / 2,
+                                rise - bottom if above else y0 - pad - top, pts, sticker)
+                continue
             rgb, bold = ((pal.color(self._xemph[s]), True) if s in self._xemph else
                          (ink if heat and self.xrot else tick_rgb, pal.tick_bold))
             if self.xrot and above:
@@ -2256,16 +2766,29 @@ class Axes:
             else:
                 text.draw(c, x, rise if above else y0 - pad, s, small, rgb, bold, ha = 'center',
                           va = 'bottom' if above else 'top')
-        yw = 0.0
-        for v, s in zip(self.yticks, self.ylabels):
+        yw, offsets = self._ytick_columns(ytext)
+        for v, s, o in zip(self.yticks, self.ylabels, offsets):
             y = float(self._ty(v))
-            yw = max(yw, text.width(s, ytext, pal.tick_bold))
+            # Where the label's column starts, from the axes outward
+            start = x0 + w + ypad - 2.0 * pal.spacing + o if self._yright else x0 - ypad - o
+            if o:
+                # A staggered label's row runs out to it as a hairline
+                way = 1.0 if self._yright else -1.0
+                marks.polyline(c, [start - way * (o - pal.spacing), start - way * 1.5 * pal.spacing], [y, y], tick_rgb,
+                               0.4 * pal.spacing, 0.7, cap = 0)
+            g = self._tick_glyph('y', s)
+            if g is not None:
+                left, _, right, _ = self._glyph_extent('y', g)
+                pts = ytext * text.GLYPH_SYMBOL * self._gscale['y']
+                # Its edge facing the axes, and its root level with the tick
+                text.draw_glyph(c, g, start - left if self._yright else start - right, y, pts, sticker)
+                continue
             rgb, bold = ((pal.color(self._yemph[s]), True) if s in self._yemph else
                          (ink if heat else tick_rgb, pal.tick_bold))
             if self._yright:
-                text.draw(c, x0 + w + ypad - 2.0 * pal.spacing, y, s, ytext, rgb, bold, ha = 'left', va = 'center')
+                text.draw(c, start, y, s, ytext, rgb, bold, ha = 'left', va = 'center')
             else:
-                text.draw(c, x0 - ypad, y, s, ytext, rgb, bold, ha = 'right', va = 'center')
+                text.draw(c, start, y, s, ytext, rgb, bold, ha = 'right', va = 'center')
         label_rgb = pal.color(pal.label_color or pal.ink)
         track = 0.9 if pal.caps else 0.0
         # Long axis names shrink to stay within their cell, centered on the axes
@@ -2307,21 +2830,20 @@ class Axes:
         texts = [a for a in sorted((r for r in self.artists if r['kind'] == 'text'), key = lambda r: r['order'])
                  if math.isfinite(a['x'] + a['y'])
                  and not (a['clip'] and not (self._in_x(a['x']) and lo <= a['y'] <= hi))]
-        placed, groups = {}, []
-        for side in ('left', 'right'):
-            # Only labels whose spans across the page overlap can collide, so each run of those moves on its own
-            spans = []
-            for a in (a for a in texts if a['spread'] and a['_ha'] == side):
-                start = float(self._tx(a['x'])) + a['_dx']
-                tw = text.width(a['s'], a['size'] or size, pal.text_bold if a['bold'] is None else a['bold'])
-                spans.append((start, start + tw, a) if side == 'left' else (start - tw, start, a))
-            for start, end, a in sorted(spans, key = lambda v: v[0]):
-                if groups and groups[-1][0] == side and start < groups[-1][1]:
-                    groups[-1][1] = max(groups[-1][1], end)
-                    groups[-1][2].append(a)
-                else:
-                    groups.append([side, end, [a]])
-        for _, _, group in groups:
+        placed, groups, spans, spots = {}, [], [], self._place_glyphs()
+        # Only labels whose spans across the page overlap can collide, on either side of their points, so each run of
+        # those moves on its own; glyphs find their own places around their points
+        for a in (a for a in texts if a['spread'] and id(a) not in spots):
+            start = float(self._tx(a['x'])) + a['_dx']
+            tw = self._note_size(a)[0]
+            spans.append((start, start + tw, a) if a['_ha'] == 'left' else (start - tw, start, a))
+        for start, end, a in sorted(spans, key = lambda v: v[0]):
+            if groups and start < groups[-1][0]:
+                groups[-1][0] = max(groups[-1][0], end)
+                groups[-1][1].append(a)
+            else:
+                groups.append([end, [a]])
+        for _, group in groups:
             want = np.array([float(self._ty(a['y'])) + a['dy'] for a in group])
             gap = max((1.25 + a['linespacing'] * _extra_lines(a['s'])) * (a['size'] or size) for a in group)
             order = np.argsort(want, kind = 'stable')
@@ -2342,6 +2864,14 @@ class Axes:
             bold = pal.text_bold if a['bold'] is None else a['bold']
             px = x0 + a['x'] * w if a['frac'] else float(self._tx(a['x']))
             py = y0 + a['y'] * h if a['frac'] else float(self._ty(a['y']))
+            if id(a) in spots:
+                gx, gy, leader, pts = spots[id(a)]
+                if leader:
+                    marks.polyline(c, leader[::2], leader[1::2], a['rgb'], 0.5 * pal.spacing, 0.6, cap = 0)
+                g, _, cut = self._note(a)
+                text.draw_glyph(c, g, gx, gy, pts, (1.0, 1.0, 1.0) if pal.is_dark else pal.color('paper') if cut else
+                                None)
+                continue
             ty, gap = placed.get(id(a), (py + a['dy'], 0.0))
             # Only a spread label that had to move gets a leader
             if id(a) in placed and abs(ty - py - a['dy']) > 0.3 * gap:
@@ -2349,6 +2879,15 @@ class Axes:
                 k = pal.spacing
                 marks.polyline(c, [px + way * 2.0 * k, px + a['_dx'] - way * 1.5 * k], [py, ty], a['rgb'], 0.5 * k, 0.6,
                                cap = 0)
+            g, pts, cut = self._note(a)
+            if g is not None:
+                left, bottom, right, top = g.extent(pts, cut)
+                gx = px + a['_dx'] - {'left': left, 'center': (left + right) / 2, 'right': right}[a['_ha']]
+                # Its root level with the point, or its edge at it
+                gy = ty - {'top': top, 'bottom': bottom, 'baseline': bottom}.get(a['va'], 0.0)
+                text.draw_glyph(c, g, gx, gy, pts, (1.0, 1.0, 1.0) if pal.is_dark else pal.color('paper') if cut else
+                                None)
+                continue
             n = len(c.ops)
             text.draw(c, px + a['_dx'], ty, a['s'], a['size'] or size, a['rgb'], bold, ha = a['_ha'],
                       va = a['va'], rotation = a['rotation'], halo = a['halo'], halo_color = pal.color('paper'),
@@ -2414,13 +2953,12 @@ class Axes:
         if loc == 'right':
             left, top = x0 + w + right + 16.0 * u, y0 + h - 8.0 * u
         elif loc == 'below':
-            rows = round(th / row)
             left = x0 if tw >= w else x0 + (w - tw) / 2
-            top = (y0 - 40.0 * u if self._legend_y is None else self._legend_y) + (rows - 1) * row
+            top = (y0 - 40.0 * u if self._legend_y is None else self._legend_y) + (th - row)
         else:
             left = x0 + w - tw - 8.0 * u if 'right' in loc else x0 + 10.0 * u
             top = y0 + h - 12.0 * u if 'upper' in loc else y0 + 12.0 * u + th - row
-        for (dx, dy), (s, rgb, k, marker, area, _) in zip(spots, entries):
+        for (dx, dy), (s, rgb, k, marker, area, _, g, _) in zip(spots, entries):
             x, y = left + dx, top - dy
             if k == 'header':
                 text.draw(c, x, y, s, size, pal.color(pal.ink), True, va = 'center', tracking = track)
@@ -2434,6 +2972,11 @@ class Axes:
             else:
                 lo, hi = y - 4.5 * u, y + 4.5 * u
                 marks.polygon(c, [x, x + 12.0 * u, x + 12.0 * u, x], [lo, lo, hi, hi], rgb)
+            if g is not None:
+                cut = self._legend_cut()
+                gl, gb, _, gt = g.extent(size * text.GLYPH_SYMBOL, cut is not None)
+                text.draw_glyph(c, g, x + 17.0 * u - gl, y - (gb + gt) / 2, size * text.GLYPH_SYMBOL, cut)
+                continue
             text.draw(c, x + 17.0 * u, y, s, size, pal.color(pal.ink), pal.text_bold, va = 'center', tracking = track,
                       halo = 0.0 if loc in ('right', 'below') else 2.6 * u, halo_color = pal.color('paper'))
 

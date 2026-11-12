@@ -122,7 +122,7 @@ def test_labels_leave_room_inside_the_page():
     ax.bar(['a long category', 'another long one'], [1000000, 2000000])
     ax.set_xlabel('x')
     ax.set_ylabel('y')
-    c = fig._canvas()
+    fig._canvas()
     x0, y0, w, h = ax.rect
     assert x0 > 0 and y0 > 0 and x0 + w <= fig.width and y0 + h <= fig.height
     assert w > 100 and h > 100
@@ -3101,3 +3101,278 @@ def test_violins_scale_by_area_count_or_width():
     assert peaks['area'][1] / peaks['area'][0] == pytest.approx(4 * peaks['count'][1] / peaks['count'][0])
     with pytest.raises(ValueError, match = 'density_norm'):
         vc.subplots()[1].violinplot(data, density_norm = 'height')
+
+
+def _beads(label, vertical = False):
+    """A stand-in for GlycoDraw, as CI has no glycowork: a row of outlined discs per '|'-separated part of a label of
+    letters, the first part lowest and longest, its rightmost disc the root (the lowest in a vertical drawing), and a
+    bit of text; anything else is no drawing."""
+    if not label.replace('|', '').isalpha():
+        return None
+    rows = label.split('|')
+    w, h = 50 * max(map(len, rows)), 50 * len(rows)
+    body = []
+    for r, row in enumerate(rows):
+        for i, _ in enumerate(row):
+            x, y = w - 25 - 50 * i, h - 25 - 50 * r
+            x, y = (y, w - x) if vertical else (x, y)
+            body.append(f'<circle cx="{x}" cy="{y}" r="18" fill="#058F60" stroke="#000000" stroke-width="2"/>')
+    body.append(f'<text x="{w / 2}" y="{h - 2}" font-size="12" text-anchor="middle">b4</text>')
+    w, h = (h, w) if vertical else (w, h)
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
+            f'{"".join(body)}</svg>')
+
+
+def _symbols(ops):
+    """Middles and sizes of the discs among a display list's ops, on the page, one per subpath, as a glyph's discs of
+    one paint are one path."""
+    out = []
+    for op in ops:
+        if op['kind'] == 'path' and op['fill'] and op['stroke'] and op['fill_rgb'] == pytest.approx(
+                (5 / 255, 143 / 255, 96 / 255)):
+            m, subs = op['ctm'], []
+            for s in op['path']:
+                if s[0] == 'm':
+                    subs.append([])
+                subs[-1] += [(m[0] * s[i] + m[2] * s[i + 1] + m[4], m[1] * s[i] + m[3] * s[i + 1] + m[5])
+                             for i in range(1, len(s), 2)]
+            for pts in map(np.array, subs):
+                out.append((*(pts.min(0) + pts.max(0)) / 2, np.ptp(pts, axis = 0).max()))
+    return np.array(out).reshape(-1, 3)
+
+
+def test_glyph_labels_sit_their_root_on_the_tick():
+    fig, ax = vc.subplots(figsize = (5, 4))
+    ax.barh(['abc|d', 'ab', '42'], [1, 2, 3])
+    ax.tick_params('y', glyphs = _beads)
+    ops = fig.display_list()
+    beads = _symbols(ops)
+    # Four discs and two, and the label that draws nothing stays text
+    assert len(beads) == 6 and any(op['kind'] == 'text' and op['text'] == '42' for op in ops)
+    for y in ax._ty([0.0, 1.0]):
+        # Each glyph's root, its rightmost disc, is level with its tick, and the drawing ends left of the axes
+        row = beads[np.abs(beads[:, 1] - y) < 1e-6]
+        assert len(row) and row[:, 0].max() + row[0, 2] / 2 < ax.rect[0]
+    assert np.ptp(beads[:, 2]) < 1e-6 and beads[0, 2] <= ax._tick_sizes()[1] * vc.text.GLYPH_SYMBOL + 1e-6
+
+
+def test_glyph_labels_grow_the_page_before_any_is_left_out():
+    names = ['abcdefghijklmn'[k] + 'a' * (k % 3 + 1) + '|ab|a' for k in range(14)]
+    fig, ax = vc.subplots(figsize = (5, 3))
+    ax.barh(names, np.arange(14))
+    ax.tick_params('y', glyphs = _beads)
+    fig.layout()
+    assert ax.ylabels == names and fig.height > 3 * 72
+    # Neighbors in a column never meet, whether the labels share one or stagger in two
+    boxes = sorted((y + e[1], y + e[3]) for y, e in zip(ax._ty(ax.yticks), (
+        ax._glyph_extent('y', vc.text.glyph(_beads, s)) for s in ax.ylabels)))
+    step = ax._gcols
+    assert all(lo[1] <= hi[0] for lo, hi in zip(boxes[:-step], boxes[step:]))
+    # Past what the page may grow, labels are left out as text would be
+    fig, ax = vc.subplots(figsize = (5, 1))
+    ax.barh([n + 'a' * k for k in range(4) for n in names], np.arange(56))
+    ax.tick_params('y', glyphs = _beads)
+    fig.layout()
+    assert len(ax.ylabels) < 56 and fig.height <= 3 * 72 + 1e-6
+
+
+def test_crowded_x_glyphs_run_up_the_page():
+    asked = []
+    def maker(label, vertical):
+        asked.append(vertical)
+        return _beads(label, vertical)
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.boxplot({'abcdefghijkl'[:k] + 'xyz'[k % 3]: [1, 2, k] for k in range(5, 12)})
+    ax.tick_params('x', glyphs = maker)
+    beads = _symbols(fig.display_list())
+    assert ax.xrot == 90.0 and True in asked
+    for x in ax._tx(ax.xticks):
+        # The root, the lowest disc, sits on the tick, and the drawing hangs below the axes
+        column = beads[np.abs(beads[:, 0] - x) < 1e-6]
+        assert len(column) >= 5 and column[:, 1].max() < ax.rect[1]
+
+
+def test_glyphs_are_stickers_on_a_dark_page_and_halos_over_marks():
+    fig, ax = vc.subplots(palette = 'aura-dark')
+    ax.scatter([0, 1], [0, 1])
+    ax.annotate('abc', (0.5, 0.5), glyph = _beads)
+    cut = [op for op in fig.display_list() if op['kind'] == 'path' and op['fill_rgb'] == (1.0, 1.0, 1.0)]
+    # One cut runs around the discs, and one around the text's box where the text is drawn
+    assert all(op['cap'] == 1 and op['stroke'] for op in cut)
+    assert sorted([s[0] for s in op['path']].count('m') for op in cut) in ([3], [1, 3])
+    fig, ax = vc.subplots()
+    ax.annotate('abc', (0.5, 0.5), glyph = _beads)
+    assert sum(op['fill_rgb'] == fig.pal.color('paper') for op in fig.display_list() if op['kind'] == 'path') in (1, 2)
+    fig, ax = vc.subplots()
+    ax.annotate('abc', (0.5, 0.5), glyph = _beads, halo = 0.0)
+    assert not any(op['kind'] == 'path' and op['cap'] == 1 and op['fill_rgb'] == fig.pal.color('paper')
+                   for op in fig.display_list())
+
+
+def test_spread_glyphs_stack_across_both_sides_of_their_points():
+    fig, ax = vc.subplots(figsize = (5, 4))
+    ax.scatter([0, 1, 2, 3], [1.0, 1.02, 1.04, 0.98])
+    for x, y, side in ((0, 1.0, 'left'), (1, 1.02, 'left'), (3, 1.04, 'right'), (2, 0.98, 'right')):
+        ax.annotate('abcd|ab', (x, y), offset = (4, 0) if side == 'left' else (-4, 0), ha = side, glyph = _beads,
+                    spread = True)
+    fig.layout()
+    boxes = ax.boxes()[-4:]
+    assert len(_symbols(fig.display_list())) == 24
+    # The four drawings span one another across the page, so they stack, and no two meet
+    for i in range(4):
+        for j in range(i + 1, 4):
+            a, b = boxes[i], boxes[j]
+            assert a[3] <= b[1] + 1e-6 or b[3] <= a[1] + 1e-6 or a[2] <= b[0] or b[2] <= a[0]
+
+
+def test_legend_rows_hold_their_glyphs():
+    fig, ax = vc.subplots(figsize = (5, 4))
+    for name in ('abc|ab|a', 'ab', 'x1'):
+        ax.plot([0, 1], [0, 1], label = name)
+    ax.legend('right', glyphs = _beads)
+    ops = fig.display_list()
+    assert len(_symbols(ops)) == 8 and any(op['kind'] == 'text' and op['text'] == 'x1' for op in ops)
+    spots, (w, h) = ax._legend_grid()
+    assert h > 3 * vc.axes.LEGEND_ROW and spots[1][1] - spots[0][1] > vc.axes.LEGEND_ROW
+
+
+def test_glyph_figures_save_everywhere_and_replay_in_another_palette(tmp_path):
+    def draw(palette):
+        fig, heat = vc.clustermap(np.arange(12.0).reshape(4, 3) % 5, yticklabels = ['abc', 'ab|a', 'abcd', 'zz9'],
+                                  palette = palette, glyphs = _beads)
+        heat.annotate('ab', (1, 1), glyph = _beads)
+        return fig
+    for kind in ('png', 'pdf', 'svg'):
+        draw('lumen').save(tmp_path / f'glyphs.{kind}')
+    # The drawing's text is embedded with the page's own
+    assert b'/FontFile2' in (tmp_path / 'glyphs.pdf').read_bytes()
+    moved, direct = draw('couture').in_palette('poster'), draw('poster')
+    assert moved.to_png(72.0) == direct.to_png(72.0) and moved.to_pdf() == direct.to_pdf()
+
+
+def test_glyph_makers_are_checked_and_registered():
+    with pytest.raises(ValueError, match = 'Glyphs come from'):
+        vc.subplots()[1].tick_params('y', glyphs = 'snfg')
+    vc.register_glyphs('beads', _beads)
+    fig, ax = vc.subplots()
+    ax.bar(['abc', 'de'], [1, 2])
+    ax.tick_params('x', glyphs = 'beads')
+    assert len(_symbols(fig.display_list())) == 5
+    ax.tick_params('x', glyphs = False)
+    assert not len(_symbols(fig.display_list()))
+
+
+def test_a_glyph_writes_each_paint_once_and_leaves_out_unreadable_text():
+    g = vc.text.glyph(_beads, 'abcd|ab')
+    # Six discs of one paint are one path, and the cut one path for shapes and one for the text's box
+    assert len([op for op in g.ops if op['kind'] == 'path']) == 1 and len(g.cut) == 2
+    c = pdfwrite.Canvas(BytesIO(), (200, 200))
+    vc.text.draw_glyph(c, g, 100, 100, 3.0, (1.0, 1.0, 1.0))
+    assert not any(op['kind'] == 'text' for op in c.ops) and len(c.ops) == 2 and not c.glyphs
+    c = pdfwrite.Canvas(BytesIO(), (200, 200))
+    vc.text.draw_glyph(c, g, 100, 100, 30.0, (1.0, 1.0, 1.0))
+    assert sum(op['kind'] == 'text' for op in c.ops) == 1 and len(c.ops) == 4 and c.glyphs
+
+
+def test_crowded_glyph_rows_stagger_in_two_columns():
+    names = ['abcdefghijklmnopqrstuvwxyz'[k] + 'a' * (k % 3 + 1) + '|ab|a|a' for k in range(26)]
+    fig, ax = vc.subplots(figsize = (5, 3))
+    ax.barh(names, np.arange(26))
+    ax.tick_params('y', glyphs = _beads)
+    ops = fig.display_list()
+    # One column would need more than the threefold page, and two fit within it
+    assert ax._gcols == 2 and ax.ylabels == names and fig.height <= 3 * 3 * 72 + 1e-6
+    # Where the page may grow enough, the labels keep one column, and past what it may, some are left out once
+    fig, ax = vc.subplots(figsize = (5, 8))
+    ax.barh(names, np.arange(26))
+    ax.tick_params('y', glyphs = _beads)
+    fig.layout()
+    assert ax._gcols == 1 and ax.ylabels == names
+    fig, ax = vc.subplots(figsize = (5, 2))
+    ax.barh(names, np.arange(26))
+    ax.tick_params('y', glyphs = _beads)
+    fig.layout()
+    assert len(ax.ylabels) == 13 and fig.height == pytest.approx(3 * 2 * 72)
+    # Every other row reaches its label through a hairline, and both columns face the axes from the left
+    widths, offsets = ax._ytick_columns(ax._tick_sizes()[1])
+    assert sorted(set(offsets))[0] == 0.0 and len(set(offsets)) == 2 and widths > max(offsets)
+    hairlines = [op for op in ops if op['kind'] == 'path' and op['stroke'] and not op['fill']
+                 and abs(op['line_width'] - 0.4 * fig.pal.spacing) < 1e-9]
+    assert len(hairlines) == 13
+    beads = _symbols(ops)
+    assert beads[:, 0].max() < ax.rect[0]
+
+
+def _crossings(spots):
+    """How many pairs of the leaders among placed glyphs cross."""
+    lines = [v[2] for v in spots.values() if v[2] is not None]
+    turn = lambda a, b, c: (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    return sum(turn(u[:2], u[2:], v[:2]) * turn(u[:2], u[2:], v[2:]) < 0 and
+               turn(v[:2], v[2:], u[:2]) * turn(v[:2], v[2:], u[2:]) < 0
+               for n, u in enumerate(lines) for v in lines[n + 1:])
+
+
+def test_spread_glyphs_find_room_inside_the_axes():
+    rng = np.random.default_rng(5)
+    x, y = rng.normal(0, 0.3, 60), rng.normal(0, 0.3, 60)
+    fig, ax = vc.subplots(figsize = (6, 5))
+    ax.scatter(x, y)
+    ax.set_xlim(-3, 3)
+    ax.set_ylim(-3, 3)
+    for i in range(8):
+        ax.annotate('abc|ab', (x[i], y[i]), glyph = _beads, spread = True)
+    fig.layout()
+    boxes = ax.boxes()[-8:]
+    x0, y0, w, h = ax.rect
+    assert (boxes[:, 0] >= x0 - 1e-6).all() and (boxes[:, 2] <= x0 + w + 1e-6).all()
+    assert (boxes[:, 1] >= y0 - 1e-6).all() and (boxes[:, 3] <= y0 + h + 1e-6).all()
+    for i in range(8):
+        for j in range(i + 1, 8):
+            a, b = boxes[i], boxes[j]
+            assert a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1]
+    # Drawn where boxes() says, each with a leader where it stands apart, and no two leaders cross
+    spots = ax._place_glyphs()
+    assert len(spots) == 8 and not _crossings(spots)
+    # A crowd too dense to label point by point keeps its drawings apart, uncrossed, on the page, and off its points
+    fig, ax = vc.subplots(figsize = (6, 5))
+    ax.scatter(np.zeros(14), np.linspace(0, 0.5, 14))
+    ax.set_xlim(-10, 10)
+    ax.set_ylim(-3, 3)
+    for i, y in enumerate(np.linspace(0, 0.5, 14)):
+        ax.annotate('abcde'[:i % 4 + 2] + '|ab', (0.0, y), glyph = _beads, spread = True)
+    fig.layout()
+    spots, boxes = ax._place_glyphs(), ax.boxes()[-14:]
+    assert not _crossings(spots)
+    # No drawing covers another's point
+    px, ys = float(ax._tx(0.0)), ax._ty(np.linspace(0, 0.5, 14))
+    assert (boxes[:, 1] >= 0).all()
+    assert not any(b[0] + 1 < px < b[2] - 1 and b[1] + 1 < y < b[3] - 1 for i, b in enumerate(boxes)
+                   for j, y in enumerate(ys) if i != j)
+    for i in range(14):
+        for j in range(i + 1, 14):
+            a, b = boxes[i], boxes[j]
+            assert a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1]
+    # The same page places them the same way
+    assert fig.to_png(72.0) == fig.to_png(72.0)
+    # A few drawings with room around them grow past their type's size, and a size given by hand is the largest
+    for size, largest in ((None, max(vc.axes.GLYPH_SIZES)), (6.0, 1.0)):
+        fig, ax = vc.subplots(figsize = (6, 5))
+        ax.scatter([0, 1], [0, 1])
+        ax.annotate('ab', (0.2, 0.8), glyph = _beads, spread = True, size = size)
+        fig.layout()
+        (_, _, _, pts), = ax._place_glyphs().values()
+        assert pts == pytest.approx((size or 8.6) * vc.text.GLYPH_SYMBOL * largest)
+
+
+def test_a_halo_follows_tracked_letters():
+    c = pdfwrite.Canvas(BytesIO(), (400, 100))
+    vc.text.draw(c, 10, 50, 'HALO', 20, (0, 0, 0), tracking = 6.0, halo = 2.0)
+    halo, letters = c.ops[0], c.ops[1]
+    xs = [s[i] + halo['ctm'][4] for s in halo['path'] for i in range(1, len(s), 2)]
+    # The halo's last letter ends where the tracked text does, not a tracking per letter short
+    assert max(xs) == pytest.approx(10 + width('HALO', 20) + 3 * 6.0, abs = 1.5) and letters['char_space'] == 6.0
+
+
+def test_glycans_draw_through_glycowork():
+    pytest.importorskip('glycowork')
+    assert vc.text.glyph('glycan', 'Gal(b1-4)GlcNAc') is not None and vc.text.glyph('glycan', 'not a glycan') is None

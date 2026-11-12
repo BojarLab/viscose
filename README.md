@@ -67,18 +67,26 @@ The same data and the same labels, with no styling on either side: matplotlib an
 
 ## Glycans in your plots
 
-viscose shares its renderer with [glycowork](https://github.com/BojarLab/glycowork)'s GlycoDraw, so a plot can carry real SNFG
-drawings as sharp as the rest of the figure, in PNG, PDF, and SVG.
+viscose shares its renderer with [glycowork](https://github.com/BojarLab/glycowork)'s GlycoDraw, so glycans are glyphs: real
+SNFG drawings that stand wherever a label does, laid out by the same engine as the rest of the figure and as sharp in PNG, PDF,
+and SVG. Tick labels, annotations, legend entries, and clustermap rows all take them. Each drawing's reducing end sits on its
+tick or beside its point. Tick drawings scale together to fit between their neighbors, crowded rows stagger into two
+columns, and the page grows before any label is left out. Annotations with `spread = True` find open room around their
+points, clear of the data and of each other, at the largest size that room allows, with a hairline where they stand apart.
+On a dark page they become die-cut stickers, and a glycan at heatmap size takes 1.5 kB of SVG.
 
 ```python
-from glycowork.motif.draw import annotate_figure
-
-ax.annotate('Neu5Ac(a2-6)Gal(b1-4)GlcNAc', (x, y), offset = (12, 0), svg_label = True)
-fig.save('volcano.svg')
-annotate_figure('volcano.svg', filepath = 'volcano.pdf', compact = True)
+ax.barh(glycans, abundance)
+ax.tick_params('y', glyphs = 'glycan')
+ax.annotate('Neu5Ac(a2-6)Gal(b1-4)GlcNAc', (x, y), glyph = 'glycan', spread = True)
+ax.legend('right', glyphs = 'glycan')
+vc.clustermap(table, glyphs = 'glycan')
 ```
 
-<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/glycans.png" alt="A volcano plot and a biosynthetic network with SNFG glycan drawings as labels" width="100%"></p>
+Labels that name no glycan, such as a sample, stay text. Any drawing can be a glyph: `vc.register_glyphs(name, maker)` takes
+a function that returns SVG for a label, for chemical structures, protein domains, or icons of your own.
+
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/glycans.png" alt="A volcano plot with SNFG glycan drawings beside its points, and a bar chart of colorectal N-glycans with their drawings as tick labels" width="100%"></p>
 
 ## Everything you reach for
 
