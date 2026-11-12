@@ -1279,7 +1279,11 @@ def test_a_glycan_label_records_what_the_page_needs_without_it():
     assert abs(bare - 4 * 72) < 0.01 and fig.width > 4 * 72
     # What is left as text says how far it reaches, and slate's mark stays right after the root tag
     right = float(re.search(r'data-right="([\d.]+)"', svg).group(1))
-    assert abs(right - (float(fig.axes[0]._tx(0.9)) + 5 + width(glycan, 8.6, fig.pal.text_bold))) < 1
+    # Its ink, which starts at the point and stands in from the advance by the last glyph's side bearing
+    name = vc.text.fonts()[1 if fig.pal.text_bold else 0]
+    ink = width(glycan, 8.6, fig.pal.text_bold) - 8.6 * (vc.text._bearings(name, glycan[0])[0] +
+                                                         vc.text._bearings(name, glycan[-1])[1])
+    assert abs(right - (float(fig.axes[0]._tx(0.9)) + 5 + ink)) < 0.05
     assert re.search(r'<svg[^>]*>\n<metadata>viscose</metadata>\n', svg)
     # Another label keeps the room it needs, as much as on a page of its own
     fig, _, none = labeled_figure((plain, False))
@@ -2338,7 +2342,23 @@ def _paper_page(palette):
 
 
 def _texts(c):
-    return [o['text'] for o in c.ops if o['kind'] == 'text']
+    """Every text op's text, and each label set as several ops, as tabular figures in a font whose figures differ in
+    width are, one op per character in cells less than a size apart."""
+    ops = [o for o in c.ops if o['kind'] == 'text']
+    rows = {}
+    for o in ops:
+        rows.setdefault((round(o['ctm'][5] + o['y'], 2), o['ctm'][:4], o['size']), []).append(o)
+    words = []
+    for row in rows.values():
+        row.sort(key = lambda o: o['ctm'][4] + o['x'])
+        word = [row[0]]
+        for prev, o in zip(row, row[1:]):
+            if o['ctm'][4] + o['x'] - prev['ctm'][4] - prev['x'] > o['size']:
+                words.append(''.join(w['text'] for w in word))
+                word = []
+            word.append(o)
+        words.append(''.join(w['text'] for w in word))
+    return [o['text'] for o in ops] + words
 
 
 @pytest.mark.parametrize('name', NAMES)
@@ -3606,6 +3626,8 @@ def test_numeric_y_labels_line_up_on_their_decimal_points():
     for label in ('0', '0.5', '1', '1.5'):
         row = next(r for r in rows.values() if ''.join(o['text'] for o in sorted(r, key = lambda o: o['x'])) == label)
         left, size = min(o['ctm'][4] + o['x'] for o in row), row[0]['size']
+        # Where its cells start: a figure narrower than its cell stands centered in it, in a font whose figures differ
+        left -= vc.text._pieces(label, vc.text.fonts()[0], size, 0.0, True)[0][0][1]
         points.append(left + width(label.split('.')[0], size, tabular = True))
     assert max(points) - min(points) < 1e-6
 
@@ -3624,7 +3646,8 @@ def test_text_lines_up_by_its_ink():
     # Numbers set as a table's line up by their cells instead
     c.ops = []
     vc.text.draw(c, 100, 50, '15', 20, (0, 0, 0), ha = 'right', tabular = True)
-    assert min(o['ctm'][4] + o['x'] for o in c.ops) == pytest.approx(100 - width('15', 20, tabular = True))
+    cells = min(o['ctm'][4] + o['x'] for o in c.ops) - vc.text._pieces('15', name, 20, 0.0, True)[0][0][1]
+    assert cells == pytest.approx(100 - width('15', 20, tabular = True))
 
 
 def test_apca_and_ciede2000_match_their_references():
