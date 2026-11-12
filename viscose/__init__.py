@@ -2,6 +2,7 @@
 from importlib.metadata import version, PackageNotFoundError
 from . import marks, text
 from .figure import Figure, clustermap, linkage, show_png, subplot_mosaic, subplots
+from .drawingml import deck
 # vc.open, which stays out of __all__, so that `from viscose import *` never hides Python's own open
 from .figure import open
 from .axes import Axes
@@ -12,6 +13,6 @@ try:
     __version__ = version('viscose')
 except PackageNotFoundError:
     __version__ = '0.0.0'
-__all__ = ['Axes', 'Figure', 'Palette', 'Press', 'clustermap', 'dark_mode', 'default_palette', 'get_palette',
+__all__ = ['Axes', 'Figure', 'Palette', 'Press', 'clustermap', 'dark_mode', 'deck', 'default_palette', 'get_palette',
            'linkage', 'palette', 'palettes', 'register_glyphs', 'register_palette', 'set_palette', 'show_png',
            'subplot_mosaic', 'subplots']

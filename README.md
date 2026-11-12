@@ -185,7 +185,7 @@ fig.save('proof.png', press = True)
 | **Pages** | `vc.Figure(183, 120, unit = 'mm')` is a journal page, `fig.add_axes((x, y, w, h), unit = 'mm')` places a panel from its top left, and `fig.letter(x, y, 'a', 'Heading')` and `fig.text` write panel letters and any other text on the page; `vc.subplot_mosaic('abc;ddd')` lets axes span cells of a grid |
 | **Axes** | `set_xscale` takes `linear`, `log`, `sqrt`, or any pair of functions; `fmt` on `set_xticks` and `set_yticks` writes the ticks, as `'{:.0%}'` or a function; `tick_params` sets each axis's tick length, pad, label size, and labels, puts x labels on top, or keeps labels exactly as set; `emphasis` sets chosen tick labels bold in a color; `set_spines` shows or hides each axis line |
 | **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, long axis names shrink, and the page grows for anything that needs it; `vc.subplots(sharex = True, sharey = 'row')` shares limits, scales, and ticks across all panels, rows, or columns, as in matplotlib |
-| **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG, and with `press` a CMYK PDF/X-4 for print or a soft proof; `scatter(rasterized = True)` makes tens of thousands of points one image there, as 100,000 points take 1.7 MB of SVG in place of 17.6 MB, with axes and text still vector; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window; `viscose.qt`, with `pip install "viscose[qt]"`, is that window: PySide6 widgets that paint a figure about ten times as fast as the rasterizer, with pan, zoom, and mouse targets |
+| **Output** | `fig.save` writes PNG, PDF, SVG, or PowerPoint from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG, native shapes and editable text in PowerPoint, and with `press` a CMYK PDF/X-4 for print or a soft proof; `vc.deck` makes a talk whose slides Morph into each other; `scatter(rasterized = True)` makes tens of thousands of points one image there, as 100,000 points take 1.7 MB of SVG in place of 17.6 MB, with axes and text still vector; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window; `viscose.qt`, with `pip install "viscose[qt]"`, is that window: PySide6 widgets that paint a figure about ten times as fast as the rasterizer, with pan, zoom, and mouse targets |
 | **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, and `ax.boxes()` gives the page boxes of everything drawn, for placing things yourself clear of it or answering a mouse |
 | **Display** | `fig.show()` works inline in Jupyter and slate, and in the system's image viewer from a terminal, with CI and coding agents kept silent |
 | **SVG hooks** | `gid` on `arrow` and `scatter` names elements for hover text and scripting |
@@ -193,6 +193,39 @@ fig.save('proof.png', press = True)
 | **Palettes** | `fig.in_palette('aura')` gives the same figure in another palette, exactly as if it had been drawn in that one, shades taken from `fig.pal` included |
 | **Source** | Every file `fig.save` writes carries the figure's own calls and data, a few kB of JSON, and `vc.open('fig3.pdf')` brings the figure back from that file alone: `vc.open('fig3.pdf', 'couture')` in another palette, `vc.open('fig3.pdf', 'aura-dark')` dark, `vc.open('fig3.pdf', size = (89, 70), unit = 'mm')` at a journal's column width, exactly as if drawn that way, and the numbers are there for anyone to read, as the PDF's attachment `figure-source.json`; `source = False` leaves it out |
 | **State** | None hidden: a figure is an object, with no current figure and nothing to close |
+
+## Talks that move
+
+`fig.save('figure.pptx')` writes a slide of PowerPoint's own shapes. Bars, points, lines, and cells are shapes you can
+click, text stays text in the palette's font, ready to edit in place, and Aura's soft shadows and Lumen's gradients are
+PowerPoint's own effects: PowerPoint renders every gallery figure in all eight palettes, light and dark, within 1 to 5.5
+levels of 255 of viscose's own pixels, on average. `vc.deck([fig1, fig2, fig3], 'talk.pptx')` puts figures on
+consecutive slides with Morph between them. Every shape is named after what it draws, by its axes, its series, and its
+own category, point name, or row and column, and Morph carries each shape to the shape of the same name on the next
+slide: bars grow to their new heights, points travel to their new places, ticks slide along their axes, and a heatmap's
+cells fly to where clustering puts them. Draw the next figure with the same calls on new data, and the talk animates
+itself, with no video files.
+
+The palette becomes the deck's theme. Its two hues are the theme's first two accents, and every shade, gradient, cell,
+and shadow is its hue's accent at the shade's own lightness; its ink, muted text, page, and guides are the theme's text
+and background colors, and its font the theme's. A deck's own theme, or PowerPoint's Design tab, recolors the figure in
+the new hues while every shade keeps its lightness, so contrast and order hold, and glycan drawings keep SNFG's colors.
+
+```python
+figs = []
+for day in (1, 4, 14):
+    fig, ax = vc.subplots(figsize = (13.333, 7.5))
+    ax.barh(glycans, shares.loc[day])
+    ax.tick_params('y', glyphs = 'glycan')
+    figs.append(fig)
+vc.deck(figs, 'talk.pptx')
+```
+
+Below is [such a deck](https://github.com/BojarLab/viscose/raw/main/examples/readme/talk.pptx) as PowerPoint plays it:
+human milk oligosaccharides on days 1, 4, and 14 of lactation, then the most abundant colorectal N-glycans in sample
+order and clustered. Five widescreen slides take 0.2 s and 45 kB.
+
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/talk.webp" alt="PowerPoint playing a viscose deck: bars of milk oligosaccharides with glycan drawings as ticks grow and shrink from day to day of lactation, and the cells of a heatmap of colorectal N-glycans fly to their places in a clustermap" width="100%"></p>
 
 ## Light and quick
 

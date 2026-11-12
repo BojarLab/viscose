@@ -24,6 +24,7 @@ for name in vc.palettes:
     ax.bar([0, 1], [1, 2])
     ax.legend()
     assert fig.to_png(72)[:4] == b'\\x89PNG' and fig.to_pdf()[:4] == b'%PDF' and '<svg' in fig.to_svg(), name
+    assert vc.deck([fig, fig])[:2] == b'PK', name
     fig, heat = vc.clustermap([[0.0, 1.0, 2.0], [2.0, 1.0, 0.5], [1.0, 1.5, 3.0]], palette = name)
     assert fig.to_png(72)[:4] == b'\\x89PNG' and sorted(fig.row_order) == [0, 1, 2], name
 print(f'viscose {vc.__version__} draws all {len(vc.palettes)} palettes from {vc.__file__}')

@@ -203,6 +203,7 @@ def draw(c, x, y, text, size, color, bold = False, ha = 'left', va = 'baseline',
         lead = tail = 0.0
     dx = {'left': -lead, 'center': (tail - lead - w) / 2, 'right': tail - w}[ha]
     dy = {'baseline': 0.0, 'center': -CAP_HEIGHT * size / 2, 'top': -CAP_HEIGHT * size, 'bottom': 0.22 * size}[va]
+    n = len(c.ops)
     c.saveState()
     c.translate(x, y)
     if rotation:
@@ -222,6 +223,10 @@ def draw(c, x, y, text, size, color, bold = False, ha = 'left', va = 'baseline',
         c.setFont(name, size * k)
         c.drawString(dx + at, dy + rise * size, t, charSpace = tracking)
     c.restoreState()
+    # PowerPoint sets the line's runs as one text box, aligned as asked, with its halo as a glow
+    if getattr(c, 'shapes', False):
+        for op in c.ops[n:]:
+            op['line'] = (n, ha, dy, ''.join(t for t, _, _ in runs(text)), halo, tuple(halo_color))
 
 
 # Points a glyph's median symbol, such as a monosaccharide, takes per point of type, and the least share of that which
@@ -283,12 +288,12 @@ class Glyph:
     """A drawing that stands in for a label: its display-list ops in units of its median symbol around its anchor, the
     middle of its root symbol (the rightmost, or the lowest in a vertical drawing, as a glycan's reducing end), with y
     up; `box` is the ink's (left, bottom, right, top), `cut` the ops of a die-cut layer under it, colored when drawn,
-    `fonts` the glyphs of each font its text uses, and `symbols` each symbol's (x, y, radius), where a leader may
-    end."""
-    __slots__ = ('ops', 'cut', 'box', 'fonts', 'symbols')
+    `fonts` the glyphs of each font its text uses, `symbols` each symbol's (x, y, radius), where a leader may end,
+    and `label` what it draws, which names its shapes in PowerPoint."""
+    __slots__ = ('ops', 'cut', 'box', 'fonts', 'symbols', 'label')
 
-    def __init__(self, ops, cut, box, fonts, symbols):
-        self.ops, self.cut, self.box, self.fonts, self.symbols = ops, cut, box, fonts, symbols
+    def __init__(self, ops, cut, box, fonts, symbols, label = ''):
+        self.ops, self.cut, self.box, self.fonts, self.symbols, self.label = ops, cut, box, fonts, symbols, label
 
     def extent(self, scale, cut = False):
         """(left, bottom, right, top) around the anchor at `scale` points per symbol, with the cut's reach if drawn."""
@@ -375,7 +380,7 @@ def glyph(maker, label, vertical = False):
                      even_odd = False, glyph_text = bool(i)) for i, path in enumerate((cut, boxed)) if path)
     box = tuple((v - o) / unit for v, o in zip((min(xs), min(ys), max(xs), max(ys)), root * 2))
     marks = tuple(((x - root[0]) / unit, (y - root[1]) / unit, size / 2 / unit) for size, x, y in symbols)
-    return Glyph(ink, cut, box, fonts, marks)
+    return Glyph(ink, cut, box, fonts, marks, label)
 
 
 def draw_glyph(c, g, x, y, scale, cut = None):
@@ -384,6 +389,7 @@ def draw_glyph(c, g, x, y, scale, cut = None):
     drawing's own round numbers under one shared transform, which compress better than page points: a glycan takes
     what GlycoDraw's own PDF of it does."""
     m = _mul((scale, 0.0, 0.0, scale, x, y), c.state['ctm'])
+    n = len(c.ops)
     # Text too small to read on the page is left out, with its share of the cut
     legible = [op for op in g.ops if op['kind'] != 'text' or op['size'] * _det(op['ctm']) * scale >= GLYPH_TEXT_MIN]
     lettered = any(op['kind'] == 'text' for op in legible)
@@ -393,6 +399,9 @@ def draw_glyph(c, g, x, y, scale, cut = None):
                               stroke_rgb = tuple(cut), fill_alpha = 1.0, stroke_alpha = 1.0))
     for op in legible:
         c.ops.append(dict(op, ctm = _mul(op['ctm'], m), clip = c.state['clip']))
+    if getattr(c, 'shapes', False):
+        for op in c.ops[n:]:
+            op['glyph'] = g.label
     # The page embeds the glyphs of every font its text uses
     for name, gids in g.fonts.items() if lettered else ():
         c.used[name] = pdfmetrics.fonts[name]

@@ -29,8 +29,9 @@ MARKERS = {'o': None,
 # From this many discs on, a raster output stamps them instead of tracing each one's curves, this many at a time: a
 # smaller batch finds more of its pixels opaque already, a larger one costs less around them
 STAMP_MIN, STAMP_BATCH = 50, 100
-# Dense plots of ringed or layered points are drawn in at most about this many overlapping groups
-POINT_GROUPS = 200
+# Dense plots of ringed or layered points are drawn in at most about this many overlapping groups; in PowerPoint, a
+# call's points are a shape each up to SHAPE_POINTS, so that Morph moves each to its own place
+POINT_GROUPS, SHAPE_POINTS = 200, 2000
 # A stamped marker other than a disc takes its coverage from a table per size, with its center on the nearest of this
 # many positions per pixel and axis; a scatter with more sizes than this stays vector
 SPRITE_PHASES, SPRITE_SIZES = 8, 4
@@ -166,6 +167,15 @@ def crowd_op(c, pal, bands):
         c.state['even_odd'] = True
         c.drawPath(p, fill = 1, stroke = 1)
         c.restoreState()
+
+
+def tag(c, n, **found):
+    """Note on the ops from `n` on what drew them, for PowerPoint, which names each shape after it; a note made
+    closer to the mark, such as a point's own index, stays."""
+    if getattr(c, 'shapes', False):
+        for op in c.ops[n:]:
+            for k, v in found.items():
+                op.setdefault(k, v)
 
 
 def _style(c, rgb = None, alpha = 1.0, stroke = None, lw = None, stroke_alpha = 1.0, cap = 0, join = 0, dash = None):
@@ -466,9 +476,10 @@ def _layers(pal, xs, ys, r, rgb, edge):
     return [(xs, ys, r, rgb, None, 0.0)]
 
 
-def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None):
+def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None, ids = None):
     """Scatter marks in the palette's manner; `area` is in points squared, as in matplotlib. `edge` is (color,
-    width), and with `rgb` None it is all that shows."""
+    width), and with `rgb` None it is all that shows. `ids` names each point, for PowerPoint, which draws up to
+    SHAPE_POINTS of them as a shape each, so that each moves to its own place."""
     n = len(xs)
     if not n:
         return
@@ -483,13 +494,18 @@ def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None):
     # Later points must cover earlier ones, or one path's rings would all lie over all its fills. Groups do that and
     # keep dense plots light; points that look alike when merged need no order.
     step = max(1, n // POINT_GROUPS) if edge is not None or pal.point != 'flat' or alpha < 1.0 else n
+    single = getattr(c, 'shapes', False) and n <= SHAPE_POINTS
+    if single:
+        step, ids = 1, np.arange(n) if ids is None else np.asarray(ids, dtype = object)[drawn]
     if not (getattr(c, 'stamp_dpi', None) and n >= STAMP_MIN and c.state['clip']
             and (marker == 'o' or len(np.unique(r)) <= SPRITE_SIZES)):
         form = getattr(c, 'marker_forms', False) and np.min(r) == np.max(r)
         for start in range(0, n, step):
-            chosen = slice(start, start + step)
+            chosen, at = slice(start, start + step), len(c.ops)
             for lx, ly, lr, color, stroke, lw in _layers(pal, xs[chosen], ys[chosen], r[chosen], rgb, edge):
                 shapes(c, lx, ly, lr, color, alpha, stroke, lw, marker, form)
+            if single:
+                tag(c, at, part = ids[start])
         return
     buf = _stamp_buffer(c, xs, ys, r, marker)
     if buf is None:

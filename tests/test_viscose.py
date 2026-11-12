@@ -3914,3 +3914,137 @@ def test_what_has_no_place_of_its_own_keeps_a_legend():
     assert [ax.legend_items[i][0] for i in ax._legend_keep] == ['counts', 'window'] and ax._legend_loc == 'below'
     assert sorted(a['s'] for a in ax.artists if a.get('direct')) == ['high', 'low', 'spread']
     assert fig.in_palette('aura').to_png(36.0) == draw('aura')[0].to_png(36.0)
+
+
+def _deck(data):
+    """A deck's parts by name, each XML part parsed once to prove it well formed, its slides, and their shape names."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    z = zipfile.ZipFile(BytesIO(data))
+    parts = {n: z.read(n) for n in z.namelist()}
+    for name, raw in parts.items():
+        if name.endswith(('.xml', '.rels')):
+            ET.fromstring(raw)
+    count = sum(1 for n in parts if re.fullmatch(r'ppt/slides/slide\d+\.xml', n))
+    slides = [parts['ppt/slides/slide%d.xml' % (i + 1)].decode() for i in range(count)]
+    return parts, slides, [re.findall(r'<p:cNvPr id="\d+" name="([^"]*)"', s)[1:] for s in slides]
+
+
+@pytest.mark.parametrize('palette', NAMES)
+def test_a_deck_names_every_shape_so_that_morph_carries_one_figure_into_the_next(palette):
+    def draw(heights, top):
+        fig, ax = vc.subplots(figsize = (6, 4), palette = palette)
+        fig.suptitle('Sialylation', 'by tissue')
+        ax.bar(['Tumor', 'Normal', 'Liver'], heights, label = 'Sialylated')
+        ax.plot([0, 1, 2], [1, top, 2], label = 'trend')
+        ax.set_xlabel('log_{2} fold change')
+        ax.legend('upper right')
+        return fig
+    parts, slides, names = _deck(vc.deck([draw([3, 5, 2], 4), draw([6, 2, 4], 7)], morph = 2.0))
+    assert '[Content_Types].xml' in parts and 'ppt/theme/theme1.xml' in parts
+    for found in names:
+        assert all(n.startswith('!!') for n in found) and len(found) == len(set(found))
+    # The same calls on new data draw shapes of the same names, which Morph pairs
+    bars = [{n for n in found if 'bars' in n} for found in names]
+    assert bars[0] == bars[1] and len({n.split(' #')[0] for n in bars[0]}) == 3
+    assert '!!a0 line trend' in names[0] and '!!page title' in names[0] and '!!a0 x name' in names[1]
+    # Named as shown, which in Couture is in capitals
+    assert '!!a0 legend trend' in [n.lower() for n in names[0]] and '!!a0 x label Tumor' in names[1]
+    assert 'p159:morph' not in slides[0] and 'p159:morph option="byObject"' in slides[1]
+    assert 'p14:dur="2000"' in slides[1]
+    # Text stays text, with its subscript as a lowered run of its own
+    assert '<a:t>Sialylation</a:t>' in slides[0] and '<a:t>Tumor</a:t>' in slides[0]
+    assert re.search(r'baseline="-\d+"[^>]*>(?:(?!</a:r>).)*<a:t>2</a:t>', slides[0])
+    assert '<p:sldSz cx="%d" cy="%d"/>' % (6 * 72 * 12700, 4 * 72 * 12700) in parts['ppt/presentation.xml'].decode()
+
+
+@pytest.mark.parametrize('palette', NAMES)
+def test_a_slide_is_what_every_other_format_draws(palette):
+    fig, ax = vc.subplots(figsize = (5, 4), palette = palette)
+    ax.bar(['a', 'b', 'c'], [1, 3, 2])
+    ax.plot([0, 1, 2], [2, 1, 3], dash = (3, 2), label = 'line')
+    ax.boxplot({'x': [1, 2, 3, 4], 'y': [2, 3, 5, 6]}, points = False)
+    ax.annotate('peak', (1, 3))
+    ax.set_title('Title')
+    tags = ('scope', 'artist', 'part', 'name', 'line', 'glyph')
+    assert [{k: v for k, v in op.items() if k not in tags} for op in fig._shapes()] == fig.display_list()
+
+
+def _hls_hex(rgb):
+    return '%02X%02X%02X' % tuple(int(round(v * 255)) for v in rgb)
+
+
+def test_the_palette_is_the_decks_theme_and_its_hues_follow_the_accents():
+    import colorsys
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'aura')
+    ax.bar(['a', 'b'], [1, 2], color = 'a2')
+    ax.plot([0, 1], [0, 1], color = '#3366FF')
+    parts, slides, _ = _deck(fig.to_pptx())
+    theme = parts['ppt/theme/theme1.xml'].decode()
+    accents = re.findall(r'<a:accent\d><a:srgbClr val="([0-9A-F]{6})"/>', theme)
+    assert accents == [_hls_hex(c) for c in fig.pal.contrast(6)]
+    hls = {'accent%d' % (i + 1): colorsys.rgb_to_hls(*(int(a[k:k + 2], 16) / 255 for k in (0, 2, 4)))
+           for i, a in enumerate(accents)}
+    # Every shade is its hue's accent turned, scaled, and set to its own lightness, as PowerPoint applies them in HSL
+    found = re.findall(r'<a:schemeClr val="(accent[12])"><a:hueOff val="(-?\d+)"/><a:satMod val="(\d+)"/>'
+                       r'<a:lumMod val="1"/><a:lumOff val="(-?\d+)"/>', slides[0])
+    made = {_hls_hex(colorsys.hls_to_rgb((hls[k][0] + int(t) / 216e5) % 1, hls[k][1] * 1e-5 + int(v) / 1e5,
+                                         min(1.0, hls[k][2] * int(s) / 1e5))) for k, t, s, v in found}
+    assert _hls_hex(fig.pal.color('a2')) in made
+    # Text and page are the theme's own, and a color of no palette hue stays as it is
+    assert '<a:schemeClr val="tx2"' in slides[0] and '<a:srgbClr val="3366FF"' in slides[0]
+    master = _deck(fig.in_palette(fig.pal.dark()).to_pptx())[0]['ppt/slideMasters/slideMaster1.xml'].decode()
+    assert 'bg1="dk1" tx1="lt1"' in master
+
+
+def test_points_and_cells_take_their_own_names_and_move_with_them():
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'poster')
+    ax.scatter([0, 1, 2], [1, 0, 2], names = ['Man5', 'Man9', 'Gal'], density = False)
+    ax.set_xlim(-0.5, 1.5)
+    points = [n for n in _deck(fig.to_pptx())[2][0] if 'points' in n]
+    # The point beyond the limits is not drawn, and its neighbors keep their own names
+    assert any(n.endswith('Man5') for n in points) and any(n.endswith('Man9') for n in points)
+    assert not any('Gal' in n for n in points)
+    m = np.array([[0.0, 5.0], [4.0, 1.0], [0.5, 4.5]])
+    rows, cols = ['r1', 'r2', 'r3'], ['c1', 'c2']
+    fig, ax = vc.subplots(figsize = (4, 4), palette = 'aura')
+    ax.heatmap(m, xticklabels = cols, yticklabels = rows)
+    flat = {n for n in _deck(fig.to_pptx())[2][0] if 'heat' in n}
+    fig, _ = vc.clustermap(m, xticklabels = cols, yticklabels = rows, palette = 'aura')
+    assert flat == {n for n in _deck(fig.to_pptx())[2][0] if 'heat' in n} and '!!a0 heat 0 r2 | c1' in flat
+
+
+def test_shapes_stay_within_the_axes_and_halos_are_glows(tmp_path):
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'aura')
+    x = np.linspace(0, 10, 100)
+    ax.plot(x, np.sin(x) * 3, dash = (4, 2))
+    ax.bar([2, 8], [5, 5])
+    ax.annotate('note', (5, 0), halo = 3.0)
+    ax.set_xlim(1, 7)
+    ax.set_ylim(-2, 2)
+    fig.layout()
+    x0, y0, w, h = ax.rect
+    k = 12700
+    _, slides, _ = _deck(fig.to_pptx())
+    shapes = re.findall(r'name="(!![^"]*(?:line|bars)[^"]*)".*?<a:off x="(-?\d+)" y="(-?\d+)"/><a:ext cx="(\d+)" '
+                        r'cy="(\d+)"/>', slides[0])
+    assert len(shapes) >= 2
+    for name, ox, oy, cx, cy in shapes:
+        assert (x0 - 2) * k <= int(ox) and int(ox) + int(cx) <= (x0 + w + 2) * k, name
+        assert (fig.height - y0 - h - 2) * k <= int(oy) and int(oy) + int(cy) <= (fig.height - y0 + 2) * k, name
+    # A round-capped dash takes its caps, which close Aura's narrow gaps as in every other format
+    assert '<a:custDash>' not in slides[0]
+    assert '<a:glow rad=' in slides[0] and '<a:t>note</a:t>' in slides[0]
+    path = fig.save(tmp_path / 'f.pptx')
+    assert path.read_bytes()[:2] == b'PK'
+    with pytest.raises(ValueError, match = 'CMYK'):
+        fig.save(tmp_path / 'f.pptx', press = True)
+    with pytest.raises(ValueError, match = 'at least one'):
+        vc.deck([])
+
+
+def test_a_heatmap_takes_true_and_false_for_its_labels():
+    fig, ax = vc.subplots(figsize = (4, 4), palette = 'aura')
+    ax.heatmap(np.eye(3), xticklabels = False, yticklabels = True)
+    fig.layout()
+    assert ax.xlabels == [] and ax.ylabels == ['2', '1', '0']

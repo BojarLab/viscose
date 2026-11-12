@@ -1,6 +1,6 @@
 """Draws every image in the README into examples/readme/: python examples/readme_figures.py
-Needs matplotlib and seaborn for the comparison, pillow for arranging the panels, and glycowork for the glycan
-drawings."""
+Needs matplotlib and seaborn for the comparison, pillow for arranging the panels, glycowork for the glycan drawings and
+the talk's data, and PowerPoint with pywin32 and OpenCV for the animation of the talk."""
 from io import BytesIO
 from pathlib import Path
 import numpy as np
@@ -182,8 +182,91 @@ def crowd(density):
     return fig
 
 
+def talk():
+    """Real data as slides: human milk oligosaccharides on days 1, 4, and 14 of lactation, then the most abundant
+    colorectal N-glycans as a heatmap in sample order and clustered."""
+    from glycowork.glycan_data.loader import glycomics_data_loader
+    milk = glycomics_data_loader.time_series_HMO_PMID22649065
+    day = milk['ID'].str.extract(r'_d(\d+)_')[0].astype(int).values
+    shares = milk.iloc[:, 1:].astype(float)
+    by_day = (shares.div(shares.sum(axis = 1), axis = 0) * 100).groupby(day).mean()
+    top = by_day.mean().sort_values().index[-7:]
+    figs = []
+    for d in (1, 4, 14):
+        fig, ax = vc.subplots(figsize = (13.333, 7.5), palette = 'aura')
+        fig.suptitle('Milk oligosaccharides over lactation', f'Day {d}, mean of {(day == d).sum()} mothers')
+        ax.barh(list(top), by_day.loc[d, top].values)
+        ax.tick_params('y', glyphs = 'glycan')
+        ax.set_xlim(0, 40)
+        ax.set_xlabel('Share of measured HMOs (%)')
+        figs.append(fig)
+    table = glycomics_data_loader.human_colorectal_N_PMID26085185
+    m = table.iloc[:, 1:].astype(float)
+    m = m / m.sum() * 100
+    z = m.iloc[np.argsort(m.mean(axis = 1).values)[-24:]]
+    z = z.sub(z.mean(axis = 1), axis = 0).div(z.std(axis = 1), axis = 0)
+    z = z.set_axis([f'N{i + 1}' for i in range(len(z))]).set_axis([c.replace('Avg_RA_', '') for c in z.columns],
+                                                                     axis = 1)
+    heading = ('Colorectal N-glycans', 'z-scores of the 24 most abundant, in tumor (T) and normal (N) tissue')
+    fig, ax = vc.subplots(figsize = (13.333, 7.5), palette = 'aura')
+    fig.suptitle(*heading)
+    ax.heatmap(z.values, xticklabels = list(z.columns), yticklabels = list(z.index), colorbar = True)
+    figs.append(fig)
+    fig, _ = vc.clustermap(z, figsize = (13.333, 7.5), palette = 'aura')
+    figs.append(fig.suptitle(*heading))
+    return figs
+
+
+def morph_video(deck, name, width = 960, fps = 15):
+    """A deck as PowerPoint plays it, exported by PowerPoint itself as video and turned into an animated WebP, so that
+    what the README shows is Morph's own work. Needs Windows with PowerPoint, pywin32, and OpenCV, and is skipped
+    elsewhere."""
+    import tempfile
+    import time
+    try:
+        import cv2
+        import win32com.client
+    except ImportError:
+        print('Skipping', name, 'which needs PowerPoint, pywin32, and OpenCV')
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        video = str(Path(tmp) / 'deck.mp4')
+        app = win32com.client.DispatchEx('PowerPoint.Application')
+        pres = app.Presentations.Open(str(Path(deck).resolve()), True, False, False)
+        try:
+            # Each slide holds for a second after its transition
+            pres.CreateVideo(video, False, 1, 720, fps, 90)
+            while pres.CreateVideoStatus in (1, 2):
+                time.sleep(1)
+        finally:
+            pres.Close()
+            app.Quit()
+        frames, cap = [], cv2.VideoCapture(video)
+        while True:
+            ok, f = cap.read()
+            if not ok:
+                break
+            frames.append(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).resize(
+                (width, round(width * f.shape[0] / f.shape[1])), Image.LANCZOS))
+        cap.release()
+    # A slide held still is one frame shown for as long, which the video repeats at every tick
+    kept, times = [], []
+    for f in frames:
+        if kept and np.abs(np.asarray(f, np.int16) - np.asarray(kept[-1], np.int16)).mean() < 0.4:
+            times[-1] += round(1000 / fps)
+        else:
+            kept.append(f)
+            times.append(round(1000 / fps))
+    # Animated WebP keeps full color, which a GIF's 256 would not: SNFG's small yellow circles lost theirs
+    kept[0].save(OUT / name, save_all = True, append_images = kept[1:], duration = times, loop = 0, quality = 82,
+                 method = 6)
+
+
 if __name__ == '__main__':
     OUT.mkdir(exist_ok = True)
+    # Real data as a talk, which the README links to as a deck and shows as PowerPoint plays it
+    vc.deck(talk(), OUT / 'talk.pptx')
+    morph_video(OUT / 'talk.pptx', 'talk.webp')
     names = list(vc.palettes)
     figures = {f.__name__: f for f in gallery.FIGURES.values()}
     arrange([[tile(gallery.ridges(p), 640) for p in names],
@@ -207,5 +290,5 @@ if __name__ == '__main__':
     arrange([[tile(crowd(False), 900), tile(crowd(True), 900)]], 'crowd.png')
     arrange([[tile(figures[k](p + '-dark'), 640) for k, p in zip(('trial', 'volcano', 'stacked', 'embedding'), names)]],
             'dark.png')
-    for path in sorted(OUT.glob('*.png')):
+    for path in sorted([*OUT.glob('*.png'), *OUT.glob('*.webp'), *OUT.glob('*.pptx')]):
         print(path.name, path.stat().st_size // 1024, 'kB')

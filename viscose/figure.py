@@ -828,30 +828,42 @@ class Figure:
         return min(self.width, max(self.width - grown, self.width + needed))
 
     @_in_font
-    def _canvas(self, stamp_dpi = None, marker_forms = False, layout = True):
+    def _canvas(self, stamp_dpi = None, marker_forms = False, layout = True, shapes = False):
         """Everything drawn onto a fresh display list; `stamp_dpi` names a raster output, where many discs become an
-        image, and `marker_forms` a PDF, where markers of one size can be one stored shape."""
+        image, `marker_forms` a PDF, where markers of one size can be one stored shape, and `shapes` PowerPoint, where
+        each op notes what drew it, which names its shape."""
         if layout:
             self._layout()
         c = pdfwrite.Canvas(BytesIO(), pagesize = (self.width, self.height))
         c.stamp_dpi = stamp_dpi
         c.marker_forms = marker_forms
+        c.shapes = shapes
         pal = self.pal
-        for ax in self.axes:
+        for i, ax in enumerate(self.axes):
+            n = len(c.ops)
             ax._draw_axes(c)
-        for ax in self.axes:
+            marks.tag(c, n, scope = ('a%d' % i, 'frame'))
+        for i, ax in enumerate(self.axes):
+            n = len(c.ops)
             ax._draw_marks(c)
+            marks.tag(c, n, scope = ('a%d' % i, 'marks'))
         if self._title:
             y = self.height - 38.0
+            n = len(c.ops)
             text.draw(c, 30.0, y, self._title, pal.title_size, pal.color(pal.title_color or pal.ink), pal.title_bold)
+            marks.tag(c, n, name = 'title')
             if self._subtitle:
                 caps = pal.extra.get('subtitle_caps')
                 y -= 1.25 * pal.title_size * self._title.count('\n')
+                n = len(c.ops)
                 text.draw(c, 32.0, y - 20.0, self._subtitle.upper() if caps else self._subtitle, pal.subtitle_size,
                           pal.color(pal.subtitle_color or pal.muted), pal.subtitle_bold,
                           tracking = 0.9 if caps else 0.0)
-        for ax in self.axes:
+                marks.tag(c, n, name = 'subtitle')
+        for i, ax in enumerate(self.axes):
+            n = len(c.ops)
             ax._draw_text(c)
+            marks.tag(c, n, scope = ('a%d' % i, 'text'))
         for t in self._texts:
             x, y = ((t['x'] * UNITS['mm'], self.height - t['y'] * UNITS['mm']) if t['unit'] == 'mm' else
                     (t['x'] * self.width, t['y'] * self.height))
@@ -967,6 +979,20 @@ class Figure:
         with a painter of its own, which is much faster at high resolution; a palette's soft shadow and its page's color
         are not part of it. layout = False takes the page as `layout` last settled it."""
         return self._canvas(layout = layout).ops
+
+    def _shapes(self):
+        """The display list that PowerPoint's shapes are made from, each op noting what drew it, without the soft
+        shadow, which each mark casts there as PowerPoint's own."""
+        return self._canvas(shapes = True).ops
+
+    def to_pptx(self, morph = 1.5):
+        """A PowerPoint file of one slide as large as the page, in native shapes: text stays text in the palette's font,
+        to edit in place; the palette is the deck's theme, its ink, muted text, page, and faint guides the theme's text
+        and background colors and the six shades that series take first its accents, in the order an Office chart
+        gives them, so that a deck's own theme or the Design tab recolors the figure as it does a chart; and every shape
+        is named after what it draws, so that Morph carries one figure into the next (see vc.deck)."""
+        from .drawingml import deck
+        return deck([self], morph = morph)
 
     def to_pdf(self, press = None):
         """PDF bytes, with marks and text as vector; only a blurred shadow and very large heatmaps are images. With a
@@ -1088,15 +1114,16 @@ class Figure:
         return svg.replace(THEME_PREFIX, 'vc%08x' % zlib.crc32(svg.encode()))
 
     def save(self, path, dpi = 300.0, background = 'paper', press = None, source = None, themes = False):
-        """Write the file format that the path's suffix names: png, pdf, or svg. `dpi` and `background` are for PNG, as
-        PDF and SVG are vector on the palette's page. `press` makes a PDF a PDF/X-4 in that press's CMYK, and a PNG its
-        soft proof (see to_pdf), which SVG, a screen format, has no place for. The file carries the figure's source, the
-        calls and data that drew it, as JSON: vc.open brings the figure back from the file alone, in another palette,
-        dark, or at a journal's column width, and anyone can read its numbers. A figure's source takes a few kB, and is
-        written while the page draws. source = False leaves it out, as a PDF/X does, which is the page alone for print;
-        a source past 64 kB that is larger than the rest of the file, such as of 100,000 points, stays out with a
-        warning, unless source = True. themes = True makes an SVG follow its reader's light or dark mode (see
-        to_svg)."""
+        """Write the file format that the path's suffix names: png, pdf, svg, or pptx, a slide of PowerPoint's own
+        shapes whose text stays editable and which Morph carries into the next figure (see to_pptx and vc.deck). `dpi`
+        and `background` are for PNG, as PDF, SVG, and PowerPoint are vector on the palette's page. `press` makes a PDF
+        a PDF/X-4 in that press's CMYK, and a PNG its soft proof (see to_pdf), which SVG, a screen format, has no place
+        for. A PNG, PDF, or SVG carries the figure's source, the calls and data that drew it, as JSON: vc.open brings
+        the figure back from the file alone, in another palette, dark, or at a journal's column width, and anyone can
+        read its numbers. A figure's source takes a few kB, and is written while the page draws. source = False leaves
+        it out, as a PDF/X does, which is the page alone for print; a source past 64 kB that is larger than the rest of
+        the file, such as of 100,000 points, stays out with a warning, unless source = True. themes = True makes an SVG
+        follow its reader's light or dark mode (see to_svg)."""
         path = Path(path)
         suffix = path.suffix.lower()
         if themes and suffix != '.svg':
@@ -1105,8 +1132,13 @@ class Figure:
         if press and suffix == '.svg':
             raise ValueError('SVG is for screens and has no CMYK; for print, save a PDF with press, or a PNG for its '
                              'proof')
+        if press and suffix == '.pptx':
+            raise ValueError('A slide is for screens and has no CMYK; for print, save a PDF with press')
+        if suffix == '.pptx':
+            path.write_bytes(self.to_pptx())
+            return path
         if suffix not in ('.png', '.pdf', '.svg'):
-            raise ValueError(f'Unsupported format {suffix!r}; use .png, .pdf, or .svg')
+            raise ValueError(f'Unsupported format {suffix!r}; use .png, .pdf, .svg, or .pptx')
         force = source is True
         with ThreadPoolExecutor(1) as pool:
             made = None if source is False or press and suffix == '.pdf' else pool.submit(self._source)

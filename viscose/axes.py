@@ -1039,8 +1039,9 @@ class Axes:
     def heatmap(self, data, xticklabels = None, yticklabels = None, cmap = 'diverging', vmin = None, vmax = None,
                 center = 0.0, labels_right = True, show_all = False, colorbar = False, colorbar_label = '',
                 annot = False, fmt = '.2f', annot_size = None, names = None):
-        """A matrix of cells, first row at the top, where NaN is left empty. `cmap` is diverging, sequential, or
-        sequential_r, which puts the darkest color at the lowest value. Too many labels are thinned unless show_all,
+        """A matrix of cells, first row at the top, where NaN is left empty. Labels are given per column and row, True
+        numbers them, and False or None leaves them out. `cmap` is diverging, sequential, or sequential_r, which puts
+        the darkest color at the lowest value. Too many labels are thinned unless show_all,
         which can also be a pair for the x and y axes; the page grows for those that must all show. `annot` writes each
         cell's value into it, formatted by `fmt`, a format spec or a function of the value, in whichever of ink or white
         reads over the cell. `names` holds the
@@ -1050,6 +1051,9 @@ class Axes:
         m = np.asarray(data, dtype = float)
         if m.ndim != 2 or not m.size:
             raise ValueError(f'A heatmap needs rows and columns of at least one cell, got an array of shape {m.shape}')
+        # As seaborn takes them: True numbers the rows or columns, False leaves them unlabeled
+        xticklabels, yticklabels = [(list(range(n)) if v is True else None if v is False else v)
+                                    for v, n in ((xticklabels, m.shape[1]), (yticklabels, m.shape[0]))]
         rows, columns = (yticklabels, xticklabels) if names is None else names
         for given, n, what in ((rows, m.shape[0], 'row'), (columns, m.shape[1], 'column')):
             if names is not None and given is not None and len(given) != n:
@@ -2446,9 +2450,15 @@ class Axes:
     def _draw_marks(self, c):
         x0, y0, w, h = self.rect
         c.saveState()
+        # In PowerPoint, each artist's shapes take its legend entry's name, or its kind and its place among its kind
+        shapes, labels, kinds = getattr(c, 'shapes', False), {}, {}
+        if shapes:
+            labels = {id(s): self.legend_items[i][0] for i, found in self._sources.items() for s in found or ()}
         for a in sorted(self.artists, key = lambda r: (r['z'], r['order'])):
             k = a['kind']
             n = len(c.ops)
+            if shapes and k != 'text':
+                kinds[k] = kinds.get(k, -1) + 1
             # Color 'none' draws nothing but an edge, while a dendrogram's None means the palette's choice
             if k == 'text' or (k != 'dendro' and a.get('rgb', k) is None and not a.get('edge')):
                 continue
@@ -2462,6 +2472,7 @@ class Axes:
                 op['gid'] = gid
                 if k not in ('hline', 'vline', 'vspan', 'hspan', 'image', 'contour', 'aline', 'rect', 'bracket'):
                     op['mark'] = True
+            marks.tag(c, n, artist = '%s %s' % (k, labels.get(id(a), kinds.get(k))))
         c.restoreState()
 
     def _in_x(self, v):
@@ -2574,9 +2585,17 @@ class Axes:
             kept = getattr(c, 'crowd', {})
         for px, py, s, b in drawn:
             keep = kept.get(id(b))
+            # Each point's own name or place in the call's data, which PowerPoint names its shape by
+            ids = None
+            if getattr(c, 'shapes', False):
+                mask = np.isfinite(b['x']) & np.isfinite(b['y'])
+                for v, (lo, hi) in ((b['x'], sorted(self.xlim)), (b['y'], sorted(self.ylim))):
+                    mask &= (v >= lo - 1e-9 * (hi - lo)) & (v <= hi + 1e-9 * (hi - lo))
+                ids = np.flatnonzero(mask) if b.get('names') is None else b['names'][mask]
             if keep is not None and not keep.all():
                 px, py, s = px[keep], py[keep], s if np.ndim(s) == 0 else s[keep]
-            marks.points(layer, self.pal, px, py, s, b['rgb'], b['alpha'], b['marker'], b['edge'])
+                ids = None if ids is None else ids[keep]
+            marks.points(layer, self.pal, px, py, s, b['rgb'], b['alpha'], b['marker'], b['edge'], ids)
         if not spec:
             return
         if len(layer.ops) == 1 and layer.ops[0]['kind'] == 'image':
@@ -2613,9 +2632,10 @@ class Axes:
             free = (np.diff(a['x'][order]) - (a['w'][order][:-1] + a['w'][order][1:]) / 2) / 2
             room[order[:-1]] = np.maximum(free, 0.0)
             room[order[1:]] = np.fmin(room[order[1:]], np.maximum(free, 0.0))
-        for x, b, v, w, rgb, free in zip(a['x'], a['b'], a['h'], a['w'], a['rgb'], room):
+        for i, (x, b, v, w, rgb, free) in enumerate(zip(a['x'], a['b'], a['h'], a['w'], a['rgb'], room)):
             if rgb is None or not np.isfinite((x, b, v, w)).all():
                 continue
+            n = len(c.ops)
             if a['horizontal']:
                 x1, x2 = self._tx(self._base(b, self._xscale, self.xlim)), self._tx(b + v)
                 y1, y2 = self._ty(x - w / 2), self._ty(x + w / 2)
@@ -2630,6 +2650,7 @@ class Axes:
                 # Its base lies at the far end if it runs down or left on the page
                 marks.bar(c, self.pal, lx, ly, bw, bh, rgb, a['horizontal'], a['alpha'],
                           x2 < x1 if a['horizontal'] else y2 < y1, min(0.7, free / w) if w else 0.0)
+            marks.tag(c, n, part = i)
 
     def _d_errors(self, c, a):
         for x, lo, hi in zip(self._tx(a['x']), self._ty(a['lo']), self._ty(a['hi'])):
@@ -2708,8 +2729,12 @@ class Axes:
         across, along, (plo, phi), (vlo, vhi) = self._across(a)
         v, px = a['values'][i], a['x'][i] + offsets
         keep = (v >= vlo) & (v <= vhi) & (px >= plo) & (px <= phi)
+        # Named in PowerPoint by their group and their own names or places in it
+        names = a['names'][i] if a['names'] is not None and a['names'][i] is not None else range(len(v))
+        group = ' '.join(str(g) for g in a['groups'][i] if g is not None)
+        ids = ['%s %s' % (group, t) for t, k in zip(names, keep) if k]
         marks.points(c, self.pal, *marks.turn(a['horizontal'], across(px[keep]), along(v[keep])), size, rgb,
-                     a['alpha'])
+                     a['alpha'], ids = ids)
 
     def _d_box(self, c, a):
         dots = a['offsets'] is not None
@@ -2718,6 +2743,7 @@ class Axes:
         for i, (x, w, stats, rgb) in enumerate(zip(a['x'], a['w'], a['stats'], a['rgb'])):
             if stats is None:
                 continue
+            n = len(c.ops)
             x0, x1 = float(across(x - w / 2)), float(across(x + w / 2))
             fill, ink = self._paired(rgb) if dots and a['box'] else (rgb, rgb)
             if a['box']:
@@ -2729,6 +2755,7 @@ class Axes:
             elif a['fliers'] and len(stats[5]):
                 marks.points(c, self.pal, *marks.turn(a['horizontal'], np.full(len(stats[5]), (x0 + x1) / 2),
                                                       along(stats[5])), 12.0, rgb, a['alpha'])
+            marks.tag(c, n, part = ' '.join(str(g) for g in a['groups'][i] if g is not None))
 
     def _d_violin(self, c, a):
         pal = self.pal
@@ -2740,6 +2767,7 @@ class Axes:
             dots = a['inner'] in ('points', 'swarm')
             fill, ink = self._paired(rgb) if dots else (rgb, rgb)
             cx = float(across(x))
+            n = len(c.ops)
             if shape is not None:
                 grid, half = shape
                 ys = along(grid)
@@ -2753,6 +2781,7 @@ class Axes:
                 span = abs(float(across(x + w / 2) - across(x - w / 2)))
                 marks.inner_box(c, pal, cx, min(max(span * 0.08, 2.5), 7.0), (low, q1, median, q3, high), rgb,
                                 a['alpha'], a['horizontal'])
+            marks.tag(c, n, part = ' '.join(str(g) for g in a['groups'][i] if g is not None))
 
     def _d_stems(self, c, a):
         pal = self.pal
@@ -2760,7 +2789,8 @@ class Axes:
         xs, ys = self._tx(a['x'][keep]), self._ty(a['y'][keep])
         zero = float(self._ty(self._base(0.0, self._yscale, self.ylim)))
         scale = {'needle': 0.35, 'flat': 1.6}.get(pal.bar, 1.0)
-        for x, y in zip(xs, ys):
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            n = len(c.ops)
             if pal.bar in ('deep', 'soft'):
                 dark, base, light = pal.shades(a['rgb'])
                 hw = a['lw'] / 2.0
@@ -2776,6 +2806,7 @@ class Axes:
                 marks.polygon(c, [x - hw, x + hw, x + hw, x - hw], [zero, zero, y, y], None, 1.0, grad)
             else:
                 marks.polyline(c, [x, x], [zero, y], a['rgb'], a['lw'] * scale, cap = 0)
+            marks.tag(c, n, part = i)
         if a['cap']:
             marks.points(c, pal, xs, ys, 26.0, a['rgb'])
 
@@ -2873,11 +2904,15 @@ class Axes:
             c.ops.append(op)
             return
         cw, ch = float(abs(xs[1] - xs[0])), float(abs(ys[1] - ys[0]))
+        # Each cell named in PowerPoint by its row and column, so that reordered rows carry their cells along
+        rows, columns = a['rows'] or range(ny), a['columns'] or range(nx)
         for r in range(ny):
             for j in range(nx):
                 if np.isfinite(a['m'][r, j]):
+                    n = len(c.ops)
                     marks.heat_cell(c, self.pal, float(min(xs[j], xs[j + 1])), float(min(ys[r], ys[r + 1])), cw, ch,
                                     tuple(a['rgb'][r, j]))
+                    marks.tag(c, n, part = '%s | %s' % (rows[r], columns[j]))
 
     def _d_ridges(self, c, a):
         pal = self.pal
@@ -2914,9 +2949,11 @@ class Axes:
         x0, y0, w, h = self.rect
         ink = pal.color(pal.spine_color or pal.ink)
         if self.grid_on and 'grid' not in self._hidden:
-            for v in self.yticks:
+            for j, v in enumerate(self.yticks):
                 y = float(self._ty(v))
+                n = len(c.ops)
                 marks.polyline(c, [x0, x0 + w], [y, y], pal.color(pal.faint), 1.1, cap = 0)
+                marks.tag(c, n, name = 'grid %s' % (self.ylabels[j] if j < len(self.ylabels) else j))
         off = pal.spine_offset
         cap = 1 if pal.spine_round else 0
         spines = self._spines()
@@ -2924,15 +2961,23 @@ class Axes:
         if 'left' in spines:
             tl = self._tick_room('y')[1]
             lo, hi = (min(yt), max(yt)) if off and yt else (y0, y0 + h)
+            n = len(c.ops)
             marks.polyline(c, [x0 - off, x0 - off], [lo, hi], ink, pal.spine_width, cap = cap)
-            for y in yt if tl else ():
+            marks.tag(c, n, name = 'spine left')
+            for j, y in enumerate(yt if tl else ()):
+                n = len(c.ops)
                 marks.polyline(c, [x0 - off - tl, x0 - off], [y, y], ink, pal.spine_width, cap = 0)
+                marks.tag(c, n, name = 'tick y %s' % (self.ylabels[j] if j < len(self.ylabels) else j))
         if 'bottom' in spines:
             tl = self._tick_room('x')[1]
             lo, hi = (min(xt), max(xt)) if off and xt else (x0, x0 + w)
+            n = len(c.ops)
             marks.polyline(c, [lo, hi], [y0 - off, y0 - off], ink, pal.spine_width, cap = cap)
-            for x in xt if tl else ():
+            marks.tag(c, n, name = 'spine bottom')
+            for j, x in enumerate(xt if tl else ()):
+                n = len(c.ops)
                 marks.polyline(c, [x, x], [y0 - off - tl, y0 - off], ink, pal.spine_width, cap = 0)
+                marks.tag(c, n, name = 'tick x %s' % (self.xlabels[j] if j < len(self.xlabels) else j))
 
     def _draw_text(self, c):
         pal = self.pal
@@ -2950,6 +2995,7 @@ class Axes:
         sticker = (1.0, 1.0, 1.0) if pal.is_dark else None
         for v, s in zip(self.xticks, self.xlabels):
             x = float(self._tx(v))
+            n = len(c.ops)
             g = self._tick_glyph('x', s)
             if g is not None:
                 left, bottom, right, top = self._glyph_extent('x', g)
@@ -2974,6 +3020,7 @@ class Axes:
             else:
                 text.draw(c, x, rise if above else y0 - pad, s, small, rgb, bold, ha = 'center',
                           va = 'bottom' if above else 'top', tabular = figures)
+            marks.tag(c, n, name = 'x label ' + s)
         yw, offsets = self._ytick_columns(ytext)
         # Numbers line up on their decimal points, the column's widest fraction in from its edge away from the plot
         split = self._decimals(self.ylabels, ytext)
@@ -2981,6 +3028,7 @@ class Axes:
         split = split or [None] * len(self.ylabels)
         for v, s, o, part in zip(self.yticks, self.ylabels, offsets, split):
             y = float(self._ty(v))
+            n = len(c.ops)
             # Where the label's column starts, from the axes outward
             start = x0 + w + ypad - 2.0 * pal.spacing + o if self._yright else x0 - ypad - o
             if o:
@@ -3004,6 +3052,7 @@ class Axes:
                 text.draw(c, start, y, s, ytext, rgb, bold, ha = 'left', va = 'center', tabular = self._numbers['y'])
             else:
                 text.draw(c, start, y, s, ytext, rgb, bold, ha = 'right', va = 'center', tabular = self._numbers['y'])
+            marks.tag(c, n, name = 'y label ' + s)
         label_rgb = pal.color(pal.label_color or pal.ink)
         track = 0.9 if pal.caps else 0.0
         # Long axis names shrink to stay within their cell, centered on the axes
@@ -3017,21 +3066,27 @@ class Axes:
             drop = (pad + self._xtick_height() if self.xlabels and not above else off + xtl if len(self.xticks) else
                     off)
             gap = base[0] * 0.55 if self._label_pad['x'] is None else self._label_pad['x']
+            n = len(c.ops)
             text.draw(c, x0 + w / 2, y0 - drop - gap, text.spaced(pal, self.xlabel), size_x,
                       label_rgb, pal.label_bold, ha = 'center', va = 'top', tracking = track)
+            marks.tag(c, n, name = 'x name')
         if self.ylabel:
             beside = ypad + yw if self.ylabels else off + ytl if len(self.yticks) else off
             # Further lines run away from the axes on the right, and towards them on the left
             ylx = (x0 + w + beside + base[1] * 1.3 if self._yright else
                    x0 - beside - self._ridge_width() - self._ylabel_room() + base[1])
+            n = len(c.ops)
             text.draw(c, ylx, y0 + h / 2, text.spaced(pal, self.ylabel), size_y, label_rgb, pal.label_bold,
                       ha = 'center', va = 'baseline', rotation = 90.0, tracking = track)
+            marks.tag(c, n, name = 'y name')
         if self.title_text:
             title_size = self._title_size()
             lift = rise - y0 - h + self._xtick_height() if above and self.xlabels and len(self.xticks) else 0.0
             pad = 8.0 * pal.spacing if self._title_pad is None else self._title_pad
+            n = len(c.ops)
             text.draw(c, x0, y0 + h + lift + pad + 1.25 * title_size * _extra_lines(self.title_text),
                       self.title_text, title_size, pal.color(pal.title_color or pal.ink), pal.title_bold, ha = 'left')
+            marks.tag(c, n, name = 'title')
         for a in self.artists:
             if a['kind'] == 'ridges' and a['labels'] is not None:
                 n = len(a['curves'])
@@ -3149,6 +3204,7 @@ class Axes:
         bx = x0 + w + right + 12.0 * k
         bh = min(h * 0.6, 170.0 * k)
         by = y0 + h - bh
+        n = len(c.ops)
         marks.polygon(c, [bx, bx + bar, bx + bar, bx], [by, by, by + bh, by + bh], None, 1.0,
                       ((bx, by, bx, by + bh), stops))
         labels = _minus(pal, tick_labels(ticks))
@@ -3156,9 +3212,12 @@ class Axes:
         split = self._decimals(labels, 8.4 * k, True)
         point = max(a for a, _ in split) if split else 0.0
         widest = point + max(b for _, b in split) if split else 0.0
+        marks.tag(c, n, name = 'color bar')
         for i, (t, s) in enumerate(zip(ticks, labels)):
+            n = len(c.ops)
             text.draw(c, bx + bar + 5.0 * k + (point - split[i][0] if split else 0.0), by + (t - lo) / span * bh, s,
                       8.4 * k, ink, va = 'center', tabular = True)
+            marks.tag(c, n, name = 'color bar ' + s)
             widest = max(widest, text.width(s, 8.4 * k, tabular = True))
         if label:
             text.draw(c, bx + bar + 5.0 * k + widest + pal.label_size * 1.3, by + bh / 2,
@@ -3184,8 +3243,11 @@ class Axes:
             top = y0 + h - 12.0 * u if 'upper' in loc else y0 + 12.0 * u + th - row
         for (dx, dy), (s, rgb, k, marker, area, _, g, _) in zip(spots, entries):
             x, y = left + dx, top - dy
+            # In PowerPoint, an entry's swatch and name are named after it, so that they stay its own in the next figure
+            n = len(c.ops)
             if k == 'header':
                 text.draw(c, x, y, s, size, pal.color(pal.ink), True, va = 'center', tracking = track)
+                marks.tag(c, n, name = 'legend ' + s)
                 continue
             if k == 'line':
                 marks.polyline(c, [x, x + 12.0 * u], [y, y], rgb, max(pal.line_width, 1.2 * u), cap = 0, dash = marker)
@@ -3200,9 +3262,11 @@ class Axes:
                 cut = self._legend_cut()
                 gl, gb, _, gt = g.extent(size * text.GLYPH_SYMBOL, cut is not None or self._cut)
                 text.draw_glyph(c, g, x + 17.0 * u - gl, y - (gb + gt) / 2, size * text.GLYPH_SYMBOL, cut)
-                continue
-            text.draw(c, x + 17.0 * u, y, s, size, pal.color(pal.ink), pal.text_bold, va = 'center', tracking = track,
-                      halo = 0.0 if loc in ('right', 'below') else 2.6 * u, halo_color = pal.color('paper'))
+            else:
+                text.draw(c, x + 17.0 * u, y, s, size, pal.color(pal.ink), pal.text_bold, va = 'center',
+                          tracking = track, halo = 0.0 if loc in ('right', 'below') else 2.6 * u,
+                          halo_color = pal.color('paper'))
+            marks.tag(c, n, name = 'legend ' + s)
 
 
 def _recorded(method):
