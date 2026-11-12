@@ -4406,6 +4406,46 @@ def test_a_highlight_finds_every_series_by_its_label_and_keeps_the_order_of_what
     assert draw(['a', 'b', 'c']).to_png(72.0) == draw(None).to_png(72.0)
 
 
+def test_a_pale_color_in_focus_steps_up_beside_its_context():
+    from viscose.palettes import LC_FOCUS, apca
+    draw = lambda color, keys: (lambda f, a: (a.scatter([0.0, 1.0, 2.0], [0.0, 1.0, 2.0], color = color,
+                                                        names = ['p', 'q', 'r'], highlight = keys), f)[-1])(
+        *vc.subplots(figsize = (3, 3), palette = 'aura'))
+    fig = draw('a3', ['q'])
+    pal = fig.pal
+    stood = pal.stand(pal.color('a3'))
+    # The pale shade steps to a stronger one of its own hue that stands out, and the point in focus is drawn as that
+    # shade would be drawn without a highlight
+    assert stood != pal.color('a3') and abs(apca(stood, pal.color('paper'))) >= LC_FOCUS
+    fills = lambda f, part: [tuple(o['fill_rgb']) for o in f._shapes() if o.get('part') == part and o['fill']]
+    assert fills(fig, 'q') == fills(draw(stood, None), 'q')
+    # A color that stands out already stays, and a highlight of everything draws what none does
+    assert pal.stand(pal.color('a1')) == pal.color('a1')
+    assert draw('a3', ['p', 'q', 'r']).to_png(72.0) == draw('a3', None).to_png(72.0)
+
+
+def test_an_end_left_none_stays_automatic_and_brackets_lift_it():
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.boxplot({'a': [3.0, 4.0, 5.0], 'b': [6.0, 7.0, 9.0], 'c': [2.0, 3.0, 4.0]})
+    fig.layout()
+    auto = ax.get_ylim()
+    ax.set_ylim(0.0, None)
+    fig.layout()
+    assert ax.get_ylim()[0] == 0.0 and ax.get_ylim()[1] == pytest.approx(auto[1])
+    ax.bracket('a', 'b', 0.003)
+    ax.bracket('a', 'c', 0.04)
+    fig.layout()
+    # The bottom stays where it was set, and the top grows for both brackets, which all show
+    assert ax.get_ylim()[0] == 0.0 and ax.get_ylim()[1] > auto[1]
+    assert sum(1 for o in fig.display_list() if o['kind'] == 'text' and o['text'].startswith('p = ')) == 2
+    ax.set_ylim(None, 9.5)
+    fig.layout()
+    assert ax.get_ylim()[1] == 9.5
+    ax.set_ylim(None, None)
+    with pytest.raises(ValueError, match = 'finite'):
+        ax.set_ylim(0.0, float('nan'))
+
+
 def test_a_hue_level_stays_in_the_legend_while_a_group_in_focus_holds_it():
     data = {'g': ['A'] * 8 + ['B'] * 8, 'h': ['p', 'q'] * 8, 'v': np.arange(16.0)}
     fig, ax = vc.subplots(palette = 'lumen')

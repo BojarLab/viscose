@@ -155,10 +155,11 @@ def _warp(scale, functions):
 
 
 def _check_limits(lo, hi):
-    """Limits as floats; a NaN or an infinity would otherwise only fail once the figure is saved."""
-    if not (math.isfinite(lo) and math.isfinite(hi)):
+    """Limits as floats, None for an end that stays automatic, or None for both; a NaN or an infinity would otherwise
+    only fail once the figure is saved."""
+    if any(v is not None and not math.isfinite(v) for v in (lo, hi)):
         raise ValueError(f'Axis limits have to be finite, got {lo} and {hi}')
-    return float(lo), float(hi)
+    return None if lo is None and hi is None else tuple(None if v is None else float(v) for v in (lo, hi))
 
 
 def _check_marker(marker):
@@ -1302,10 +1303,13 @@ class Axes:
         return self
 
     def set_xlim(self, lo, hi):
+        """The x limits; None for an end keeps it automatic, as for an axis that starts at zero and leaves its top
+        to the data and to what brackets need above them."""
         self._xlim = _check_limits(lo, hi)
         return self
 
     def set_ylim(self, lo, hi):
+        """The y limits, as set_xlim takes them."""
         self._ylim = _check_limits(lo, hi)
         return self
 
@@ -1677,11 +1681,13 @@ class Axes:
                           hi if hi > lo and any(abs(hi - s) < 1e-12 for s in sticky) else hi + pad)
                 lo, hi = (float(v) for v in inverse(np.array([lo, hi])))
             if fixed is not None:
-                # A log axis has no zero or negative end, so such a limit stays automatic
-                lo, hi = [v if v > 0 or scale != 'log' else auto for v, auto in zip(fixed, (lo, hi))]
+                # An end left None stays automatic, and so does a log axis's zero or negative end, which it has none of
+                lo, hi = [auto if v is None or (v <= 0 and scale == 'log') else v for v, auto in zip(fixed, (lo, hi))]
                 pad = abs(lo) * 0.1 or 1.0
                 lo, hi = (lo - pad, hi + pad) if lo == hi else (lo, hi)
-            lift = max(ax._lift for ax in group) if axis == 'y' and fixed is None else 1.0
+            # Brackets lift only an end that is automatic
+            free = fixed is None or fixed[0 if inverted else 1] is None
+            lift = max(ax._lift for ax in group) if axis == 'y' and free else 1.0
             if lift != 1.0:
                 # Brackets stretch the end at the page's top away from the other one, the low end on a turned axis
                 forward, inverse = self._ywarp
@@ -2573,7 +2579,8 @@ class Axes:
         changed the limits."""
         group = self._share['y']
         held = [ax for ax in group if any(a['kind'] == 'bracket' for a in ax.artists)]
-        if not held or any(ax._ylim is not None for ax in group):
+        inverted = any(ax._yinv for ax in group)
+        if not held or any(ax._ylim is not None and ax._ylim[0 if inverted else 1] is not None for ax in group):
             return False
         need = 1.0
         for ax in held:
@@ -2635,6 +2642,24 @@ class Axes:
             return np.ones(n, dtype = bool), False
         kept = self._focused(a, n, own)
         return (~kept, True) if c.passing == 'context' else (kept, False)
+
+    def _standing(self):
+        """Whether a highlight leaves anything of the axes as context, beside which a pale color in focus steps up to
+        a stronger shade of its hue (Palette.stand); a highlight of everything leaves the figure as drawn without
+        one."""
+        if self._focus is None and not any(a.get('focus') is not None for a in self.artists):
+            return False
+        return any(not self._focused(a, len(self._own(a) or [None])).all() for a in self.artists
+                   if a['kind'] in FOCUS_KINDS and a['kind'] != 'heat')
+
+    def _paint(self, c, a, rgb, back):
+        """A mark's color as this pass draws it: receded as context, stepped up where it stands in focus beside
+        context, or as it is; colors from a scale are data and stay."""
+        if back:
+            return self.pal.recede(rgb)
+        if getattr(c, 'standing', False) and c.passing == 'focus' and not a.get('mapped'):
+            return self.pal.stand(rgb)
+        return rgb
 
     def _receding(self, i):
         """Whether a legend entry names only what a highlight leaves as context."""
@@ -2698,6 +2723,7 @@ class Axes:
         # What never recedes, such as guides and error bars, keeps its order with the marks in focus: under all of them
         # in the first pass, else among them in the second, so that a highlight of everything draws what none does
         floor = min((a['z'] for a in ordered if a['kind'] in FOCUS_KINDS), default = math.inf)
+        c.standing = focusing and self._standing()
         for done in ('context', 'focus') if focusing else (None, ):
             c.passing = done
             for a in ordered:
@@ -2734,7 +2760,7 @@ class Axes:
         pick, back = self._chosen(c, a, 1)
         if not pick[0]:
             return
-        rgb = self.pal.recede(a['rgb']) if back else a['rgb']
+        rgb = self._paint(c, a, a['rgb'], back)
         mask = np.isfinite(a['x']) & np.isfinite(a['y'])
         # A log axis has no place for zero or below, so those points break the line too
         if self._xscale == 'log':
@@ -2756,7 +2782,7 @@ class Axes:
         by_color, sticks = {}, []
         for i, (x, lo, hi, rgb) in enumerate(zip(self._tx(a['x']), self._ty(a['y0']), self._ty(a['y1']), a['rgb'])):
             if pick[i] and rgb is not None and np.isfinite((x, lo, hi)).all():
-                rgb = self.pal.recede(rgb) if back else rgb
+                rgb = self._paint(c, a, rgb, back)
                 by_color.setdefault(rgb, []).append(((x, x), (lo, hi)))
                 sticks.append((i, x, lo, hi, rgb))
         n = len(c.ops)
@@ -2909,9 +2935,8 @@ class Axes:
                 ids = None if ids is None else ids[keep]
                 hovers = None if hovers is None else [h for h, k in zip(hovers, keep) if k]
             rgb, edge = b['rgb'], b['edge']
-            if back:
-                rgb = None if rgb is None else self.pal.recede(rgb)
-                edge = None if edge is None else (self.pal.recede(edge[0]), edge[1])
+            rgb = None if rgb is None else self._paint(c, b, rgb, back)
+            edge = None if edge is None else (self._paint(c, b, edge[0], back), edge[1])
             marks.points(layer, self.pal, px, py, s, rgb, b['alpha'], b['marker'], edge, ids, hovers)
         if not spec:
             return
@@ -2938,7 +2963,7 @@ class Axes:
             x, y1, y2 = a['x'][run], a['y1'][run], a['y2'][run]
             if len(x) > 1:
                 marks.polygon(c, np.r_[self._tx(x), self._tx(x[::-1])], np.r_[self._ty(y1), self._ty(y2[::-1])],
-                              self.pal.recede(a['rgb']) if back else a['rgb'], a['alpha'])
+                              self._paint(c, a, a['rgb'], back), a['alpha'])
 
     def _base(self, v, scale, limits):
         """Where a bar or a stem starts: a log axis has no place for zero or below, so the start of the axis."""
@@ -2959,7 +2984,7 @@ class Axes:
         for i, (x, b, v, w, rgb, free) in enumerate(zip(a['x'], a['b'], a['h'], a['w'], a['rgb'], room)):
             if rgb is None or not pick[i] or not np.isfinite((x, b, v, w)).all():
                 continue
-            rgb = self.pal.recede(rgb) if back else rgb
+            rgb = self._paint(c, a, rgb, back)
             n = len(c.ops)
             if a['horizontal']:
                 x1, x2 = self._tx(self._base(b, self._xscale, self.xlim)), self._tx(b + v)
@@ -3072,7 +3097,7 @@ class Axes:
                        (title, self._says(axis, u))) for t, u, k in zip(names, v, keep) if k]
         n = len(c.ops)
         marks.points(c, self.pal, *marks.turn(a['horizontal'], across(px[keep]), along(v[keep])), size,
-                     self.pal.recede(rgb) if back else rgb, a['alpha'], ids = ids, hovers = hovers)
+                     self._paint(c, a, rgb, back), a['alpha'], ids = ids, hovers = hovers)
         # In an interactive SVG, they light up with their group, which they belong to as a series
         marks.tag(c, n, series = tuple(group))
 
@@ -3090,12 +3115,12 @@ class Axes:
             if a['box'] and pick[i]:
                 # In order up or across the page, which a turned axis reverses
                 marks.box(c, self.pal, min(x0, x1), abs(x1 - x0), sorted(float(along(v)) for v in stats[:5]),
-                          self.pal.recede(fill) if back else fill, a['alpha'], a['horizontal'])
+                          self._paint(c, a, fill, back), a['alpha'], a['horizontal'])
             if dots:
                 self._group_points(c, a, i, offsets[i], sizes[i], ink)
             elif a['fliers'] and len(stats[5]) and pick[i]:
                 marks.points(c, self.pal, *marks.turn(a['horizontal'], np.full(len(stats[5]), (x0 + x1) / 2),
-                                                      along(stats[5])), 12.0, self.pal.recede(rgb) if back else rgb,
+                                                      along(stats[5])), 12.0, self._paint(c, a, rgb, back),
                              a['alpha'])
             marks.tag(c, n, part = ' '.join(self._group_names(a, i)))
             if getattr(c, 'hover', False):
@@ -3118,7 +3143,7 @@ class Axes:
                 ys = along(grid)
                 left, right = across(x - half), across(x + half)
                 marks.violin(c, pal, np.r_[left, right[::-1]], np.r_[ys, ys[::-1]], cx,
-                             float(np.max(np.abs(right - left))) / 2, pal.recede(fill) if back else fill, a['alpha'],
+                             float(np.max(np.abs(right - left))) / 2, self._paint(c, a, fill, back), a['alpha'],
                              a['horizontal'])
             if dots or shape is None:
                 self._group_points(c, a, i, offsets[i], sizes[i], ink)
@@ -3126,7 +3151,7 @@ class Axes:
                 low, q1, median, q3, high = sorted(float(along(v)) for v in stats[:5])
                 span = abs(float(across(x + w / 2) - across(x - w / 2)))
                 marks.inner_box(c, pal, cx, min(max(span * 0.08, 2.5), 7.0), (low, q1, median, q3, high),
-                                pal.recede(rgb) if back else rgb, a['alpha'], a['horizontal'])
+                                self._paint(c, a, rgb, back), a['alpha'], a['horizontal'])
             marks.tag(c, n, part = ' '.join(self._group_names(a, i)))
             if getattr(c, 'hover', False):
                 marks.tag(c, n, hover = self._group_hover(a, i))
@@ -3134,7 +3159,7 @@ class Axes:
     def _d_stems(self, c, a):
         pal = self.pal
         pick, back = self._chosen(c, a, len(a['x']))
-        rgb = pal.recede(a['rgb']) if back else a['rgb']
+        rgb = self._paint(c, a, a['rgb'], back)
         keep = np.flatnonzero(np.isfinite(a['x']) & np.isfinite(a['y']) & pick)
         if not len(keep):
             return
@@ -3664,6 +3689,8 @@ class Axes:
         size, track, entries = self._legend_entries()
         spots, (tw, th) = self._legend_grid()
         loc = self._legend_loc
+        # Swatches in focus step up with their marks
+        standing = self._standing()
         if loc == 'right':
             left, top = x0 + w + right + 16.0 * u, y0 + h - 8.0 * u
         elif loc == 'below':
@@ -3682,7 +3709,7 @@ class Axes:
                 continue
             # An entry for what a highlight leaves as context recedes with it
             back = self._receding(i)
-            rgb = pal.recede(rgb) if back else rgb
+            rgb = pal.recede(rgb) if back else pal.stand(rgb) if standing else rgb
             if k == 'line':
                 marks.polyline(c, [x, x + 12.0 * u], [y, y], rgb, max(pal.line_width, 1.2 * u), cap = 0, dash = marker)
             elif k == 'point':

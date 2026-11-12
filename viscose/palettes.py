@@ -119,6 +119,9 @@ def _oklab(rgb):
 # levels: text that is read (tick labels, axis names, legends, annotations), large or heavy text (from 24 points, or 16
 # bold), and marks that carry data, which need to be discernible, while their shades stay free to recede
 LC_TEXT, LC_LARGE, LC_MARK = 60.0, 45.0, 15.0
+# What a color in focus reaches beside receded context, APCA's level for marks that carry meaning, so that a pale
+# category set on purpose, such as a volcano's background points, still stands out when a highlight picks it
+LC_FOCUS = 30.0
 # Machado, Oliveira, and Fernandes (2009) at full severity, on linear sRGB
 CVD = {'protan': np.array([[0.152286, 1.052583, -0.204868], [0.114503, 0.786281, 0.099216],
                            [-0.003882, -0.048116, 1.051998]]),
@@ -390,6 +393,20 @@ class Palette:
                     dark, light = (_hex(_from_oklch(min(max(Lj + L - Ls, 0.0), 1.0), Cj, hj)) for Lj, Cj, hj in moved)
                     return dark, rgb, light
         return mix(rgb, 0.62, (0.0, 0.0, 0.0)), rgb, mix(rgb, 0.55)
+
+    def stand(self, c):
+        """A color in focus beside receded context: stepped through the shades of its own hue that stand out more
+        against the page until it reaches LC_FOCUS, as a pale shade in focus would hardly differ from the context
+        receded around it; a color that reaches it already stays as it is."""
+        rgb, page = self.color(c), self.color('paper')
+        for _ in range(4):
+            if abs(apca(rgb, page)) >= LC_FOCUS:
+                break
+            stronger = self.shades(rgb)[0]
+            if abs(apca(stronger, page)) <= abs(apca(rgb, page)):
+                break
+            rgb = tuple(float(v) for v in stronger)
+        return rgb
 
     def _recessions(self):
         """The colors recede made, by their originals, and back. They live on the palette itself, outside its fields,
