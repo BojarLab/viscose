@@ -67,6 +67,9 @@ _LAB = np.array([[0.2104542553, 0.7936177850, -0.0040720468], [1.9779984951, -2.
 # orange turns brown
 DARK_L = (0.52, 0.93)
 DARK_PAPER_L = 0.19
+# What a highlight leaves as context steps this far toward the page's lightness, in its own hue, keeping this share of
+# its chroma
+RECEDE, RECEDE_CHROMA = 0.68, 0.4
 
 
 def _oklch(rgb):
@@ -371,6 +374,8 @@ class Palette:
         by as much lightness where it is one of them made lighter or darker in its own hue, as the legibility check
         makes them, so that it keeps the palette's gradients; else mixes."""
         rgb = self.color(c)
+        if rgb in self._recessions()[1]:
+            return tuple(self.recede(s) for s in self.shades(self._recessions()[1][rgb]))
         for hue in (self.a, self.b):
             for i, s in enumerate(hue):
                 if np.allclose(_hex(s), rgb, atol = 1e-3):
@@ -385,6 +390,42 @@ class Palette:
                     dark, light = (_hex(_from_oklch(min(max(Lj + L - Ls, 0.0), 1.0), Cj, hj)) for Lj, Cj, hj in moved)
                     return dark, rgb, light
         return mix(rgb, 0.62, (0.0, 0.0, 0.0)), rgb, mix(rgb, 0.55)
+
+    def _recessions(self):
+        """The colors recede made, by their originals, and back. They live on the palette itself, outside its fields,
+        so that replace never copies them and they go with it, where a table keyed by id would hand them to whatever
+        palette later takes its place in memory."""
+        if '_receded' not in self.__dict__:
+            self.__dict__['_receded'] = ({}, {})
+        return self.__dict__['_receded']
+
+    def receded(self, c):
+        """Whether a color is one that recede made, for what draws over it, such as a box's median."""
+        return self.color(c) in self._recessions()[1]
+
+    def recede(self, c):
+        """A color stepped back from the focus, for what a highlight leaves as context: its own hue, RECEDE of the way
+        to the page's lightness with RECEDE_CHROMA of its chroma, and still a discernible mark (LC_MARK). One color,
+        whose shades are its original's receded, so that it keeps the palette's gradients and rims, or an array of
+        colors along the last axis, such as a heatmap's cells, which keep their order of lightness."""
+        page = _oklab(self.color('paper'))
+        if not isinstance(c, (str, tuple)) and np.ndim(c) > 1:
+            ok = _oklab(np.asarray(c, dtype = float))
+            ok[..., 0] += RECEDE * (page[0] - ok[..., 0])
+            ok[..., 1:] *= RECEDE_CHROMA
+            return _oklab_srgb(ok)
+        rgb = self.color(c)
+        receded, origins = self._recessions()
+        # A receded color stays as it is
+        if rgb in origins:
+            return rgb
+        if rgb not in receded:
+            ok = _oklab(rgb)
+            ok[0] += RECEDE * (page[0] - ok[0])
+            ok[1:] *= RECEDE_CHROMA
+            receded[rgb] = tuple(float(v) for v in legible(tuple(_oklab_srgb(ok)), self.color('paper'), LC_MARK))
+            origins.setdefault(receded[rgb], rgb)
+        return receded[rgb]
 
 
 LUMEN = Palette('lumen', ['#063B4C', '#0B7A8C', '#2CC4C9', '#A8EDE8'], ['#B34700', '#F28C0F', '#FFC042', '#FFE7A8'],

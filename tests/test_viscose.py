@@ -12,7 +12,7 @@ import viscose as vc
 from viscose import marks
 from viscose.axes import fmt, nice_ticks, tick_labels
 from viscose.figure import SHADOW_DPI
-from viscose.palettes import get_palette, ramp
+from viscose.palettes import _oklch, get_palette, ramp
 from viscose.text import runs, width
 from glycorender import pdfwrite, raster
 from glycorender.pdfwrite import pdfmetrics
@@ -281,6 +281,18 @@ def test_importing_viscose_does_not_load_qt():
     code = ("import sys, viscose; assert not any(m.startswith('PySide6') for m in sys.modules); "
             "assert 'viscose.qt' not in sys.modules")
     subprocess.run([sys.executable, '-c', code], check = True)
+
+
+def test_a_canvas_drafts_while_redraws_come_and_settles_after(qt):
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.scatter([0.0, 1.0], [0.0, 1.0])
+    ax.annotate('abc', (0.0, 0.0), glyph = _beads, spread = True)
+    canvas = qt.Canvas(fig)
+    canvas.draw_idle()
+    # Only the canvas's own layout and painting draft, so a file saved meanwhile is placed in full
+    assert canvas.drafting and canvas.settle.isActive() and not fig._draft
+    canvas.settled()
+    assert not canvas.drafting and not fig._draft
 
 
 def test_qt_paints_what_the_rasterizer_draws(qt):
@@ -3401,6 +3413,102 @@ def test_legend_rows_hold_their_glyphs():
     assert h > 3 * vc.axes.LEGEND_ROW and spots[1][1] - spots[0][1] > vc.axes.LEGEND_ROW
 
 
+def test_a_label_held_to_a_share_of_the_height_stays_in_its_band():
+    fig, ax = vc.subplots(figsize = (5, 4))
+    ax.vlines([1.0, 2.0, 3.0], 0.0, [1.0, 3.0, 2.0])
+    ax.annotate('abc', (2.0, 0.9), glyph = _beads, y_fraction = True, ha = 'center', va = 'bottom')
+    ax.annotate('peak', (3.0, 0.95), y_fraction = True, ha = 'center')
+    fig.layout()
+    x0, y0, w, h = ax.rect
+    # Its discs just over nine tenths of the height, over its text and cut, whatever the data, which it leaves the
+    # limits to, centered on x
+    discs = _symbols(fig.display_list())
+    assert 0.0 < (discs[:, 1] - discs[:, 2] / 2).min() - (y0 + 0.9 * h) < 6.0 and ax.get_ylim()[1] < 3.5
+    assert discs[:, 0].mean() == pytest.approx(float(ax._tx(2.0)), abs = 0.01)
+    # Zooming keeps it in its band, and leaving its x behind takes it away
+    lowest = (discs[:, 1] - discs[:, 2] / 2).min() - (y0 + 0.9 * h)
+    ax.set_ylim(0.0, 1.5)
+    discs = _symbols(fig.display_list())
+    assert (discs[:, 1] - discs[:, 2] / 2).min() - (ax.rect[1] + 0.9 * ax.rect[3]) == pytest.approx(lowest)
+    ax.set_xlim(0.0, 1.5)
+    assert not any(op['kind'] == 'text' and op['text'] == 'peak' for op in fig.display_list())
+    with pytest.raises(ValueError, match = 'y_fraction'):
+        ax.annotate('ab', (1.0, 0.5), glyph = _beads, y_fraction = True, spread = True)
+
+
+def test_spread_glyphs_move_with_their_points_while_a_window_drafts():
+    fig, ax = vc.subplots(figsize = (5, 4))
+    xs, ys = [0.0, 1.0, 2.0, 3.0], [1.0, 1.02, 1.04, 0.98]
+    ax.scatter(xs, ys)
+    for x, y in zip(xs, ys):
+        ax.annotate('abcd|ab', (x, y), glyph = _beads, spread = True)
+    fig.layout()
+    settled = dict(ax._place_glyphs())
+    ax.set_xlim(-0.5, 3.4)
+    fig._draft = True
+    fig.layout()
+    moved = ax._place_glyphs()
+    # Each drawing and its leader moved by just as much as its point
+    for a, (px, py) in zip([a for a in ax.artists if a['kind'] == 'text'], ax._glyph_settled[1]):
+        dx = float(ax._tx(a['x'])) - px
+        (gx, gy, leader, _), (sx, sy, slead, _) = moved[id(a)], settled[id(a)]
+        assert gx - sx == pytest.approx(dx) and gy == pytest.approx(sy) and (leader is None) == (slead is None)
+    # Once it settles, they are placed in full, as a file always places them
+    fig._draft = False
+    fig.layout()
+    full = ax._place_glyphs()
+    fresh, axf = vc.subplots(figsize = (5, 4))
+    axf.scatter(xs, ys)
+    for x, y in zip(xs, ys):
+        axf.annotate('abcd|ab', (x, y), glyph = _beads, spread = True)
+    axf.set_xlim(-0.5, 3.4)
+    fresh.layout()
+    assert sorted(v[:2] for v in full.values()) == pytest.approx(sorted(v[:2] for v in axf._place_glyphs().values()))
+
+
+def test_named_arrows_and_annotations_answer_the_mouse():
+    import json
+    fig, ax = vc.subplots(figsize = (5, 4))
+    ax.arrow(0.0, 0.0, 1.0, 1.0, name = 'Gal(b1-4)', lw = 1.0)
+    ax.arrow(1.0, 0.0, 2.0, 1.0, name = 'Gal(b1-4)', lw = 1.0)
+    ax.scatter([0.0, 1.0], [0.0, 1.0], names = ['abc', 'ab'])
+    ax.annotate('abc', (0.0, 0.0), glyph = _beads)
+    ax.annotate('ab', (1.0, 1.0))
+    ax.off()
+    plain = fig._canvas().ops
+    hover = fig._canvas(hover = True, layout = False).ops
+    # Each named arrow gains an unpainted grip as wide as the pointer needs, and nothing else changes
+    grips = [o for o in hover if o['kind'] == 'path' and o['stroke'] and o['stroke_alpha'] == 0.0]
+    assert len(grips) == 2 and all(o['line_width'] == vc.axes.ARROW_GRIP for o in grips)
+    assert [{k: v for k, v in o.items() if k not in vc.figure.TAGS} for o in hover if o not in grips] == plain
+    texts, table = json.loads(re.search(r'var T = (.*?), word = ', fig.to_svg(interactive = True)).group(1))
+    rows = [([texts[k] for k in names], [texts[k] for k in said]) for names, said, *_ in table]
+    # Arrows of one name light together, a drawing lights its point and says its label, a text label lights its point
+    # without a box of its own, and points of axes switched off say no positions
+    assert (['Gal(b1-4)'], ['Gal(b1-4)']) in rows and (['abc'], ['abc']) in rows and (['ab'], []) in rows
+    assert (['ab'], ['ab']) in rows
+
+
+def test_hidden_names_the_points_a_field_takes():
+    rng = np.random.default_rng(0)
+    xy = rng.normal(size = (3000, 2)) * 0.3
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'poster')
+    ax.scatter(xy[:, 0], xy[:, 1], s = 60, names = ['p%d' % i for i in range(3000)])
+    ax.scatter([5.0], [5.0])
+    fig.layout()
+    ax.set_xlim(-1.5, 1.5)
+    ax.set_ylim(-1.5, 1.5)
+    fig.layout()
+    hidden = ax.hidden(ax.artists[0])
+    shown = {o.get('part') for o in fig._shapes() if str(o.get('part')).startswith('p')}
+    assert hidden.shape == (3000, ) and 2000 < hidden.sum() < 3000
+    assert shown == {'p%d' % i for i in np.flatnonzero(~hidden)}
+    assert not ax.hidden(ax.artists[1]).any()
+    fig, ax = vc.subplots()
+    ax.scatter(xy[:, 0], xy[:, 1], density = False)
+    assert not ax.hidden(ax.artists[0]).any()
+
+
 def test_glyph_figures_save_everywhere_and_replay_in_another_palette(tmp_path):
     def draw(palette):
         fig, heat = vc.clustermap(np.arange(12.0).reshape(4, 3) % 5, yticklabels = ['abc', 'ab|a', 'abcd', 'zz9'],
@@ -3466,6 +3574,30 @@ def test_crowded_glyph_rows_stagger_in_two_columns():
     assert len(hairlines) == 13
     beads = _symbols(ops)
     assert beads[:, 0].max() < ax.rect[0]
+
+
+def test_glyph_rows_keep_to_a_page_that_cannot_grow():
+    names = ['abcdefg'[k] * (k % 3 + 4) + '|ab|a|a' for k in range(7)]
+    # Axes at a fixed place stagger only as wide as the room left of them, smaller where it is narrow, and past that
+    # keep one column, below the least size, rather than run off the page
+    for left, cols in ((40, 2), (25, 2), (14, 1)):
+        fig = vc.Figure(8, 4)
+        ax = fig.add_axes((left, 10, 140, 60), unit = 'mm')
+        ax.barh(names, np.arange(7))
+        ax.tick_params('y', glyphs = _beads, labelsize = 14)
+        beads = _symbols(fig.display_list())
+        assert ax.ylabels == names and ax._gcols == cols and (beads[:, 0] - beads[:, 2] / 2).min() >= 0
+        boxes = sorted((y + e[1], y + e[3]) for y, e in zip(ax._ty(ax.yticks), (
+            ax._glyph_extent('y', vc.text.glyph(_beads, s)) for s in ax.ylabels)))
+        assert all(lo[1] <= hi[0] + 1e-6 for lo, hi in zip(boxes[:-cols], boxes[cols:]))
+    assert vc.text.GLYPH_MIN / 2 <= ax._gscale['y'] < vc.text.GLYPH_MIN
+    # A page held to a window's size keeps them within the share of their cell that margins may take
+    fig, ax = vc.subplots(figsize = (5, 3))
+    ax.barh(names, np.arange(7))
+    ax.tick_params('y', glyphs = _beads, labelsize = 14)
+    fig.set_size(5, 2)
+    fig.layout()
+    assert ax.ylabels == names and ax._margins()[0] + ax._margins()[1] <= 0.55 * ax._room[2] + 1e-6
 
 
 def _crossings(spots):
@@ -3966,8 +4098,7 @@ def test_a_slide_is_what_every_other_format_draws(palette):
     ax.boxplot({'x': [1, 2, 3, 4], 'y': [2, 3, 5, 6]}, points = False)
     ax.annotate('peak', (1, 3))
     ax.set_title('Title')
-    tags = ('scope', 'artist', 'part', 'name', 'line', 'glyph')
-    assert [{k: v for k, v in op.items() if k not in tags} for op in fig._shapes()] == fig.display_list()
+    assert [{k: v for k, v in op.items() if k not in vc.figure.TAGS} for op in fig._shapes()] == fig.display_list()
 
 
 def _hls_hex(rgb):
@@ -4048,3 +4179,266 @@ def test_a_heatmap_takes_true_and_false_for_its_labels():
     ax.heatmap(np.eye(3), xticklabels = False, yticklabels = True)
     fig.layout()
     assert ax.xlabels == [] and ax.ylabels == ['2', '1', '0']
+
+
+def _linked(palette, highlight = None):
+    """Samples by name in three panels: a scatter of two groups, their values over boxes, and a heatmap's columns."""
+    rng = np.random.default_rng(5)
+    names, group = ['S%d' % i for i in range(12)], ['Tumor'] * 6 + ['Normal'] * 6
+    fig, axes = vc.subplots(1, 3, figsize = (12, 4), palette = palette)
+    axes[0].scatter(rng.normal(size = 12), rng.normal(size = 12), hue = group, names = names, highlight = highlight)
+    axes[0].set_xlabel('PC1')
+    axes[1].boxplot({'Tumor': rng.normal(size = 6), 'Normal': rng.normal(size = 6)}, names = [names[:6], names[6:]],
+                    highlight = highlight)
+    axes[2].heatmap(rng.normal(size = (4, 12)), xticklabels = names, yticklabels = list('ABCD'), highlight = highlight)
+    return fig, axes
+
+
+@pytest.mark.parametrize('palette', NAMES)
+def test_a_highlight_keeps_its_focus_and_lets_the_rest_recede(palette):
+    plain = {}
+    for op in _linked(palette)[0]._shapes():
+        plain.setdefault((op.get('artist'), op.get('part')), []).append(op)
+    fig, _ = _linked(palette, ['S2', 'Normal', 'B'])
+    ops = fig._shapes()
+    pal = fig.pal
+    elements = {}
+    for i, op in enumerate(ops):
+        elements.setdefault((op.get('artist'), op.get('part')), []).append((i, op))
+    fills = lambda found: [tuple(o['fill_rgb']) for o in found if o['kind'] == 'path' and o['fill']
+                           and o['fill_grad'] is None and o['fill_alpha'] > 0]
+    # A point keeps its shades where the highlight names it or its series, and recedes in its own hue elsewhere, as
+    # do the points over the boxes, with no shadow; the focus draws over the context
+    for (artist, part), found in elements.items():
+        if artist is None or not artist.startswith('points') or part is None:
+            continue
+        was, now = fills(plain[(artist, part)]), fills([o for _, o in found])
+        if part in ('S2', 'Tumor S2') or artist == 'points Normal' or str(part).startswith('Normal'):
+            assert now == was and all(o.get('mark') for _, o in found), (artist, part)
+        else:
+            assert now == [pal.recede(c) for c in was] and not any(o.get('mark') for _, o in found), (artist, part)
+    first = lambda part: min(i for (artist, p), found in elements.items() if p == part for i, _ in found)
+    assert first('S2') > first('S3') and first('Tumor S2') > first('Tumor S3')
+    # A heatmap keeps the rows and columns it names, and its other cells recede
+    for (artist, part), found in elements.items():
+        if artist and artist.startswith('heat') and part:
+            row, column = part.split(' | ')
+            was, now = np.array(fills(plain[(artist, part)])), np.array(fills([o for _, o in found]))
+            assert np.allclose(now, was if row == 'B' or column == 'S2' else pal.recede(was), atol = 1e-9), part
+    # It is a call like any other, which another palette draws again
+    assert fig.in_palette('lumen').to_png(72.0) == _linked('lumen', ['S2', 'Normal', 'B'])[0].to_png(72.0)
+
+
+def test_a_highlight_of_the_axes_takes_its_lines_and_their_labels():
+    from viscose.palettes import LC_TEXT, legible
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'lumen')
+    for k, name in enumerate('abc'):
+        ax.plot(np.arange(5), np.arange(5) * (k + 1), label = name)
+    ax.legend()
+    plain = fig.display_list()
+    ax.highlight('b')
+    ops = fig._shapes()
+    pal, colors = fig.pal, fig.pal.colors(3)
+    line = lambda name: [i for i, o in enumerate(ops) if o.get('artist') == 'line %s' % name]
+    stroke = lambda name: {tuple(ops[i]['stroke_rgb']) for i in line(name) if ops[i]['stroke']}
+    assert min(line('b')) > max(line('a') + line('c'))
+    assert stroke('b') == {colors[1]} and stroke('a') == {pal.recede(colors[0])}
+    # The labels that name the lines recede with them, and the one in focus keeps its color
+    label = lambda name: next(o['fill_rgb'] for o in ops if o['kind'] == 'text' and o.get('series') == name)
+    assert _oklch(label('a'))[1] < _oklch(colors[0])[1]
+    assert label('b') == pytest.approx(legible(colors[1], pal.color('paper'), LC_TEXT))
+    ax.highlight(None)
+    assert fig.display_list() == plain
+
+
+@pytest.mark.parametrize('palette', NAMES)
+def test_receded_shades_keep_their_hue_and_can_still_be_seen(palette):
+    from viscose.palettes import LC_MARK, RECEDE, RECEDE_CHROMA, _oklab, _oklab_srgb, apca
+    for pal in (get_palette(palette), get_palette(palette).dark()):
+        page = pal.color('paper')
+        for s in pal.a + pal.b:
+            c = pal.color(s)
+            r = pal.recede(c)
+            (L, C, h), (Lr, Cr, hr) = _oklch(c), _oklch(r)
+            # Its own lightness steps toward the page's by 0.01 at most past the floor, so within 2 Lc of it
+            assert LC_MARK - 1e-6 <= apca(r, page) <= max(apca(c, page), LC_MARK) + 2.0, s
+            assert Cr < C, s
+            if Cr > 0.02:
+                assert abs((h - hr + np.pi) % (2 * np.pi) - np.pi) < 0.15, s
+            # Receding twice changes nothing, and a receded color's gradients are its original's, receded
+            assert pal.recede(r) == r and pal.receded(r) and not pal.receded(c)
+            assert pal.shades(r) == tuple(pal.recede(v) for v in pal.shades(c))
+        # Cells recede all at once, by the same rule
+        cells = np.array([[pal.color(s) for s in pal.a]])
+        ok = _oklab(cells)
+        ok[..., 0] += RECEDE * (_oklab(page)[0] - ok[..., 0])
+        ok[..., 1:] *= RECEDE_CHROMA
+        assert np.allclose(pal.recede(cells), _oklab_srgb(ok))
+
+
+@pytest.mark.parametrize('palette', NAMES)
+def test_an_interactive_svg_is_the_page_as_drawn_with_hover_text_and_links(palette):
+    import json
+    import xml.dom.minidom
+    fig, _ = _linked(palette)
+    plain = fig._canvas().ops
+    hover = fig._canvas(hover = True, layout = False).ops
+    # The same page, with an unpainted disc over each point that a flat palette draws in one path
+    assert [{k: v for k, v in o.items() if k not in vc.figure.TAGS} for o in hover if not o.get('hit')] == plain
+    hits = [o for o in hover if o.get('hit')]
+    assert all(o['fill_alpha'] == 0.0 for o in hits) and len(hits) == (24 if fig.pal.point == 'flat' else 0)
+    svg = fig.to_svg(interactive = True)
+    xml.dom.minidom.parseString(svg.encode())
+    root = re.search(r'<svg id="(vc[0-9a-f]{8})"', svg).group(1)
+    assert svg.count('<script>') == 1 and svg.index('<script>') > svg.rindex('data-h=')
+    assert '#%s .vc-off' % root in svg and '@media print{#%s .vc-off' % root in svg
+    assert svg.index('<metadata>viscose</metadata>') < 3000 and svg.index('<rect width=') < svg.index('<g transform')
+    # Each text once, and rows that point at them
+    texts, table = json.loads(re.search(r'var T = (.*?), word = ', svg).group(1))
+    assert len(texts) == len(set(texts))
+    word = lambda found: None if found is None else [texts[k] for k in found]
+    table = [(word(names), word(said), word(series), axes, whole) for names, said, series, axes, whole in table]
+    rows = {(tuple(names), tuple(said[:1]), axes): (said, series, whole) for names, said, series, axes, whole in table}
+    # A point names its sample, its series, and where it lies, also over a box; a cell its row, column, and value; a
+    # box its group
+    said, series, whole = rows[(('S2', ), ('S2', ), 0)]
+    assert said[1:] == ['Tumor', 'PC1 ' + said[2][4:], 'y ' + said[3][2:]] and series == ['Tumor'] and not whole
+    said, series, whole = rows[(('S2', ), ('S2', ), 1)]
+    assert said[1] == 'Tumor' and said[2].startswith('y ') and series == ['Tumor'] and not whole
+    said, series, whole = rows[(('B', 'S2'), ('B', ), 2)]
+    assert said[1] == 'S2' and said[2].startswith('value ')
+    said, series, whole = rows[(('Tumor', ), ('Tumor', ), 1)]
+    assert said[1].startswith('median ') and said[3] == 'n 6'
+    # A tick label lights up what it names and keeps to no panel, and a label that names a series stands for it
+    assert rows[(('S2', ), (), None)][1:] == (None, 0) and (('B', ), (), None) in rows
+    assert any(series == ['Normal'] and whole for _, _, series, _, whole in table)
+    both = fig.to_svg(themes = True, interactive = True)
+    xml.dom.minidom.parseString(both.encode())
+    assert both.count('prefers-color-scheme:dark') == 2 and both.count('<script>') == 1
+
+
+def test_only_an_svg_is_interactive(tmp_path):
+    fig, _ = _linked('aura')
+    for suffix in ('png', 'pdf', 'pptx'):
+        with pytest.raises(ValueError, match = 'script'):
+            fig.save(tmp_path / f'f.{suffix}', interactive = True)
+    path = fig.save(tmp_path / 'f.svg', interactive = True)
+    assert 'data-h=' in path.read_text(encoding = 'utf-8') and vc.open(path).to_png(72.0) == fig.to_png(72.0)
+    assert 'data-h=' not in fig.to_svg() and '<script' not in fig.to_svg()
+
+
+def test_an_annotation_recedes_with_the_point_it_names():
+    from viscose.palettes import LC_TEXT, legible
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'aura')
+    ax.scatter([0.0, 1.0, 2.0], [0.0, 1.0, 0.5], names = ['p', 'q', 'r'], highlight = ['q'])
+    for name, xy in (('p', (0.0, 0.0)), ('q', (1.0, 1.0)), ('r', (2.0, 0.5)), ('note', (2.0, 1.0))):
+        ax.annotate(name, xy, offset = (6.0, 0.0))
+    ink = fig.pal.color('ink')
+    color = {o['text']: tuple(o['fill_rgb']) for o in fig.display_list() if o['kind'] == 'text'}
+    faded = tuple(legible(fig.pal.recede(ink), fig.pal.color('paper'), LC_TEXT))
+    # One on a receded point recedes, as far as text can and still be read; one on the focus, or away from the points,
+    # keeps its ink, and so does one that the highlight names
+    assert color['p'] == color['r'] == faded != ink and color['q'] == color['note'] == ink
+    ax.highlight(['r'])
+    ax.artists[0]['focus'] = None
+    color = {o['text']: tuple(o['fill_rgb']) for o in fig.display_list() if o['kind'] == 'text'}
+    assert color['r'] == ink and color['p'] == color['q'] == faded
+
+
+def test_sticks_take_names_a_highlight_and_hover_text():
+    import json
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'poster')
+    ax.vlines([1.0, 2.0, 3.0], 0.0, [3.0, 1.0, 2.0], names = ['a', 'b', 'c'], highlight = ['b'])
+    ax.stem([1.5, 2.5], [1.0, 2.0], names = ['d', 'e'], highlight = 'e')
+    ax.set_xlabel('m/z')
+    plain = fig._canvas().ops
+    ops = fig._shapes()
+    rgb = ax.artists[0]['rgb'][0]
+    sticks = [tuple(o['stroke_rgb']) for o in ops if o.get('artist') == 'vsegs 0']
+    # The context first, receded, and the stick in focus over it
+    assert sticks == [fig.pal.recede(rgb), rgb]
+    stems = [(o.get('part'), bool(o.get('mark'))) for o in ops if o.get('artist') == 'stems 0']
+    assert {p for p, _ in stems} == {0, 1} and all(mark == (p == 1) for p, mark in stems)
+    assert max(i for i, (p, _) in enumerate(stems) if p == 0) < min(i for i, (p, _) in enumerate(stems) if p == 1)
+    # An interactive SVG is the same page, with an unpainted line over each stick, and names each under the mouse
+    hover = fig._canvas(hover = True, layout = False).ops
+    hits = [o for o in hover if o.get('hit')]
+    assert len(hits) == 3 and all(o['stroke_alpha'] == 0.0 for o in hits)
+    assert [{k: v for k, v in o.items() if k not in vc.figure.TAGS} for o in hover if not o.get('hit')] == plain
+    svg = fig.to_svg(interactive = True)
+    texts, table = json.loads(re.search(r'var T = (.*?), word = ', svg).group(1))
+    said = [[texts[k] for k in row[1]] for row in table]
+    assert ['b', 'm/z 2', 'y 1'] in said and ['e', 'm/z 2.5', 'y 2'] in said
+    with pytest.raises(ValueError, match = 'one name per mark'):
+        ax.vlines([1.0, 2.0], 0.0, 1.0, names = ['a'])
+
+
+def test_a_ring_is_seen_by_its_rim_and_a_dot_by_its_fill():
+    fig, ax = vc.subplots(palette = 'poster')
+    ax.scatter([0, 1, 2], [0, 1, 2], color = 'white', edge = ('a0', 1.2))
+    ax.scatter([0, 1, 2], [1, 2, 3], color = 'a1', edge = ('white', 0.6))
+    fig.layout()
+    # Neither white, which the rim or the fill carries past, moves, nor so the white rims elsewhere
+    assert not fig.adjusted and np.allclose(ax.artists[0]['rgb'], 1.0) and np.allclose(ax.artists[1]['edge'][0], 1.0)
+
+
+def test_a_highlight_finds_every_series_by_its_label_and_keeps_the_order_of_what_never_recedes(tmp_path):
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'aura')
+    ax.bar(['a', 'b'], [1.0, 2.0], label = 'X')
+    ax.bar(['c', 'd'], [2.0, 1.0], label = 'Y')
+    ax.plot([0.0, 1.0, 2.0], [1.0, 2.0, 1.5], label = 'l', marker = True)
+    ax.stem([0.5, 1.5], [1.0, 0.5], label = 'S')
+    ax.axhline(1.5, label = 'cut')
+    ax.highlight({'X', 'l'})
+    bars, line, markers, stems = ax.artists[0], ax.artists[2], ax.artists[3], ax.artists[4]
+    # Bars, a line's markers, and stems belong to their label's series
+    assert ax._focused(bars, 2).all() and ax._focused(markers, 3).all() and not ax._focused(stems, 2).any()
+    assert ax._focused(line, 1).all() and not ax._focused(ax.artists[1], 2).any()
+    # A guide never recedes, nor so its entry
+    entries = [s for s, *_ in ax.legend_items]
+    assert not ax._receding(entries.index('cut')) and ax._receding(entries.index('Y'))
+    # A set is written into the file and comes back
+    path = fig.save(tmp_path / 'set.svg')
+    assert vc.open(path).to_png(72.0) == fig.to_png(72.0)
+    # A highlight of everything draws what none does, error bars over the bars included
+    draw = lambda keys: (lambda f, a: (a.bar(['a', 'b', 'c'], [1.0, 2.0, 3.0], highlight = keys),
+                                       a.errorbar([0.0, 1.0, 2.0], [1.0, 2.0, 3.0], 0.5), f)[-1])(*vc.subplots())
+    assert draw(['a', 'b', 'c']).to_png(72.0) == draw(None).to_png(72.0)
+
+
+def test_a_hue_level_stays_in_the_legend_while_a_group_in_focus_holds_it():
+    data = {'g': ['A'] * 8 + ['B'] * 8, 'h': ['p', 'q'] * 8, 'v': np.arange(16.0)}
+    fig, ax = vc.subplots(palette = 'lumen')
+    ax.boxplot(data, x = 'g', y = 'v', hue = 'h', highlight = ['A'])
+    entries = [(i, s) for i, (s, _, kind, *_) in enumerate(ax.legend_items) if kind != 'header']
+    assert entries and not any(ax._receding(i) for i, _ in entries)
+    ax.highlight(None)
+    ax.artists[0]['focus'] = {'A p'}
+    assert all(ax._receding(i) for i, _ in entries)
+
+
+def test_a_point_a_highlight_names_draws_over_the_field_it_lies_in():
+    rng = np.random.default_rng(0)
+    xy = rng.normal(size = (1500, 2)) * 0.3
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'poster')
+    ax.scatter(np.r_[xy[:, 0], 0.0], np.r_[xy[:, 1], 0.0], s = 60,
+               names = ['n%d' % i for i in range(1500)] + ['target'], highlight = 'target')
+    ops = fig._shapes()
+    assert any(o.get('part') == 'target' for o in ops)
+    svg = fig.to_svg(themes = True, interactive = True)
+    assert '.vc-on .vc-hit' in svg
+
+
+def test_bars_name_a_mismatch_and_stacked_bars_take_a_highlight():
+    fig, ax = vc.subplots(palette = 'aura')
+    with pytest.raises(ValueError, match = 'one height per bar'):
+        ax.bar(['a', 'b', 'c'], [1.0, 2.0])
+    with pytest.raises(ValueError, match = 'one width per bar'):
+        ax.barh(['a', 'b', 'c'], [1.0, 2.0])
+    with pytest.raises(ValueError, match = 'row per bar'):
+        ax.stacked_bar(['a', 'b'], [[1.0, 2.0, 3.0]])
+    ax.bar(['a', 'b'], 1.0)
+    ax.stacked_bar(['c', 'd'], [[1.0, 2.0], [3.0, 1.0]], labels = ['p', 'q'], highlight = ['q'])
+    ops = fig._shapes()
+    assert all(not o.get('mark') for o in ops if o.get('artist') == 'bars p')
+    assert any(o.get('mark') for o in ops if o.get('artist') == 'bars q')

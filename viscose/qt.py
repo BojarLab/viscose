@@ -5,7 +5,7 @@ from typing import NamedTuple
 import numpy as np
 from glycorender import pdfwrite
 try:
-    from PySide6.QtCore import QRect, QRectF, QSize, Qt, Signal
+    from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer, Signal
     from PySide6.QtGui import (QAction, QBrush, QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
                                QRadialGradient, QTransform)
     from PySide6.QtWidgets import QStyle, QToolBar, QVBoxLayout, QWidget
@@ -18,6 +18,8 @@ from .figure import Figure
 # Widget pixels per inch of a figure, as figures follow their widget's size in inches
 DPI = 100
 RING_RADIUS, RING_WIDTH = 6.0, 1.4
+# How long a zoom, pan, or resize must pause before spread glyphs are placed in full again
+SETTLE_MS = 200
 
 
 def _path(ops):
@@ -35,10 +37,11 @@ def _path(ops):
 
 
 @lru_cache(4096)
-def _glyphs(ttf, string):
-    """A string's outlines at 1000 units per em, cached, as the same few characters come back with every redraw; filled
-    by the nonzero rule, as strokes of a glyph may overlap."""
-    path = _path(text.outline(pdfwrite.Canvas(None, (1.0, 1.0)), ttf, string, 0.0, 0.0, 1000.0).ops)
+def _glyphs(ttf, string, tracking = 0.0):
+    """A string's outlines at 1000 units per em, with `tracking` after each letter in those units, as spaced capitals
+    and a glycan's linkages carry, cached, as the same few characters come back with every redraw; filled by the
+    nonzero rule, as strokes of a glyph may overlap."""
+    path = _path(text.outline(pdfwrite.Canvas(None, (1.0, 1.0)), ttf, string, 0.0, 0.0, 1000.0, tracking).ops)
     path.setFillRule(Qt.WindingFill)
     return path
 
@@ -57,7 +60,7 @@ def _color(rgb, alpha = 1.0):
 def paint_page(figure, dpi, layout = True):
     """The page as a QImage, painted by Qt from the figure's display list: about ten times as fast as the numpy
     rasterizer that saved images go through, whatever the resolution, which makes zooming and panning smooth. For
-    palettes without a soft shadow or spaced capitals, which the display list or this leaves out."""
+    palettes without a soft shadow, which the display list leaves out."""
     ops = figure.display_list(layout)
     scale = dpi / 72
     image = QImage(round(figure.width * scale), round(figure.height * scale), QImage.Format_RGBA8888_Premultiplied)
@@ -80,7 +83,8 @@ def paint_page(figure, dpi, layout = True):
             painter.save()
             painter.translate(op['x'], op['y'])
             painter.scale(size, size)
-            painter.fillPath(_glyphs(op['ttf'], op['text']), _color(op['fill_rgb'], op['fill_alpha']))
+            painter.fillPath(_glyphs(op['ttf'], op['text'], op.get('char_space', 0.0) / size),
+                             _color(op['fill_rgb'], op['fill_alpha']))
             painter.restore()
         elif op['kind'] == 'image':
             # The unit square, first row at its top
@@ -160,6 +164,12 @@ class Canvas(QWidget):
         self.figure, self.toolbar, self.span, self.rings = figure, None, None, []
         self.image, self.band, self.start, self.pan_from = None, None, None, None
         self.setMouseTracking(True)
+        # While redraws come quickly, spread glyphs move with their points, and once they pause they are placed in full
+        self.drafting = False
+        self.settle = QTimer(self)
+        self.settle.setSingleShot(True)
+        self.settle.setInterval(SETTLE_MS)
+        self.settle.timeout.connect(self.settled)
         figure.layout()
 
     def sizeHint(self):
@@ -169,7 +179,21 @@ class Canvas(QWidget):
         return QSize(10, 10)
 
     def draw_idle(self):
-        self.figure.layout()
+        self.drafting = True
+        self.settle.start()
+        self.lay_out()
+
+    def settled(self):
+        self.drafting = False
+        self.lay_out()
+
+    def lay_out(self):
+        # The figure drafts only within the canvas's own layout and painting, so a file saved meanwhile is drawn in full
+        self.figure._draft = self.drafting
+        try:
+            self.figure.layout()
+        finally:
+            self.figure._draft = False
         self.image = None
         self.update()
 
@@ -185,7 +209,11 @@ class Canvas(QWidget):
         ratio = self.devicePixelRatioF()
         if self.image is None or self.image.devicePixelRatio() != ratio:
             # Laid out by draw_idle or, for a figure just shown, by __init__
-            self.image = paint_page(self.figure, DPI * ratio, False)
+            self.figure._draft = self.drafting
+            try:
+                self.image = paint_page(self.figure, DPI * ratio, False)
+            finally:
+                self.figure._draft = False
             self.image.setDevicePixelRatio(ratio)
         painter = QPainter(self)
         painter.drawImage(0, 0, self.image)

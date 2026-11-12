@@ -181,18 +181,41 @@ fig.save('proof.png', press = True)
 |---|---|
 | **Plots** | `plot`, `step`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `boxplot`, `violinplot`, `stripplot`, `contour`, `stem`, `hlines`, `vlines`, `arrow`, `rectangle`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, `axline`, `axhspan`, `axvspan`, `image`, and `vc.clustermap` |
 | **Markers** | `o`, `s`, `D`, `^`, `v`, `>`, `<`, `X`, `P`, `*`, `h`, and `p`, all with the palette's effects |
-| **Annotation** | `text`, `annotate`, `bracket`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text; `legend()` names every line, group of points, stacked bar, histogram, and reference line where it is, and `annotate(spread = True)` does the same for any text, moving labels apart exactly as little as it takes, with a hairline to each one that moved |
+| **Annotation** | `text`, `annotate`, `bracket`, `legend`, and `colorbar`, with `_{sub}` and `^{super}` in any text; `legend()` names every line, group of points, stacked bar, histogram, and reference line where it is, and `annotate(spread = True)` does the same for any text, moving labels apart exactly as little as it takes, with a hairline to each one that moved; `annotate(y_fraction = True)` holds a label or a drawing in a band of the axes through every zoom, such as a fragment over its peak |
 | **Pages** | `vc.Figure(183, 120, unit = 'mm')` is a journal page, `fig.add_axes((x, y, w, h), unit = 'mm')` places a panel from its top left, and `fig.letter(x, y, 'a', 'Heading')` and `fig.text` write panel letters and any other text on the page; `vc.subplot_mosaic('abc;ddd')` lets axes span cells of a grid |
 | **Axes** | `set_xscale` takes `linear`, `log`, `sqrt`, or any pair of functions; `fmt` on `set_xticks` and `set_yticks` writes the ticks, as `'{:.0%}'` or a function; `tick_params` sets each axis's tick length, pad, label size, and labels, puts x labels on top, or keeps labels exactly as set; `emphasis` sets chosen tick labels bold in a color; `set_spines` shows or hides each axis line |
 | **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, long axis names shrink, and the page grows for anything that needs it; `vc.subplots(sharex = True, sharey = 'row')` shares limits, scales, and ticks across all panels, rows, or columns, as in matplotlib |
-| **Output** | `fig.save` writes PNG, PDF, SVG, or PowerPoint from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG, native shapes and editable text in PowerPoint, and with `press` a CMYK PDF/X-4 for print or a soft proof; `vc.deck` makes a talk whose slides Morph into each other; `scatter(rasterized = True)` makes tens of thousands of points one image there, as 100,000 points take 1.7 MB of SVG in place of 17.6 MB, with axes and text still vector; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window; `viscose.qt`, with `pip install "viscose[qt]"`, is that window: PySide6 widgets that paint a figure about ten times as fast as the rasterizer, with pan, zoom, and mouse targets |
-| **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, and `ax.boxes()` gives the page boxes of everything drawn, for placing things yourself clear of it or answering a mouse |
+| **Output** | `fig.save` writes PNG, PDF, SVG, or PowerPoint from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG, native shapes and editable text in PowerPoint, and with `press` a CMYK PDF/X-4 for print or a soft proof; `interactive = True` gives an SVG hover text and highlighting linked across panels; `vc.deck` makes a talk whose slides Morph into each other; `scatter(rasterized = True)` makes tens of thousands of points one image there, as 100,000 points take 1.7 MB of SVG in place of 17.6 MB, with axes and text still vector; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window; `viscose.qt`, with `pip install "viscose[qt]"`, is that window: PySide6 widgets that paint a figure about ten times as fast as the rasterizer, with pan, zoom, and mouse targets |
+| **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, and `ax.boxes()` gives the page boxes of everything drawn, for placing things yourself clear of it or answering a mouse, and `ax.hidden(artist)` which points a density field holds |
 | **Display** | `fig.show()` works inline in Jupyter and slate, and in the system's image viewer from a terminal, with CI and coding agents kept silent |
 | **SVG hooks** | `gid` on `arrow` and `scatter` names elements for hover text and scripting |
-| **Names** | `names` on `scatter` labels each point, and on `heatmap` each row and column, which draws nothing but lets slate show what is under the mouse |
+| **Names** | `names` on `scatter`, `boxplot`, `stripplot`, and `violinplot` labels each point, on `stem` and `vlines` each peak, and on `heatmap` each row and column, which draws nothing but lets slate show what is under the mouse, `highlight` find them, and an interactive SVG light up the same sample in every panel |
 | **Palettes** | `fig.in_palette('aura')` gives the same figure in another palette, exactly as if it had been drawn in that one, shades taken from `fig.pal` included |
 | **Source** | Every file `fig.save` writes carries the figure's own calls and data, a few kB of JSON, and `vc.open('fig3.pdf')` brings the figure back from that file alone: `vc.open('fig3.pdf', 'couture')` in another palette, `vc.open('fig3.pdf', 'aura-dark')` dark, `vc.open('fig3.pdf', size = (89, 70), unit = 'mm')` at a journal's column width, exactly as if drawn that way, and the numbers are there for anyone to read, as the PDF's attachment `figure-source.json`; `source = False` leaves it out |
 | **State** | None hidden: a figure is an object, with no current figure and nothing to close |
+
+## Focus in shades, figures that answer the mouse
+
+`highlight` keeps what matters in full shade and lets everything else recede toward the page, each in its own hue, so
+the emphasis comes from shade, never from a new color. It names samples, groups, categories, or a heatmap's rows and
+columns; the focus draws over the context, which casts no shadow, and legends and labels follow.
+`ax.highlight(['Day 4'])` does the same for every line on an axes.
+
+```python
+pca.scatter(pc1, pc2, hue = condition, names = samples, highlight = ['C3', 'T3'])
+heat.heatmap(z, xticklabels = samples, yticklabels = glycans, highlight = ['C3', 'T3'])
+bars.barh(glycans, change, highlight = largest)
+```
+
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/focus.png" alt="Colorectal O-glycomes of 12 tumor and 12 control tissues in Aura: two samples in full shade across a PCA, a heatmap with glycan drawings as row labels, and box plots of sialylation, and the three largest changes in full shade among bars, with everything else receded toward the page in its own hue" width="100%"></p>
+
+`fig.save('figure.svg', interactive = True)` writes an SVG that answers the mouse, with a few lines of script and no
+library. Over a point, bar, box, cell, line, or tick label, a box in the palette's colors says what it is and gives its
+values, and everything of the same name lights up in every panel while the rest of each fades: a sample's point in the
+PCA, its column in the heatmap, and its point over the boxes; a glycan's row and its bar, from its drawing on either
+axis; a group from its label. Interactive figures on one page light up together. Printed, as an `<img>`, or in an
+editor, the file is the figure as drawn, pixel for pixel. [The figure above](https://github.com/BojarLab/viscose/raw/main/examples/readme/linked.svg),
+in Poster, is one: save it and open it in a browser.
 
 ## Talks that move
 

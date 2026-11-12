@@ -133,6 +133,46 @@ def glycan_bars():
     return fig
 
 
+def linked(highlight, palette = 'aura'):
+    """Colorectal O-glycomes by sample in four panels, with samples C3 and T3 and the largest changes in focus."""
+    from glycowork.glycan_data.loader import glycomics_data_loader
+    table = glycomics_data_loader.human_colorectal_O_PMC9254241.groupby('glycan', sort = False).sum()
+    samples = [c for c in table.columns if c[0] in 'CT']
+    shares = table[samples].to_numpy(float)
+    shares = shares / shares.sum(axis = 0) * 100
+    clr = np.log(shares + 0.1)
+    clr -= clr.mean(axis = 0)
+    tumor = np.array([s[0] == 'T' for s in samples])
+    u, sv, _ = np.linalg.svd(clr.T - clr.T.mean(axis = 0), full_matrices = False)
+    share = sv ** 2 / (sv ** 2).sum()
+    top = np.argsort(-clr.var(axis = 1))[:12]
+    glycans = list(table.index[top])
+    z = (clr[top] - clr[top].mean(axis = 1, keepdims = True)) / clr[top].std(axis = 1, keepdims = True)
+    change = clr[top][:, tumor].mean(axis = 1) - clr[top][:, ~tumor].mean(axis = 1)
+    sialylated = shares[np.array(['Neu5Ac' in g for g in table.index])].sum(axis = 0)
+    pick = ['C3', 'T3'] if highlight else None
+    fig, axes = vc.subplot_mosaic('ab;cd', figsize = (13, 10), palette = palette, width_ratios = [1, 1.4])
+    fig.suptitle('Colorectal O-glycome', '12 tumor and 12 control tissues')
+    ax = axes['a']
+    ax.scatter(*(u[:, :2] * sv[:2]).T, hue = np.where(tumor, 'Tumor', 'Control'), names = samples, s = 60,
+               highlight = pick)
+    ax.set(xlabel = 'PC1 (%d%%)' % round(100 * share[0]), ylabel = 'PC2 (%d%%)' % round(100 * share[1]))
+    axes['b'].heatmap(z, xticklabels = samples, yticklabels = glycans, colorbar = True,
+                      colorbar_label = 'z-score (CLR)', highlight = pick)
+    axes['b'].tick_params('y', glyphs = 'glycan')
+    ax = axes['c']
+    ax.boxplot({'Control': sialylated[~tumor], 'Tumor': sialylated[tumor]},
+               names = [list(np.array(samples)[~tumor]), list(np.array(samples)[tumor])], highlight = pick)
+    ax.set_ylabel('Sialylated (%)')
+    ax = axes['d']
+    ax.barh(glycans, change, color = ['a1' if v > 0 else 'b1' for v in change],
+            highlight = [glycans[i] for i in np.argsort(-np.abs(change))[:3]] if highlight else None)
+    ax.tick_params('y', glyphs = 'glycan')
+    ax.axvline(0)
+    ax.set_xlabel('Tumor - control (CLR)')
+    return fig
+
+
 def markers():
     rng = np.random.default_rng(3)
     n = 150
@@ -286,6 +326,9 @@ if __name__ == '__main__':
     arrange([[fit(Image.open(BytesIO(labels('lumen').to_png(200))).convert('RGB'), 2400, 740)]], 'labels.png')
     # One file that follows the reader's light or dark mode, as GitHub and PyPI show it
     labels('poster').save(OUT / 'themes.svg', themes = True)
+    # Focus in shades, and the same figure as an SVG whose samples light up across its panels under the mouse
+    arrange([[fit(Image.open(BytesIO(linked(True).to_png(200))).convert('RGB'), 1400, 1080)]], 'focus.png')
+    linked(False, 'poster').save(OUT / 'linked.svg', interactive = True)
     arrange([[tile(gallery.heatmap('aura'), 1100)]], 'clustermap.png')
     arrange([[tile(crowd(False), 900), tile(crowd(True), 900)]], 'crowd.png')
     arrange([[tile(figures[k](p + '-dark'), 640) for k, p in zip(('trial', 'volcano', 'stacked', 'embedding'), names)]],

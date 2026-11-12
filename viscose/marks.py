@@ -476,10 +476,11 @@ def _layers(pal, xs, ys, r, rgb, edge):
     return [(xs, ys, r, rgb, None, 0.0)]
 
 
-def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None, ids = None):
+def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None, ids = None, hovers = None):
     """Scatter marks in the palette's manner; `area` is in points squared, as in matplotlib. `edge` is (color,
     width), and with `rgb` None it is all that shows. `ids` names each point, for PowerPoint, which draws up to
-    SHAPE_POINTS of them as a shape each, so that each moves to its own place."""
+    SHAPE_POINTS of them as a shape each, so that each moves to its own place, and `hovers` gives each its names and
+    text for an interactive SVG."""
     n = len(xs)
     if not n:
         return
@@ -496,16 +497,31 @@ def points(c, pal, xs, ys, area, rgb, alpha = 1.0, marker = 'o', edge = None, id
     step = max(1, n // POINT_GROUPS) if edge is not None or pal.point != 'flat' or alpha < 1.0 else n
     single = getattr(c, 'shapes', False) and n <= SHAPE_POINTS
     if single:
-        step, ids = 1, np.arange(n) if ids is None else np.asarray(ids, dtype = object)[drawn]
+        ids = np.arange(n) if ids is None else np.asarray(ids, dtype = object)[drawn]
+        hovers = None if hovers is None else [h for h, d in zip(hovers, drawn) if d]
+        # PowerPoint draws each point as a shape of its own, while an interactive SVG draws them as every other format
+        # does, so that its page is the same, and where they come in groups, puts an unpainted disc over each, which
+        # the pointer finds and which fills in while it is lit
+        step = step if getattr(c, 'hover', False) else 1
     if not (getattr(c, 'stamp_dpi', None) and n >= STAMP_MIN and c.state['clip']
             and (marker == 'o' or len(np.unique(r)) <= SPRITE_SIZES)):
         form = getattr(c, 'marker_forms', False) and np.min(r) == np.max(r)
+        first = len(c.ops)
         for start in range(0, n, step):
             chosen, at = slice(start, start + step), len(c.ops)
             for lx, ly, lr, color, stroke, lw in _layers(pal, xs[chosen], ys[chosen], r[chosen], rgb, edge):
                 shapes(c, lx, ly, lr, color, alpha, stroke, lw, marker, form)
-            if single:
-                tag(c, at, part = ids[start])
+            if single and step == 1:
+                tag(c, at, part = ids[start], **({} if hovers is None else {'hover': hovers[start]}))
+        if single and step > 1:
+            # The groups fade with the rest of their panel, and have nothing to say of their own
+            tag(c, first, hover = ((), ()))
+            lx, ly, lr, _, _, _ = _layers(pal, xs, ys, r, rgb, edge)[0]
+            for i in range(n):
+                at = len(c.ops)
+                shapes(c, lx[i:i + 1], ly[i:i + 1], lr[i:i + 1], rgb if rgb is not None else edge[0], 0.0, None, 0.0,
+                       marker)
+                tag(c, at, part = ids[i], hit = True, **({} if hovers is None else {'hover': hovers[i]}))
         return
     buf = _stamp_buffer(c, xs, ys, r, marker)
     if buf is None:
@@ -627,7 +643,10 @@ def box(c, pal, x, w, stats, rgb, alpha = 1.0, horizontal = False):
                 ((q1, x, q3, x) if horizontal else (x, q1, x, q3), pal.shades(rgb)[1:][::-1]))
     else:
         bar(c, pal, *((q1, x, q3 - q1, w) if horizontal else (x, q1, w, q3 - q1)), rgb, horizontal, alpha)
-    polyline(c, *turn(horizontal, [x, x + w], [median, median]), pal.color(pal.on(rgb)), max(lw, 1.4), alpha, cap = 0)
+    # A receded box's median recedes with it
+    on = pal.color(pal.on(rgb))
+    polyline(c, *turn(horizontal, [x, x + w], [median, median]), pal.recede(on) if pal.receded(rgb) else on,
+             max(lw, 1.4), alpha, cap = 0)
 
 
 def violin(c, pal, xs, ys, cx, half, rgb, alpha = 1.0, horizontal = False):

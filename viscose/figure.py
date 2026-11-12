@@ -22,7 +22,7 @@ from dataclasses import fields, replace
 import numpy as np
 from glycorender import pdfwrite, raster
 from . import marks, text
-from .axes import Axes, LABEL_MIN
+from .axes import Axes, LABEL_MIN, PLOT_SHARE_MARGINS
 from .palettes import (AURA, COUTURE, CVD_MIN, LC_LARGE, LC_MARK, LC_TEXT, LUMEN, POSTER, Palette, _darks, _from_oklch,
                        _hex, _named, _oklab, _oklch, apart, apca, dark_mode, get_palette, legible, press as _press)
 
@@ -32,8 +32,6 @@ from .palettes import (AURA, COUTURE, CVD_MIN, LC_LARGE, LC_MARK, LC_TEXT, LUMEN
 SHADOW_DX, SHADOW_DY, SHADOW_BLUR, SHADOW_DPI = 1.2, 5.0, 4.7, 100.0
 # A byte's value in [0, 1], as glycorender reads image bytes
 BYTES = (np.arange(256) / 255.0).astype(np.float32)
-# Margins may take this share of an axes' cell before the figure grows
-PLOT_SHARE_MARGINS = 0.55
 # Coding agents and CI can hold a real console, so a terminal alone does not mean someone wants a window per figure
 NO_VIEWER = ('CLAUDECODE', 'CI', 'PYTEST_CURRENT_TEST', 'VISCOSE_NO_VIEWER')
 # What clustermap clusters by, as scipy names them
@@ -61,6 +59,108 @@ SOURCE_ABOUT = 'The calls and data that drew this figure, which viscose.open bri
 # drawing's id, which scopes its rules, and its own gradients' ids start with until its text is known
 THEME_PAINT = ('fill_rgb', 'fill_alpha', 'fill_grad', 'stroke_rgb', 'stroke_alpha')
 THEME_LIGHT, THEME_DARK, THEME_PREFIX = 'vl', 'vd', '\x01'
+# What an op notes about what drew it, for PowerPoint and an interactive SVG, which is the same in either theme
+TAGS = ('scope', 'artist', 'part', 'name', 'line', 'glyph', 'hover', 'series', 'hit', 'tick')
+# How far everything else in a panel fades while an interactive SVG lights up what the pointer names
+HOVER_FADE = 0.2
+# An interactive SVG's script, which needs no library. It runs where the SVG does as a document or inline in a page,
+# though not as an <img>, and only on the pointer: hover text for the element under it, in a box in the page's colors,
+# and every element of the same names lit up in every panel, and in every other such figure on the page, while the rest
+# of each panel that holds one fades, with the soft shadow. __TABLE__ is [texts, rows], each row holding, for an
+# element, its own names, its hover text, the series it belongs to, as places in texts, which holds each text once, its
+# axes, and whether it stands for that series, as a line or a legend entry does; data-h on an element or on the group of
+# its layers gives its row
+HOVER_SCRIPT = '''<script><![CDATA[(function () {
+var NS = 'http://www.w3.org/2000/svg', me = document.currentScript, svg = me && me.parentNode;
+if (!svg || !svg.querySelectorAll || !window.CustomEvent) return;
+var T = __TABLE__, word = function (k) { return T[0][k]; };
+var H = T[1].map(function (h) {
+  return [h[0].map(word), h[1].map(word), h[2] === null ? null : h[2].map(word), h[3], h[4]];
+});
+var names = {}, panels = {}, own = {}, lit = [], tip = null, at = null, quiet = false;
+function add(map, k, e) { (map[k] = map[k] || []).push(e); }
+Array.prototype.forEach.call(svg.querySelectorAll('[data-h]'), function (e) {
+  var i = +e.getAttribute('data-h'), h = H[i];
+  add(own, i, e);
+  if (h[3] !== null) add(panels, h[3], e);
+  h[0].forEach(function (k) { add(names, k, e); });
+  (h[2] || []).forEach(function (k) { add(names, k, e); });
+});
+function light(keys, mine) {
+  lit.forEach(function (e) { e.classList.remove('vc-on', 'vc-off'); });
+  lit = [];
+  var on = new Set(mine || []), held = new Set();
+  (keys || []).forEach(function (k) { (names[k] || []).forEach(function (e) { on.add(e); }); });
+  svg.classList.toggle('vc-lit', on.size > 0);
+  on.forEach(function (e) { var p = H[+e.getAttribute('data-h')][3]; if (p !== null) held.add(p); });
+  held.forEach(function (p) {
+    panels[p].forEach(function (e) { e.classList.add(on.has(e) ? 'vc-on' : 'vc-off'); lit.push(e); });
+  });
+}
+document.addEventListener('viscose-focus', function (ev) { if (!quiet) light(ev.detail); });
+function focus(keys, mine) {
+  light(keys, mine);
+  quiet = true;
+  document.dispatchEvent(new CustomEvent('viscose-focus', {detail: keys}));
+  quiet = false;
+}
+function place(ev) {
+  var m = svg.getScreenCTM();
+  if (!tip || !m) return;
+  var p = svg.createSVGPoint();
+  p.x = ev.clientX;
+  p.y = ev.clientY;
+  p = p.matrixTransform(m.inverse());
+  var b = tip.getBBox(), gap = 14 / Math.abs(m.a || 1), v = svg.viewBox.baseVal, x = p.x + gap, y = p.y + gap;
+  if (x + b.width > v.x + v.width) x = p.x - gap - b.width;
+  if (y + b.height > v.y + v.height) y = p.y - gap - b.height;
+  tip.setAttribute('transform', 'translate(' + (Math.max(v.x, x) - b.x) + ' ' + (Math.max(v.y, y) - b.y) + ')');
+}
+function show(said, ev) {
+  if (tip) tip.remove();
+  tip = null;
+  if (!said.length) return;
+  var m = svg.getScreenCTM(), k = 1 / Math.abs(m && m.a || 1), box = document.createElementNS(NS, 'rect');
+  var t = document.createElementNS(NS, 'text');
+  tip = document.createElementNS(NS, 'g');
+  tip.setAttribute('class', 'vc-tip');
+  tip.setAttribute('pointer-events', 'none');
+  t.setAttribute('font-size', 12 * k);
+  said.forEach(function (s, n) {
+    var span = document.createElementNS(NS, 'tspan');
+    span.setAttribute('x', 0);
+    if (n) span.setAttribute('dy', 15 * k);
+    else span.setAttribute('class', 'vc-head');
+    span.textContent = s;
+    t.appendChild(span);
+  });
+  tip.appendChild(box);
+  tip.appendChild(t);
+  svg.appendChild(tip);
+  var b = t.getBBox(), pad = 6 * k;
+  [['x', b.x - pad], ['y', b.y - pad], ['width', b.width + 2 * pad], ['height', b.height + 2 * pad], ['rx', 3 * k],
+   ['stroke-width', 0.75 * k]].forEach(function (a) { box.setAttribute(a[0], a[1]); });
+  place(ev);
+}
+function leave() {
+  if (at === null) return;
+  at = null;
+  show([]);
+  focus(null);
+}
+svg.addEventListener('pointerover', function (ev) {
+  var e = ev.target.closest && ev.target.closest('[data-h]');
+  if (!e || !svg.contains(e)) return leave();
+  var i = +e.getAttribute('data-h'), h = H[i];
+  if (i === at) return;
+  at = i;
+  focus(h[0].length ? h[0] : h[4] ? h[2] || [] : [], own[i]);
+  show(h[1], ev);
+});
+svg.addEventListener('pointermove', function (ev) { if (at !== null) place(ev); });
+svg.addEventListener('pointerleave', leave);
+})();]]></script>
+'''
 
 
 def show_png(png, viewer = True):
@@ -177,6 +277,72 @@ def _drawn(ops):
                                o['text'].strip())]
 
 
+def _hovered(svg, ops):
+    """Each drawn op's line of svgout.emit's output marked with its element in an interactive SVG, by its row in the
+    table that HOVER_SCRIPT reads, and that table: per element its own names, hover text, series, axes, and whether it
+    stands for its series. An element of several ops, such as a point drawn in layers, is one group, so that it fades
+    as one."""
+    start = svg.index('\n', svg.index('<g transform="matrix(')) + 1
+    end = svg.rindex('\n</g>\n</svg>')
+    lines, drawn = svg[start:end].split('\n'), _drawn(ops)
+    if len(lines) != len(drawn):
+        raise RuntimeError(f'An interactive SVG needs a line per drawn op, got {len(lines)} for {len(drawn)}')
+    found, table, rows = {}, [], []
+    for n, op in enumerate(drawn):
+        # The soft shadow fades while anything is lit, as faded marks over their full shadows would read as smudges,
+        # and an unpainted disc over a point drawn in a group fills in while it is lit
+        if op.get('shadow') or op.get('hit'):
+            cls, at = 'vc-shadow' if op.get('shadow') else 'vc-hit', lines[n].find(' class="')
+            lines[n] = (lines[n][:at] + ' class="%s ' % cls + lines[n][at + 8:] if at >= 0 else
+                        re.sub(r'^<(\w+)', r'<\1 class="%s"' % cls, lines[n], count = 1))
+        hover, series = op.get('hover'), op.get('series')
+        if hover is None and series is None:
+            rows.append(None)
+            continue
+        scope = op.get('scope')
+        key = (scope, op.get('artist'), op.get('part'), op.get('name'), hover, series)
+        if key not in found:
+            found[key] = len(table)
+            # A series is a label, or the labels of a group, such as a category and a hue level
+            series = None if series is None else [str(k) for k in (series if isinstance(series, tuple) else (series, ))]
+            names, said = hover if hover is not None else ((), (' · '.join(series), ))
+            # A line, or a legend entry or label that names a series, stands for all of it; a tick label lights up
+            # what it names, and keeps to no panel, as it never fades
+            table.append([[str(k) for k in names], [str(s) for s in said], series,
+                          None if scope is None or op.get('tick') else int(scope[0][1:]),
+                          int(hover is None or hover == ((), ()))])
+        rows.append(found[key])
+    out = []
+    for n, (line, i) in enumerate(zip(lines, rows)):
+        if i is not None:
+            first, last = n == 0 or rows[n - 1] != i, n == len(rows) - 1 or rows[n + 1] != i
+            line = (re.sub(r'^<(\w+)', r'<\1 data-h="%d"' % i, line, count = 1) if first and last else
+                    ('<g data-h="%d">' % i if first else '') + line + ('</g>' if last else ''))
+        out.append(line)
+    return svg[:start] + '\n'.join(out) + svg[end:], table
+
+
+def _hover_style(pal, dark = None):
+    """An interactive SVG's rules, scoped to the drawing's id: how the rest of a panel fades, with the soft shadow, and
+    the hover box in the page's colors, those of `dark` in a dark theme, and nothing of either in print."""
+    scope = '#' + THEME_PREFIX
+    family = ', '.join("'%s'" % f for f in dict.fromkeys(([pal.font[0]] if pal.font else []) + [
+        'Century Gothic', 'CenturyGothic', 'Comfortaa'])) + ', sans-serif'
+    box = lambda p: ('{0} .vc-tip rect{{fill:{1};stroke:{2}}}{0} .vc-tip text{{fill:{3}}}'
+                     '{0} .vc-tip .vc-head{{fill:{4}}}'.format(scope, p.css('paper'), p.css('faint'), p.css('muted'),
+                                                               p.css('ink')))
+    # A lit disc or line over marks drawn in groups, whose class sits on the element, or within it where a theme's class
+    # was there first
+    hit = '{0} .vc-hit.vc-on,{0} .vc-hit.vc-on *,{0} .vc-on .vc-hit'.format(scope)
+    rules = ('{0} [data-h],{0} .vc-shadow{{transition:opacity .15s}}{0} .vc-off,{0}.vc-lit .vc-shadow{{opacity:{1}}}'
+             '{3}{{fill-opacity:1;stroke-opacity:1}}{0} .vc-tip text{{font-family:{2}}}'
+             '{0} .vc-tip .vc-head{{font-weight:bold}}'.format(scope, HOVER_FADE, family, hit))
+    night = '@media (prefers-color-scheme:dark){%s}' % box(dark) if dark else ''
+    paper = ('@media print{{{0} .vc-off,{0}.vc-lit .vc-shadow{{opacity:1}}{1}{{fill-opacity:0;stroke-opacity:0}}'
+             '{0} .vc-tip{{display:none}}}}'.format(scope, hit))
+    return '<style>%s%s%s%s</style>\n' % (rules, box(pal), night, paper)
+
+
 def _frozen(v):
     return tuple(_frozen(u) for u in v) if isinstance(v, (list, tuple)) else v
 
@@ -184,7 +350,8 @@ def _frozen(v):
 def _shape_key(op):
     """What an op draws, apart from its paint, which is all that differs between a figure and its twin in another
     palette as long as they draw the same shapes; an image's pixels are its shape, and a gradient's stops its paint."""
-    key = tuple((k, _frozen(v)) for k, v in sorted(op.items()) if k not in THEME_PAINT + ('ttf', 'label', 'mark'))
+    key = tuple((k, _frozen(v)) for k, v in sorted(op.items())
+                if k not in THEME_PAINT + TAGS + ('ttf', 'label', 'mark'))
     return key + (op['fill_grad'][:2] if op.get('fill_grad') else None, )
 
 
@@ -312,6 +479,9 @@ def _encode(v, ctx):
         return [enc(u) for u in v]
     if isinstance(v, range):
         return {'$range': [v.start, v.stop, v.step]}
+    # A set, such as what a highlight names, in an order that stays from one process to the next, as its own does not
+    if isinstance(v, (set, frozenset)):
+        return {'$set': [enc(u) for u in sorted(v, key = repr)]}
     if isinstance(v, dict):
         if all(isinstance(k, str) and k[:1] != '$' for k in v):
             return {k: enc(u) for k, u in v.items()}
@@ -395,6 +565,8 @@ def _decode(v, arrays, axes, functions):
         return float(v['$f'])
     if '$range' in v:
         return range(*v['$range'])
+    if '$set' in v:
+        return {dec(u) for u in v['$set']}
     if '$ax' in v:
         return axes[v['$ax']]
     if '$pal' in v:
@@ -459,6 +631,9 @@ class Figure:
         self._calls, self._inside = [], 0
         self._title, self._subtitle = '', ''
         self._grid, self._held = None, False
+        # Set by a window while a zoom, pan, or resize runs, so that spread glyphs move with their points rather than
+        # being placed again at every step (see Axes._place_glyphs); files never draw in draft
+        self._draft = False
         self._texts = []
         # Every text and mark meets APCA's contrast and every color of a plot stays apart for every reader, by shades
         # adjusted where they fail, which `adjusted` lists as (was, is, why)
@@ -674,7 +849,9 @@ class Figure:
         def move(rgb, cand, why):
             swap[rgb] = cand
             origin[cand] = rgb
-            self.adjusted.append((_css(rgb), _css(cand), why))
+            # Colors a rounding apart move alike, and are listed once
+            if (_css(rgb), _css(cand), why) not in self.adjusted:
+                self.adjusted.append((_css(rgb), _css(cand), why))
         for ax in self.axes:
             # Each color an axes shows, with what it must reach, and those that tell its data apart, in order
             need, kinds = {}, []
@@ -686,8 +863,11 @@ class Figure:
                     size, bold = a['size'] or ax.pal.tick_size, pal.text_bold if a['bold'] is None else a['bold']
                     found, target = [a['rgb']], LC_LARGE if size >= 24 or bold and size >= 16 else LC_TEXT
                 elif a['kind'] in LEVELS and a.get('alpha', 1.0) >= 1.0 and not a.get('mapped'):
-                    found = a['rgb'] if isinstance(a['rgb'], list) else [a['rgb'] if a['rgb'] is not None else
-                                                                         (a.get('edge') or (None,))[0]]
+                    # A mark with a rim is seen by whichever of its fill and rim stands out more against the page, as a
+                    # ring's white fill or a dot's white rim must not count, nor be moved for everything of their color
+                    found = a['rgb'] if isinstance(a['rgb'], list) else [
+                        max((v for v in (a['rgb'], (a.get('edge') or (None, ))[0]) if v is not None),
+                            key = lambda v: abs(apca(v, page)), default = None)]
                     target = LC_MARK
                     kinds += [tuple(float(v) for v in rgb) for rgb in found if rgb is not None]
                 else:
@@ -828,16 +1008,18 @@ class Figure:
         return min(self.width, max(self.width - grown, self.width + needed))
 
     @_in_font
-    def _canvas(self, stamp_dpi = None, marker_forms = False, layout = True, shapes = False):
+    def _canvas(self, stamp_dpi = None, marker_forms = False, layout = True, shapes = False, hover = False):
         """Everything drawn onto a fresh display list; `stamp_dpi` names a raster output, where many discs become an
-        image, `marker_forms` a PDF, where markers of one size can be one stored shape, and `shapes` PowerPoint, where
-        each op notes what drew it, which names its shape."""
+        image, `marker_forms` a PDF, where markers of one size can be one stored shape, `shapes` PowerPoint, where each
+        op notes what drew it, which names its shape, and `hover` an interactive SVG, where each mark also notes its
+        names and hover text."""
         if layout:
             self._layout()
         c = pdfwrite.Canvas(BytesIO(), pagesize = (self.width, self.height))
         c.stamp_dpi = stamp_dpi
         c.marker_forms = marker_forms
-        c.shapes = shapes
+        c.shapes = shapes or hover
+        c.hover = hover
         pal = self.pal
         for i, ax in enumerate(self.axes):
             n = len(c.ops)
@@ -1039,12 +1221,13 @@ class Figure:
         c.save()
         return target.getvalue(), why
 
-    def _svg_page(self):
-        """The display list that to_svg writes, the shadow under everything, and apart from it the glycan labels."""
+    def _svg_page(self, hover = False):
+        """The display list that to_svg writes, the shadow under everything, and apart from it the glycan labels; with
+        `hover`, each op notes what drew it, for an interactive SVG."""
         op = self._shadow_op(SHADOW_DPI)
-        c = self._canvas()
+        c = self._canvas(hover = hover)
         if op is not None:
-            c.ops.insert(0, op)
+            c.ops.insert(0, dict(op, shadow = True) if hover else op)
         labels = [o for o in c.ops if o.get('label')]
         c.ops = [o for o in c.ops if not o.get('label')]
         return c, labels
@@ -1071,17 +1254,22 @@ class Figure:
             fig._stickers = True
         return pair
 
-    def to_svg(self, themes = False):
+    def to_svg(self, themes = False, interactive = False):
         """SVG text on the palette's page, with text as outlines and images embedded. themes = True writes the figure
         in its palette and that palette's dark version (Palette.dark) at once, as one drawing whose colors follow the
         reader's light or dark mode through CSS, on a website, on GitHub, or in docs alike; a color for `themes` is the
         dark page's, such as the site's own dark background. Whatever reads no CSS, as most editors, sees the light
-        page."""
+        page. interactive = True adds a few lines of script and style, with no library: the pointer over a point, bar,
+        box, cell, or line shows what it is and its values, and lights up everything of the same names in every panel,
+        a sample by its `names` across a PCA, a heatmap's column, and its points over boxes alike, a series or a
+        category by its label, and so in every other interactive figure on the same page, while the rest of each panel
+        that holds one fades. It works where the SVG runs as a document or inline in a page, not as an <img>, and the
+        page in print, in an editor, or in an <img> is the figure as drawn."""
         figure = self
         if themes:
             figure, dark = self._themes(themes)
-            d, dark_labels = dark._svg_page()
-        c, labels = figure._svg_page()
+            d, dark_labels = dark._svg_page(interactive)
+        c, labels = figure._svg_page(interactive)
         if themes:
             theme = _Themes(c.ops, d.ops)
             c.ops = theme.ops
@@ -1091,7 +1279,10 @@ class Figure:
             flat = lambda op: dict(op, fill = False) if op['kind'] == 'path' else op
             for op, other in zip(labels, dark_labels):
                 op['theme'] = theme.pair(flat(op), flat(other))
-        svg = _with_ids(_classed(c.to_svg(), c.ops) if themes else c.to_svg(), c.ops)
+        svg, table = _classed(c.to_svg(), c.ops) if themes else c.to_svg(), None
+        if interactive:
+            svg, table = _hovered(svg, c.ops)
+        svg = _with_ids(svg, c.ops)
         # With glycan labels, the width the page needs without them, down to which annotate_figure can crop it
         bare = ' data-width-unlabeled="%.2f"' % figure._width_unlabeled() if labels else ''
         page = '<rect width="%g" height="%g" fill="%s"%s%s />\n' % (
@@ -1101,19 +1292,31 @@ class Figure:
         # Tells slate this is a figure, ahead of the gradients' long <defs> and through annotate_figure. It cannot be a
         # comment, as annotate_figure takes every comment and all that follows up to the next </g> for a label
         top = svg.index('\n', svg.index('<svg')) + 1
-        svg = svg[:top] + '<metadata>viscose</metadata>\n' + (theme.style() if themes else '') + svg[top:]
+        svg = (svg[:top] + '<metadata>viscose</metadata>\n' + (theme.style() if themes else '') +
+               (_hover_style(figure.pal, dark.pal if themes else None) if table else '') + svg[top:])
         if labels:
             svg = svg.replace('</svg>', _label_groups(c, labels, figure.height) + '\n</svg>')
-        if not themes:
+        if table:
+            # The script goes last, after all it reads, with each text once, such as a glycan named in every cell of
+            # its row, and nothing in its table that could close it or its section
+            texts = {}
+            word = lambda found: None if found is None else [texts.setdefault(s, len(texts)) for s in found]
+            table = [[word(names), word(said), word(series), axes, whole] for names, said, series, axes, whole in table]
+            rows = json.dumps([list(texts), table], ensure_ascii = False, separators = (',', ':'))
+            rows = rows.replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
+            end = svg.rindex('</svg>')
+            svg = svg[:end] + HOVER_SCRIPT.replace('__TABLE__', rows) + svg[end:]
+        if not themes and not table:
             return svg
-        if theme.grads:
+        if themes and theme.grads:
             # The dark theme's own gradients, beside the light one's, which svgout.emit wrote
             svg = (svg.replace('</defs>', theme.defs() + '</defs>', 1) if '</defs>' in svg else
                    svg.replace('<rect ', '<defs>%s</defs>\n<rect ' % theme.defs(), 1))
         svg = svg.replace('<svg ', '<svg id="%s" ' % THEME_PREFIX, 1)
         return svg.replace(THEME_PREFIX, 'vc%08x' % zlib.crc32(svg.encode()))
 
-    def save(self, path, dpi = 300.0, background = 'paper', press = None, source = None, themes = False):
+    def save(self, path, dpi = 300.0, background = 'paper', press = None, source = None, themes = False,
+             interactive = False):
         """Write the file format that the path's suffix names: png, pdf, svg, or pptx, a slide of PowerPoint's own
         shapes whose text stays editable and which Morph carries into the next figure (see to_pptx and vc.deck). `dpi`
         and `background` are for PNG, as PDF, SVG, and PowerPoint are vector on the palette's page. `press` makes a PDF
@@ -1123,12 +1326,15 @@ class Figure:
         read its numbers. A figure's source takes a few kB, and is written while the page draws. source = False leaves
         it out, as a PDF/X does, which is the page alone for print; a source past 64 kB that is larger than the rest of
         the file, such as of 100,000 points, stays out with a warning, unless source = True. themes = True makes an SVG
-        follow its reader's light or dark mode (see to_svg)."""
+        follow its reader's light or dark mode, and interactive = True gives it hover text and linked highlighting
+        (see to_svg)."""
         path = Path(path)
         suffix = path.suffix.lower()
         if themes and suffix != '.svg':
             raise ValueError('Only an SVG carries both themes, as CSS; a PNG or a PDF is one page, so draw it in the '
                              "palette's dark version for a dark one")
+        if interactive and suffix != '.svg':
+            raise ValueError('Only an SVG runs the script that makes a figure interactive; save it as .svg')
         if press and suffix == '.svg':
             raise ValueError('SVG is for screens and has no CMYK; for print, save a PDF with press, or a PNG for its '
                              'proof')
@@ -1153,7 +1359,7 @@ class Figure:
                     data = data[:-12] + struct.pack('>I', len(carried[1])) + chunk + struct.pack(
                         '>I', zlib.crc32(chunk)) + data[-12:]
             else:
-                data = self.to_svg(themes)
+                data = self.to_svg(themes, interactive)
                 carried, why = _carried(made, force, lambda: len(data))
                 if carried:
                     end = data.rindex('</svg>')
@@ -1455,14 +1661,16 @@ def _tree(z):
 def clustermap(data, xticklabels = None, yticklabels = None, method = 'average', metric = 'euclidean',
                cmap = 'diverging', figsize = (8.0, 8.0), palette = None, title = '', subtitle = '', show_all = False,
                row_linkage = None, col_linkage = None, row_cluster = True, col_cluster = True, vmin = None, vmax = None,
-               center = 0.0, xlabel = '', ylabel = '', colorbar = True, colorbar_label = '', glyphs = None):
+               center = 0.0, xlabel = '', ylabel = '', colorbar = True, colorbar_label = '', glyphs = None,
+               highlight = None):
     """A heatmap with both dendrograms and a color bar, as in seaborn. A DataFrame brings its own labels, and
     xticklabels and yticklabels can be True for all, False for none, or an integer for every n-th. Rows and columns are
     clustered by `method` (single, complete, average, weighted, centroid, median, or ward) on the `metric` distance
     (euclidean, sqeuclidean, cityblock, chebyshev, cosine, correlation, braycurtis, canberra, jensenshannon, or a
     function of two rows), and each tree's links turned so that neighbors are as alike as the tree allows. Linkages
     passed in scipy's format are drawn as they are. `glyphs` draws the rows' labels as glyphs where it can, such as
-    'glycan' for SNFG drawings (see Axes.tick_params), or the (columns', rows') with a pair. Returns the figure and the
+    'glycan' for SNFG drawings (see Axes.tick_params), or the (columns', rows') with a pair. `highlight` keeps the rows
+    and columns it names in full shade, and the other cells recede (see Axes.highlight). Returns the figure and the
     heatmap's axes; the figure's row_order and col_order hold the data's rows and columns as drawn, first row at the
     top."""
     frame = hasattr(data, 'index') and hasattr(data, 'columns')
@@ -1492,7 +1700,7 @@ def clustermap(data, xticklabels = None, yticklabels = None, method = 'average',
                               None if x is None else [x[i] if j % x_step == 0 else '' for j, i in enumerate(col_order)],
                               None if y is None else [y[i] if j % y_step == 0 else '' for j, i in enumerate(row_order)],
                               cmap = cmap, show_all = (show_all or x_all, show_all or y_all), vmin = vmin, vmax = vmax,
-                              center = center, names = names)
+                              center = center, names = names, highlight = highlight)
     heat.set_xlabel(xlabel)
     heat.set_ylabel(ylabel)
     for axis, maker in zip('xy', glyphs if isinstance(glyphs, tuple) else (None, glyphs)):

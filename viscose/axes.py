@@ -11,6 +11,10 @@ from .palettes import LC_TEXT, legible, mix
 
 # Past this many cells a heatmap is one image, as matplotlib's rasterized heatmaps are, not thousands of shapes
 HEAT_IMAGE_CELLS = 2500
+# The kinds of marks that a highlight keeps in full shade or lets recede
+FOCUS_KINDS = ('points', 'line', 'band', 'bars', 'box', 'violin', 'heat', 'stems', 'vsegs')
+# How wide, in points, an interactive SVG lets the pointer find a named arrow
+ARROW_GRIP = 9.0
 LEGEND_ROW = 16.0
 COLORBAR_WIDTH = 11.0
 LEGEND_SPOTS = ('direct', 'below', 'right', 'upper left', 'upper right', 'lower left', 'lower right')
@@ -19,6 +23,8 @@ LEGEND_SPOTS = ('direct', 'below', 'right', 'upper left', 'upper right', 'lower 
 DIRECT_OWN = 0.7
 # Axis names shrink to fit their cell down to this size, and past it the page grows
 LABEL_MIN = 6.5
+# Margins may take this share of an axes' cell before the figure grows
+PLOT_SHARE_MARGINS = 0.55
 # Brackets may stretch the y axis by up to this factor, which leaves the data at least this share of the height
 BRACKET_LIFT_MAX = 4.0
 # The sizes, as shares of their type's, that spread glyph annotations may take, from the largest that fits
@@ -69,6 +75,13 @@ def tick_labels(ticks):
 def _minus(pal, labels):
     """Numbers written with the palette's minus sign, such as a true minus where its font has one."""
     return labels if pal.minus == '-' else [s.replace('-', pal.minus) for s in labels]
+
+
+def _keyset(keys):
+    """What a highlight names, as a set of labels: one label or several, or None for no highlight."""
+    if keys is None:
+        return None
+    return {str(keys)} if isinstance(keys, str) or not np.iterable(keys) else {str(k) for k in keys}
 
 
 def _numeric(values):
@@ -166,6 +179,12 @@ def _check_lengths(x, y):
     """Different lengths would otherwise only fail once the figure is saved."""
     if x.shape != y.shape:
         raise ValueError(f'x and y have to be of the same length, got {x.size} and {y.size} values')
+
+
+def _check_names(names, n):
+    """A name per mark, or none, as a wrong count would only fail under the mouse."""
+    if names is not None and len(names) != n:
+        raise ValueError(f'names needs one name per mark, got {len(names)} for {n}')
 
 
 def _spread_glyphs(placements, canvas, marks = (), ports = None, pad = 4.0, step = 3.0, radii = None):
@@ -400,6 +419,9 @@ class Axes:
         # The artists each legend entry names, by its index, for naming them directly; where the legend's entries go
         # once that is settled, those it still shows, and how far labels at line ends reach past the plot
         self._sources, self._legend_fallback = {}, 'below'
+        # The artists each legend entry stands for, by its index, which a highlight and an interactive SVG find by its
+        # label: those it names directly and more, such as a line's markers, or bars that are named in a legend
+        self._members = {}
         self._legend_loc, self._legend_keep, self._direct_room, self._direct_spots = None, [], 0.0, (None, {})
         self._xlim, self._ylim = None, None
         self.xlabel, self.ylabel, self.title_text = '', '', ''
@@ -415,6 +437,11 @@ class Axes:
         self._gscale, self._legend_glyphs = {'x': 1.0, 'y': 1.0}, None
         # Glyph labels of y in one column, or staggered in two where neighbors would crowd
         self._glyph_spots, self._gcols, self._full = (None, {}), 1, {'x': ([], []), 'y': ([], [])}
+        # The last placement of spread glyphs made in full: their notes, their points on the page, and their spots,
+        # from which a window's gesture moves them
+        self._glyph_settled = ((), [], {})
+        # Which points the density fields hide, for the page as laid out (see hidden)
+        self._hidden_points = (None, {})
         self._xscale, self._yscale = 'linear', 'linear'
         self._xwarp, self._ywarp = WARPS['linear'], WARPS['linear']
         # Whether an axis's tick labels are numbers, set in tabular figures and lined up on their decimal points
@@ -437,6 +464,8 @@ class Axes:
         self._share, self._outer = {'x': [self], 'y': [self]}, {'x': False, 'y': False}
         self.grid_on = pal.grid
         self.show_all = (False, False)
+        # What a highlight keeps in full shade, for artists whose own call set none
+        self._focus = None
 
     # --- data helpers ---
     def _next_color(self, color):
@@ -462,13 +491,15 @@ class Axes:
     def _add(self, kind, z, **kw):
         self.artists.append(dict(kind = kind, z = z, order = len(self.artists), **kw))
 
-    def _labeled(self, label, rgb, kind = 'patch', marker = 'o', area = 36.0, source = None):
-        """A legend entry; `marker` holds a point's shape, or a line's dash, and `source` the artists it names, where a
-        label beside them can name them instead."""
+    def _labeled(self, label, rgb, kind = 'patch', marker = 'o', area = 36.0, source = None, members = None):
+        """A legend entry; `marker` holds a point's shape, or a line's dash, `source` the artists it names, where a
+        label beside them can name them instead, and `members` all the artists it stands for, by default `source`."""
         if label is not None and rgb is not None:
             self.legend_items.append((str(label), rgb, kind, marker, area))
             if source:
                 self._sources[len(self.legend_items) - 1] = source
+            if members or source:
+                self._members[len(self.legend_items) - 1] = members or source
 
     # --- plotting ---
     def plot(self, x, y = None, color = None, lw = None, label = None, marker = False, alpha = 1.0, dash = None,
@@ -489,7 +520,8 @@ class Axes:
             _check_marker(marker)
             self._add('points', z + 1, x = x, y = y, s = ms, rgb = rgb, alpha = alpha, marker = marker, edge = None,
                       gid = None)
-        self._labeled(label, rgb, 'line', dash, source = [line])
+        self._labeled(label, rgb, 'line', dash, source = [line],
+                      members = [line] + ([self.artists[-1]] if marker else []))
         return self
 
     def step(self, x, y, where = 'pre', color = None, lw = None, label = None, alpha = 1.0, dash = None, z = 4,
@@ -514,7 +546,8 @@ class Axes:
     def scatter(self, x, y, s = 30, color = None, c = None, label = None, alpha = 1.0, cmap = 'sequential', vmin = None,
                 vmax = None, z = 3, marker = 'o', edge = None, gid = None, hue = None, style = None, size = None,
                 sizes = (20.0, 160.0), colors = None, markers = None, hue_label = None, style_label = None,
-                size_label = None, legend = 'direct', names = None, rasterized = False, density = True):
+                size_label = None, legend = 'direct', names = None, rasterized = False, density = True,
+                highlight = None):
         """Points, as in seaborn's scatterplot. `hue`, `style`, and `size` hold one value per point and map to color,
         marker shape, and area. Each color's points are named in its color at their middle, where they hold together
         apart from the others, and the rest in a legend at the right, or all of it in a legend at `legend`, a legend's
@@ -525,7 +558,8 @@ class Axes:
         SVG, at 300 dpi for True or at the dpi given, which keeps tens of thousands of points light, while axes and text
         stay vector. Where points pile up past telling them apart, a map of their density takes over from them, in bands
         of their color's shades set apart by hairlines of the page, while points stay wherever the data are sparse;
-        `density = False` keeps every point, as does a color scale from `c`, whose colors are data.
+        `density = False` keeps every point, as does a color scale from `c`, whose colors are data. `highlight` keeps
+        the hue levels or points it names, by their `names`, in full shade, and the rest recede (see Axes.highlight).
         """
         x, y = np.atleast_1d(self._pos(x, 'x')), np.atleast_1d(self._pos(y, 'y'))
         _check_lengths(x, y)
@@ -544,7 +578,7 @@ class Axes:
         if hue is None and style is None and size is None and c is None:
             rgb = self._next_color(color)
             self._add('points', z, x = x, y = y, s = s, rgb = rgb, alpha = alpha, marker = marker, edge = edge,
-                      gid = gid, names = names, raster = raster, crowd = crowd)
+                      gid = gid, names = names, raster = raster, crowd = crowd, focus = _keyset(highlight))
             self._labeled(label, rgb, 'point', marker, source = [self.artists[-1]])
             return self
         n = len(x)
@@ -605,7 +639,7 @@ class Axes:
                         self._add('points', z, x = x[chosen], y = y[chosen], s = area[chosen], rgb = rgb, alpha = alpha,
                                   marker = style_marker[st], edge = edge, gid = gid,
                                   names = None if names is None else names[chosen], raster = raster, crowd = crowd,
-                                  mapped = c is not None)
+                                  mapped = c is not None, focus = _keyset(highlight))
                         by_hue.setdefault(h, []).append(self.artists[-1])
         sections = (hue is not None) + (style is not None) + (size is not None)
         plain = self.pal.color(self.pal.muted) if hue is not None else hue_rgb['']
@@ -630,42 +664,53 @@ class Axes:
         return self
 
     def bar(self, x, height, width = None, bottom = 0.0, color = None, label = None, alpha = 1.0, stacked = False,
-            z = 3):
+            z = 3, highlight = None):
         """Vertical bars; several colors give one bar each, and string positions become category labels. `width` can
-        hold one value per bar."""
+        hold one value per bar. `highlight` keeps the categories it names in full shade, or all with the bars' label,
+        and the rest recede (see Axes.highlight)."""
         x = np.atleast_1d(self._pos(x, 'x'))
+        if np.size(height) not in (1, x.size):
+            raise ValueError(f'bar needs one height per bar, got {x.size} bars and {np.size(height)} heights')
         h = np.broadcast_to(np.asarray(height, dtype = float), x.shape)
         b = np.broadcast_to(np.asarray(bottom, dtype = float), x.shape)
         width = np.broadcast_to(np.asarray(self.pal.bar_width if width is None else width, dtype = float), x.shape)
         cols = [self.pal.color(k) for k in color] if isinstance(color, list) else [self._next_color(color)] * len(x)
         self._add('bars', z, x = x, h = h, b = b, w = width, rgb = cols, alpha = alpha, horizontal = False,
-                  stacked = stacked)
-        self._labeled(label, cols[0] if cols else None, source = [self.artists[-1]] if stacked else None)
+                  stacked = stacked, focus = _keyset(highlight))
+        self._labeled(label, cols[0] if cols else None, source = [self.artists[-1]] if stacked else None,
+                      members = [self.artists[-1]])
         return self
 
     def barh(self, y, width, height = None, left = 0.0, color = None, label = None, alpha = 1.0, stacked = False,
-             z = 3):
-        """Horizontal bars; `height` can hold one value per bar."""
+             z = 3, highlight = None):
+        """Horizontal bars; `height` can hold one value per bar, and `highlight` is as in bar."""
         y = np.atleast_1d(self._pos(y, 'y'))
+        if np.size(width) not in (1, y.size):
+            raise ValueError(f'barh needs one width per bar, got {y.size} bars and {np.size(width)} widths')
         w = np.broadcast_to(np.asarray(width, dtype = float), y.shape)
         b = np.broadcast_to(np.asarray(left, dtype = float), y.shape)
         height = np.broadcast_to(np.asarray(self.pal.bar_width if height is None else height, dtype = float), y.shape)
         cols = [self.pal.color(k) for k in color] if isinstance(color, list) else [self._next_color(color)] * len(y)
         self._add('bars', z, x = y, h = w, b = b, w = height, rgb = cols, alpha = alpha, horizontal = True,
-                  stacked = stacked)
-        self._labeled(label, cols[0] if cols else None)
+                  stacked = stacked, focus = _keyset(highlight))
+        self._labeled(label, cols[0] if cols else None, members = [self.artists[-1]])
         return self
 
-    def stacked_bar(self, x, values, labels = None, colors = None, width = None):
-        """Bars stacked from a (bars, segments) array. Pass colors = pal.groups(3, 2) to group segments by hue."""
+    def stacked_bar(self, x, values, labels = None, colors = None, width = None, highlight = None):
+        """Bars stacked from a (bars, segments) array. Pass colors = pal.groups(3, 2) to group segments by hue.
+        `highlight` keeps the bars it names by category, or the segments it names by label, in full shade (see
+        Axes.highlight)."""
         values = np.asarray(values, dtype = float)
+        if values.ndim != 2 or values.shape[0] != np.size(x):
+            raise ValueError(f'stacked_bar needs a (bars, segments) array with a row per bar, got {np.size(x)} bars '
+                             f'and an array of shape {values.shape}')
         colors = self.pal.colors(values.shape[1]) if colors is None else [self.pal.color(k) for k in colors]
         # A segment needs more room than a needle to show its color
         width = (0.42 if self.pal.bar == 'needle' else self.pal.bar_width) if width is None else width
         base = np.zeros(values.shape[0])
         for j in range(values.shape[1]):
             self.bar(x, values[:, j], bottom = base, color = colors[j], width = width,
-                     label = labels[j] if labels is not None else None, stacked = True)
+                     label = labels[j] if labels is not None else None, stacked = True, highlight = highlight)
             base = base + values[:, j]
         return self
 
@@ -679,7 +724,7 @@ class Axes:
                  width = np.diff(edges) * 0.94, color = color, label = label, alpha = alpha)
         # Named over its highest bar
         if len(self.legend_items) > n:
-            self._sources[n] = [self.artists[-1]]
+            self._sources[n] = self._members[n] = [self.artists[-1]]
         return self
 
     def fill_between(self, x, y1, y2 = 0.0, color = None, alpha = 0.22, label = None, z = 2):
@@ -851,7 +896,7 @@ class Axes:
     def boxplot(self, data = None, positions = None, labels = None, width = 0.5, colors = None, whis = 1.5,
                 fliers = True, alpha = 1.0, z = 3, points = True, jitter = 0.7, point_size = None, x = None, y = None,
                 hue = None, names = None, order = None, hue_order = None, orient = None, swarm = False,
-                legend = 'right'):
+                legend = 'right', highlight = None):
         """Box plots of several groups, in the palette's manner, as in seaborn: `data` is a list of value lists, a
         {label: values} dict, a {label: {hue: values}} dict, or a table such as a DataFrame whose columns `x`, `y`, and
         `hue` name, as in boxplot(df, x = 'stage', y = 'abundance', hue = 'condition'); x and y can also hold the
@@ -864,41 +909,43 @@ class Axes:
         beyond the whiskers. `names` holds a label per value, in the shape of the data or as a column, which draws
         nothing but tells a viewer such as slate which sample a point is. Groups sit at 0, 1, 2, and so on, unless
         `positions` says otherwise; `order` and `hue_order` choose and order categories and levels. `colors` are per
-        group, or per hue level with hue, as a list or a {label: color} dict."""
+        group, or per hue level with hue, as a list or a {label: color} dict. `highlight` keeps the categories, hue
+        levels, or values it names, by `names`, in full shade, and the rest recede (see Axes.highlight)."""
         g = self._groups(data, x, y, hue, names, order, hue_order, orient, positions, labels, colors, whis, width,
                          'patch', legend)
         offsets, sizes = self._strip(g['values'], g['w'] * jitter, point_size)
         self._add('box', z, **g, alpha = alpha, fliers = fliers, offsets = offsets if points else None, sizes = sizes,
-                  box = True, swarm = bool(swarm and points))
+                  box = True, swarm = bool(swarm and points), focus = _keyset(highlight))
         return self
 
     def stripplot(self, data = None, positions = None, labels = None, width = None, colors = None, alpha = 1.0, z = 3,
                   jitter = 0.7, point_size = None, x = None, y = None, hue = None, names = None, order = None,
-                  hue_order = None, orient = None, swarm = False, legend = 'right'):
+                  hue_order = None, orient = None, swarm = False, legend = 'right', highlight = None):
         """Every value of several groups as a point, spread across `jitter` of the group's `width` so that equal values
         stay apart, as in seaborn's stripplot, or with `swarm` packed side by side within the width so that none
         overlap, as in its swarmplot, which reads best for 20 to 100 values a group. The width is 0.5, or 0.8 for a
-        swarm, which needs the room, unless given. Data, hue, orientation, names, and colors are as in boxplot."""
+        swarm, which needs the room, unless given. Data, hue, orientation, names, colors, and highlight are as in
+        boxplot."""
         width = (0.8 if swarm else 0.5) if width is None else width
         g = self._groups(data, x, y, hue, names, order, hue_order, orient, positions, labels, colors, 1.5, width,
                          'point', legend)
         offsets, sizes = self._strip(g['values'], g['w'] * jitter, point_size)
         self._add('box', z, **g, alpha = alpha, fliers = False, offsets = offsets, sizes = sizes, box = False,
-                  swarm = bool(swarm))
+                  swarm = bool(swarm), focus = _keyset(highlight))
         return self
 
     def violinplot(self, data = None, positions = None, labels = None, width = 0.8, colors = None, alpha = 1.0, z = 3,
                    inner = 'box', bw_adjust = 1.0, cut = 2.0, point_size = None, x = None, y = None, hue = None,
                    names = None, order = None, hue_order = None, orient = None, legend = 'right',
-                   density_norm = 'area'):
+                   density_norm = 'area', highlight = None):
         """Violin plots of several groups, in the palette's manner: each group's density, by a Gaussian kernel of
         Scott's bandwidth times `bw_adjust`, mirrored around its position and running `cut` bandwidths past its
         extremes, as in seaborn. `density_norm` scales them as seaborn does: 'area' gives all one scale, so that each
         holds the same area, 'count' an area in proportion to its number of values, and 'width' each the same width,
         which keeps every violin readable beside a narrow one. The widest is `width` across. `inner` is 'box' for the
         quartiles and median inside, 'points' for every value spread across the violin's width at its height, 'swarm'
-        for every value packed side by side without overlap, or None. Data, hue, orientation, names, and colors are
-        as in boxplot."""
+        for every value packed side by side without overlap, or None. Data, hue, orientation, names, colors, and
+        highlight are as in boxplot."""
         if inner not in ('box', 'points', 'swarm', None):
             raise ValueError(f"A violin's inner has to be 'box', 'points', 'swarm', or None, got {inner!r}")
         if density_norm not in ('area', 'count', 'width'):
@@ -933,16 +980,19 @@ class Axes:
         offsets = [u * 0.7 * w if s is None else u * 1.6 * np.interp(v, s[0], s[1]) if inner == 'points' else u
                    for u, v, s, w in zip(unit, g['values'], shapes, g['w'])]
         self._add('violin', z, **g, shapes = shapes, alpha = alpha, inner = inner, offsets = offsets, sizes = sizes,
-                  swarm = inner == 'swarm')
+                  swarm = inner == 'swarm', focus = _keyset(highlight))
         return self
 
-    def stem(self, x, y, color = None, lw = 3.0, label = None, cap = False, z = 4):
-        """Vertical sticks from zero, as in a mass spectrum."""
+    def stem(self, x, y, color = None, lw = 3.0, label = None, cap = False, z = 4, names = None, highlight = None):
+        """Vertical sticks from zero, as in a mass spectrum. `names` labels each stick, which draws nothing but names it
+        under the mouse, and `highlight` keeps the sticks it names in full shade while the rest recede (see
+        Axes.highlight)."""
         x, y = np.atleast_1d(np.asarray(x, dtype = float)), np.atleast_1d(np.asarray(y, dtype = float))
         _check_lengths(x, y)
+        _check_names(names, x.size)
         rgb = self._next_color(color)
-        self._add('stems', z, x = x, y = y, rgb = rgb, lw = lw, cap = cap)
-        self._labeled(label, rgb)
+        self._add('stems', z, x = x, y = y, rgb = rgb, lw = lw, cap = cap, names = names, focus = _keyset(highlight))
+        self._labeled(label, rgb, members = [self.artists[-1]])
         return self
 
     def hlines(self, y, x0, x1, color = None, lw = 1.5, alpha = 1.0, dash = None, label = None, z = 2):
@@ -955,14 +1005,17 @@ class Axes:
         self._labeled(label, rgb, 'line', dash)
         return self
 
-    def vlines(self, x, y0, y1, color = None, lw = 1.0, alpha = 1.0, dash = None, label = None, z = 3):
+    def vlines(self, x, y0, y1, color = None, lw = 1.0, alpha = 1.0, dash = None, label = None, z = 3, names = None,
+               highlight = None):
         """Vertical segments of exactly this width, as many sticks need; `stem` draws them in the palette's manner. A
-        list of colors gives each its own."""
+        list of colors gives each its own. `names` and `highlight` are as in stem, such as for a spectrum's peaks."""
         x = np.atleast_1d(np.asarray(x, dtype = float))
         y0 = np.broadcast_to(np.asarray(y0, dtype = float), x.shape)
         y1 = np.broadcast_to(np.asarray(y1, dtype = float), x.shape)
+        _check_names(names, x.size)
         rgb = [self.pal.color(k) for k in color] if isinstance(color, list) else [self._next_color(color)] * len(x)
-        self._add('vsegs', z, x = x, y0 = y0, y1 = y1, rgb = rgb, lw = lw, alpha = alpha, dash = dash)
+        self._add('vsegs', z, x = x, y0 = y0, y1 = y1, rgb = rgb, lw = lw, alpha = alpha, dash = dash, names = names,
+                  focus = _keyset(highlight))
         self._labeled(label, rgb[0] if rgb else None, 'line', dash)
         return self
 
@@ -995,14 +1048,15 @@ class Axes:
         return self
 
     def arrow(self, x0, y0, x1, y1, color = 'muted', lw = 1.0, alpha = 1.0, gid = None, z = 2, head = None,
-              shrink = (0.0, 0.0), bend = 0.0):
+              shrink = (0.0, 0.0), bend = 0.0, name = None):
         """An arrow between two data points; `gid` names it in SVG output, for hover text. `head` is the head's length
         in points, or 0 for a plain leader line, `shrink` how many points it stays short of its start and its end, as
         beside a marker or a label, and `bend` turns it into an arc whose middle stands that share of its length to its
-        left."""
+        left. `name` is what it stands for, such as a reaction, which an interactive SVG shows under the mouse, lighting
+        every arrow of that name."""
         self._add('arrow', z, x0 = float(x0), y0 = float(y0), x1 = float(x1), y1 = float(y1),
                   rgb = self.pal.color(color), lw = lw, alpha = alpha, gid = gid, head = head,
-                  shrink = tuple(float(v) for v in shrink), bend = float(bend))
+                  shrink = tuple(float(v) for v in shrink), bend = float(bend), name = name)
         return self
 
     def axline(self, xy, slope = None, xy2 = None, color = 'muted', lw = 0.8, dash = (1, 3), label = None, z = 1):
@@ -1038,7 +1092,7 @@ class Axes:
 
     def heatmap(self, data, xticklabels = None, yticklabels = None, cmap = 'diverging', vmin = None, vmax = None,
                 center = 0.0, labels_right = True, show_all = False, colorbar = False, colorbar_label = '',
-                annot = False, fmt = '.2f', annot_size = None, names = None):
+                annot = False, fmt = '.2f', annot_size = None, names = None, highlight = None):
         """A matrix of cells, first row at the top, where NaN is left empty. Labels are given per column and row, True
         numbers them, and False or None leaves them out. `cmap` is diverging, sequential, or sequential_r, which puts
         the darkest color at the lowest value. Too many labels are thinned unless show_all,
@@ -1046,7 +1100,8 @@ class Axes:
         cell's value into it, formatted by `fmt`, a format spec or a function of the value, in whichever of ink or white
         reads over the cell. `names` holds the
         rows' and the columns' labels as a pair, by default the tick labels, which draws nothing but tells a viewer such
-        as slate what the cell under the mouse is."""
+        as slate what the cell under the mouse is. `highlight` keeps the rows and columns it names, by those names, in
+        full shade, and the other cells recede (see Axes.highlight)."""
         _check_cmap(cmap)
         m = np.asarray(data, dtype = float)
         if m.ndim != 2 or not m.size:
@@ -1074,7 +1129,7 @@ class Axes:
         self._scale = dict(cmap = cmap, lo = float(lo), hi = float(hi))
         rgb = getattr(self.pal, cmap)(t)
         self._add('heat', 2, m = m, rgb = rgb, rows = None if rows is None else [str(v) for v in rows],
-                  columns = None if columns is None else [str(v) for v in columns])
+                  columns = None if columns is None else [str(v) for v in columns], focus = _keyset(highlight))
         if annot:
             for r, j in np.argwhere(np.isfinite(m)):
                 self.annotate(fmt(m[r, j]) if callable(fmt) else format(m[r, j], fmt), (j + 0.5, m.shape[0] - r - 0.5),
@@ -1165,7 +1220,7 @@ class Axes:
 
     def annotate(self, s, xy, offset = (0.0, 0.0), size = None, color = 'ink', bold = None, ha = 'left', va = 'center',
                  rotation = 0.0, halo = None, z = 20, svg_label = False, clip = False, spread = False,
-                 linespacing = 1.25, glyph = None):
+                 linespacing = 1.25, glyph = None, y_fraction = False):
         """Text next to a data point, offset in points, with a halo of the page's color that keeps it readable over the
         marks. With svg_label = True, SVG output writes it the way matplotlib writes text, so that glycowork's
         annotate_figure can replace it with a glycan drawing. With clip = True it shows only while its point is within
@@ -1173,15 +1228,26 @@ class Axes:
         apart vertically as little as it takes for none to overlap, within the axes' height, each joined to its point
         by a hairline where it had to move. Without a size it takes 8.6 points, and its halo 2.6, both scaled by the
         palette's spacing. `glyph` draws the label instead, such as 'glycan' for its SNFG drawing (see tick_params), its
-        root symbol level with the point, over a die-cut halo of the page's color, or white as a sticker on a dark
-        page."""
+        root symbol level with the point, its box's edge there with va 'top' or 'bottom', over a die-cut halo of the
+        page's color, or white as a sticker on a dark page. `y_fraction` reads y as a share of the axes' height, as in
+        plot and image, which keeps a label, such as a fragment's drawing over its peak, in its band through zooming;
+        such a label takes no part in the limits and shows while its x is within them."""
+        if spread and y_fraction:
+            raise ValueError('A label spread among the points needs its point in data, not y_fraction')
         k = self.pal.spacing
         self._add('text', z, x = float(xy[0]), y = float(xy[1]), s = str(s), size = 8.6 * k if size is None else size,
                   rgb = self.pal.color(color), bold = bold, ha = ha, va = va, rotation = rotation,
                   halo = 2.6 * k if halo is None else halo, dx = offset[0], dy = offset[1], frac = False,
                   tag = svg_label, clip = clip, spread = spread, linespacing = linespacing,
-                  glyph = text.check_glyphs(glyph), grow = size is None)
+                  glyph = text.check_glyphs(glyph), grow = size is None, yfrac = bool(y_fraction))
         return self
+
+    def _anchor(self, a):
+        """Where a text artist's point lies on the page: in data, in fractions of the axes, or with y_fraction at its x
+        in data and a share of the axes' height."""
+        x0, y0, w, h = self.rect
+        return (x0 + a['x'] * w if a['frac'] else float(self._tx(a['x'])),
+                y0 + a['y'] * h if a['frac'] or a.get('yfrac') else float(self._ty(a['y'])))
 
     def bracket(self, x0, x1, text = '', color = None, lw = None, size = None, tip = None, z = 6):
         """A bracket from the group at x0 to the one at x1 with text above it, such as 'p = 0.003' or stars, or a
@@ -1352,6 +1418,15 @@ class Axes:
         self._legend_fallback = 'below'
         return self
 
+    def highlight(self, keys):
+        """Keep what `keys` name in full shade and let everything else on the axes recede toward the page, each in its
+        own hue: a series by its label, such as a line's or a hue level's, the categories and hue levels of bars,
+        boxes, and violins, points and values by their `names`, and a heatmap's rows and columns by theirs. The focus
+        draws over the context, which casts no shadow, and the legend and the labels that name series directly follow.
+        A plot call's own `highlight` takes over for its marks, and None ends it."""
+        self._focus = _keyset(keys)
+        return self
+
     def off(self):
         """Hide axis lines, ticks and grid, for figures whose position axes carry no meaning."""
         self._hidden |= {'spines', 'ticks', 'grid'}
@@ -1449,13 +1524,13 @@ class Axes:
                     g, _, cut = self._note(a)
                     left, bottom, right, top = g.extent(pts, cut)
                 else:
-                    px, py = float(self._tx(a['x'])) + a.get('_dx', a['dx']), float(self._ty(a['y'])) + a['dy']
+                    px, py = self._anchor(a)
+                    px, py = px + a.get('_dx', a['dx']), py + a['dy']
                     px -= {'left': left, 'center': (left + right) / 2, 'right': right}[a.get('_ha', a['ha'])]
                     py -= {'top': top, 'bottom': bottom, 'baseline': bottom}.get(a['va'], 0.0)
                 out.append([px + left, py + bottom, px + right, py + top])
             elif k == 'text' and not a['rotation'] and math.isfinite(a['x'] + a['y']):
-                px = x0 + a['x'] * w if a['frac'] else float(self._tx(a['x']))
-                py = y0 + a['y'] * h if a['frac'] else float(self._ty(a['y']))
+                px, py = self._anchor(a)
                 if a.get('direct') in ('cloud', 'peak'):
                     with text.family(pal.font):
                         px, py = self._place_direct().get(id(a), (px, py))
@@ -1557,7 +1632,7 @@ class Axes:
                 sticky.extend(np.unique(a['b']).tolist())
             elif k == 'hline' and axis == 'y' or k == 'vline' and axis == 'x':
                 vals = np.array([a['v']])
-            elif k == 'text' and not a['frac'] and not a.get('direct'):
+            elif k == 'text' and not a['frac'] and not a.get('direct') and not a.get('yfrac'):
                 vals = np.array([a[axis]])
             elif k == 'bracket' and axis == 'x':
                 vals = np.array([a['x0'], a['x1']])
@@ -1854,15 +1929,27 @@ class Axes:
         its root beside it to the left where that is free, clear of the other drawings and of what the axes draw, with
         short leaders ending on a symbol that cross nothing. Drawings take the largest of `GLYPH_SIZES` at which no
         leader is long or tangled, as annotate_figure's did, and never cover more than a fifth of the axes. Kept for
-        the page as laid out."""
+        the page as laid out. While a window's gesture runs (Figure._draft), each drawing and its leader move with
+        their point from the last placement made in full, which takes microseconds where placing takes up to half a
+        second, and the window places them in full once the gesture pauses."""
         x0, y0, w, h = self.rect
-        key = (self.rect, tuple(self.xlim), tuple(self.ylim))
-        if self._glyph_spots[0] == key:
-            return self._glyph_spots[1]
         lo, hi = sorted(self.ylim)
         notes = [a for a in self.artists if a['kind'] == 'text' and a['spread'] and a.get('glyph') and not a['frac']
                  and math.isfinite(a['x'] + a['y']) and not (a['clip'] and not (self._in_x(a['x']) and lo <= a['y'] <=
                                                                                   hi)) and self._note(a)[0] is not None]
+        key = (self.rect, tuple(self.xlim), tuple(self.ylim), tuple(id(a) for a in notes))
+        if self._glyph_spots[0] == key:
+            return self._glyph_spots[1]
+        points = [(float(self._tx(a['x'])), float(self._ty(a['y']))) for a in notes]
+        settled = self._glyph_settled
+        if getattr(self.figure, '_draft', False) and notes and settled[0] == key[3]:
+            moved = {}
+            for a, (px, py), (qx, qy) in zip(notes, points, settled[1]):
+                gx, gy, leader, pts = settled[2][id(a)]
+                dx, dy = px - qx, py - qy
+                moved[id(a)] = (gx + dx, gy + dy, None if leader is None else (
+                    leader[0] + dx, leader[1] + dy, leader[2] + dx, leader[3] + dy), pts)
+            return moved
         spots = {}
         if notes:
             k, top = self.pal.spacing, y0 + h
@@ -1877,7 +1964,6 @@ class Axes:
                     marks.append(((l + r) / 2 - x0, top - (b + t) / 2, 0.25))
                 else:
                     marks += [(u - x0, top - v, 3.0) for u in np.arange(l, r, 6.0) for v in np.arange(b, t, 6.0)]
-            points = [(float(self._tx(a['x'])), float(self._ty(a['y']))) for a in notes]
             # Unlike annotate_figure's anchors, which sat at a label beside its point, these are the points: each weighs
             # enough that no drawing hides one, its own included, and a drawing's natural place starts past its marker
             marks += [(px - x0, top - py, 60.0) for px, py in points]
@@ -1915,6 +2001,7 @@ class Axes:
                     leader = (px + 2.0 * k * (ex - px) / far, py + 2.0 * k * (ey - py) / far, ex, ey)
                 spots[id(a)] = (cx + x0 - left, top - cy - top_, leader, pts)
         self._glyph_spots = (key, spots)
+        self._glyph_settled = (key[3], points, spots)
         return spots
 
     def _place_direct(self):
@@ -2026,10 +2113,29 @@ class Axes:
         closest, length = _gap(pos) * step, self.rect[2 if axis == 'x' else 3]
         return (need + 0.35 * size) * (length / closest if math.isfinite(closest) else 1.0)
 
+    def _glyph_room(self, axis):
+        """How far an axis's tick labels may reach across from their pad on a page that cannot grow for them: from axes
+        at a fixed place to within the page's margin, and on a page held to a window's size, as far as margins may take
+        of their cell. Infinite where the page grows."""
+        if self._fixed is None and not self.figure._held:
+            return math.inf
+        (left, right, bottom, top), (x, y, w, h) = self._margins(), self.rect
+        if axis == 'y':
+            labels = self._ytick_columns(self._tick_sizes()[1])[0]
+            if self._fixed is None:
+                return PLOT_SHARE_MARGINS * self._room[2] - left - right + labels
+            return (self.figure.width - x - w - right if self._yright else x - left) + labels
+        labels = self._xtick_height()
+        if self._fixed is None:
+            return PLOT_SHARE_MARGINS * self._room[3] - bottom - top + labels
+        return (self.figure.height - y - h - top if self._tick_opts['x'].get('top', False) else y - bottom) + labels
+
     def _fit_glyphs(self, axis):
         """Shrinks an axis's glyph labels to fit between their ticks, turns x's to run up the page and staggers y's in
         two columns where they still crowd at their least size, and past that leaves out labels as text would, unless
-        all must show. True if anything changed."""
+        all must show. On a page that cannot grow, labels also keep within the room it has across: y's stagger only
+        where both columns fit there, and labels shrink past their least size, down to half of it, before any is left
+        out. True if anything changed."""
         pal, i = self.pal, 'xy'.index(axis)
         ticks, labels = (self.xticks, self.xlabels) if axis == 'x' else (self.yticks, self.ylabels)
         if len(ticks) < 2 or not labels or not self._tick_opts[axis].get('fit', True):
@@ -2038,21 +2144,27 @@ class Axes:
         pos = np.asarray(self._tx(ticks) if axis == 'x' else self._ty(ticks), dtype = float)
         order = np.argsort(pos, kind = 'stable')
         before = (self._gscale[axis], self.xrot, len(ticks), self._gcols)
-        def fits(turned):
+        room = self._glyph_room(axis)
+        def fits(turned, step):
             # Each label's reach before and after its tick along the axis, the part that scales with the glyph and the
-            # part that does not, then the least share of their full size that fits between all neighbors, and the
-            # widest gap any pair needs at the least size
-            reach = []
+            # part that does not, then the least share of their full size that fits between all neighbors, each pair's
+            # need, and the closest gap; on a page that cannot grow, also the largest share whose labels fit across
+            reach, across = [], []
             for s in labels:
                 g = text.glyph(maker, s, turned)
                 if g is None:
                     half = text.width(s, size, pal.tick_bold) / 2 if axis == 'x' and not turned else 0.6 * size
                     reach.append((0.0, 0.0, half, half))
+                    if math.isfinite(room):
+                        wide = text.width(s, size, pal.tick_bold, tabular = self._numbers[axis])
+                        across.append((0.0, wide if axis == 'y' else wide + 0.4 * size if turned else
+                                       size * (1.0 + 1.25 * _extra_lines(s))))
                     continue
                 left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL, self._cut)
                 reach.append((-bottom, top, 0.0, 0.0) if axis == 'y' else (-left, right, 0.0, 0.0) if turned else
                              ((right - left) / 2, (right - left) / 2, 0.0, 0.0))
-            share, need, least, step = math.inf, 0.0, math.inf, self._gcols if axis == 'y' else 1
+                across.append((right - left if axis == 'y' else top - bottom, 0.0))
+            share, pairs, least = math.inf, [], math.inf
             for a, b in zip(order[:-step], order[step:]):
                 gap = pos[b] - pos[a]
                 if gap <= 0:
@@ -2060,23 +2172,63 @@ class Axes:
                 scaled, fixed = reach[a][1] + reach[b][0], reach[a][3] + reach[b][2] + 0.35 * size
                 if scaled:
                     share = min(share, (gap - fixed) / scaled)
-                need, least = max(need, scaled * text.GLYPH_MIN + fixed), min(least, gap)
-            return share, need, least
+                pairs.append((scaled, fixed))
+                least = min(least, gap)
+            if not math.isfinite(room):
+                return share, math.inf, pairs, least
+            if step == 1:
+                # Text that runs off by itself is no glyph's to make room for
+                most = max(v for v, _ in across)
+                return share, room / most if most else math.inf, pairs, least
+            # Staggered, every other label down the axis lies a column farther out, half the type's size beyond
+            rank = np.empty(len(labels), dtype = int)
+            rank[order] = np.arange(len(labels)) % 2
+            deep = lambda f: size / 2 + sum(max((max(v * f, t) for (v, t), r in zip(across, rank) if r == side),
+                                                default = 0.0) for side in (0, 1))
+            if deep(1.0) <= room:
+                return share, math.inf, pairs, least
+            low, high = 0.0, 1.0
+            for _ in range(50):
+                low, high = ((low + high) / 2, high) if deep((low + high) / 2) <= room else (low, (low + high) / 2)
+            return share, low if deep(low) <= room else 0.0, pairs, least
         # A page grown to exactly what the labels need gives back their least size within rounding
         floor = text.GLYPH_MIN * (1 - 1e-9)
-        share, need, least = fits(axis == 'x' and bool(self.xrot))
-        turned = share < floor and axis == 'x' and not self.xrot
-        if turned:
-            self.xrot = 90.0
-            share, need, least = fits(True)
-        staggered = share < floor and axis == 'y' and self._gcols == 1 and len(ticks) > 2
-        if staggered:
-            self._gcols = 2
-            share, need, least = fits(False)
-        self._gscale[axis] = min(1.0, max(share, text.GLYPH_MIN))
-        # Labels go only once the page has grown all it may, which it does for turned or staggered ones next pass
-        if share < floor and not self.show_all[i] and not turned and not staggered:
-            k = max(2, int(math.ceil(need / least)))
+        if math.isfinite(room):
+            # A page that cannot grow takes the first of one column and two, or of x's lying and turned, that holds the
+            # labels at their least size both along the axis and across it, else whichever holds them largest, which
+            # may be below that size, down to half of it, before any is left out, as this page has no other way to
+            # show them all
+            ways = ([(True, 1)] if self._xrot else [(False, 1), (True, 1)]) if axis == 'x' else [(False, 1)] + (
+                [(False, 2)] if len(ticks) > 2 else [])
+            best = None
+            for turned, step in ways:
+                found = fits(turned, step)
+                if best is None or min(found[:2]) > min(best[2][:2]):
+                    best = (turned, step, found)
+                if min(found[:2]) >= floor:
+                    break
+            turned, step, (share, wide, pairs, least) = best
+            if axis == 'y':
+                self._gcols = step
+            elif not self._xrot:
+                self.xrot = 90.0 if turned else 0.0
+            self._gscale[axis] = min(1.0, max(min(share, wide), text.GLYPH_MIN / 2))
+            thin, need = share < self._gscale[axis] * (1 - 1e-9), self._gscale[axis]
+        else:
+            share, _, pairs, least = fits(axis == 'x' and bool(self.xrot), self._gcols if axis == 'y' else 1)
+            turned = share < floor and axis == 'x' and not self.xrot
+            if turned:
+                self.xrot = 90.0
+                share, _, pairs, least = fits(True, 1)
+            staggered = share < floor and axis == 'y' and self._gcols == 1 and len(ticks) > 2
+            if staggered:
+                self._gcols = 2
+                share, _, pairs, least = fits(False, 2)
+            self._gscale[axis] = min(1.0, max(share, text.GLYPH_MIN))
+            # Labels go only once the page has grown all it may, which it does for turned or staggered ones next pass
+            thin, need = share < floor and not turned and not staggered, text.GLYPH_MIN
+        if thin and not self.show_all[i]:
+            k = max(2, int(math.ceil(max((scaled * need + fixed for scaled, fixed in pairs), default = 0.0) / least)))
             setattr(self, axis + 'ticks', ticks[::k])
             setattr(self, axis + 'labels', labels[::k])
         return (abs(self._gscale[axis] - before[0]) > 0.01 * before[0] or self.xrot != before[1]
@@ -2447,32 +2599,130 @@ class Axes:
         return True
 
     # --- drawing ---
+    def _series(self):
+        """The label of the legend entry that names each artist, by the artist's id."""
+        return {id(s): self.legend_items[i][0] for i, found in self._members.items() for s in found or ()}
+
+    def _own(self, a):
+        """What each of an artist's elements is called, by which a highlight or a hover finds it: a point's name, a
+        bar's category, or a box's or violin's group, or None where its elements have no names of their own."""
+        k = a['kind']
+        if k in ('points', 'vsegs', 'stems') and a.get('names') is not None:
+            return [[str(v)] for v in a['names']]
+        if k == 'bars':
+            cats = {v: s for s, v in self._cats['y' if a['horizontal'] else 'x'].items()}
+            return [[cats[x]] if x in cats else [] for x in a['x'].tolist()]
+        if k in ('box', 'violin'):
+            return [self._group_names(a, i) for i in range(len(a['groups']))]
+        return None
+
+    def _focused(self, a, n, own = False):
+        """Which of an artist's `n` elements a highlight keeps in full shade: all where none is set or where it names
+        the artist's series, else those it names by their own names, from `own` or else _own."""
+        focus = a['focus'] if a.get('focus') is not None else self._focus
+        if focus is None or self._series().get(id(a)) in focus:
+            return np.ones(n, dtype = bool)
+        own = self._own(a) if own is False else own
+        if own is None:
+            return np.zeros(n, dtype = bool)
+        return np.array([any(k in focus for k in keys) for keys in own], dtype = bool)
+
+    def _chosen(self, c, a, n, own = False):
+        """Which of an artist's `n` elements this pass of drawing takes, and whether they recede: all where nothing is
+        highlighted, else the context in the first pass and the focus over it in the second, as the canvas notes: its
+        own, and not the axes', as a figure's shadow is drawn on a thread beside its page."""
+        if c.passing is None:
+            return np.ones(n, dtype = bool), False
+        kept = self._focused(a, n, own)
+        return (~kept, True) if c.passing == 'context' else (kept, False)
+
+    def _receding(self, i):
+        """Whether a legend entry names only what a highlight leaves as context."""
+        label, _, kind, _, _ = self.legend_items[i]
+        focus = [f for f in [self._focus] + [a.get('focus') for a in self.artists] if f is not None]
+        if not focus or kind == 'header':
+            return False
+        # What it stands for recedes, unless it is a guide, which a highlight leaves as it is
+        members = self._members.get(i)
+        if members:
+            return not any(a['kind'] not in FOCUS_KINDS or self._focused(
+                a, len(np.atleast_1d(a['x'])) if 'x' in a else 1).any() for a in members)
+        if any(label in f for f in focus):
+            return False
+        # A hue level's entry stays while any group in focus holds that level
+        for a in self.artists:
+            own = self._own(a) if a['kind'] in FOCUS_KINDS else None
+            if own and any(label in names for names, kept in zip(own, self._focused(a, len(own), own)) if kept):
+                return False
+        return True
+
+    def _number(self, v):
+        """A number as an interactive SVG's hover text gives it."""
+        return _minus(self.pal, ['%.4g' % v])[0]
+
+    def _says(self, axis, v):
+        """A value along an axis as an interactive SVG's hover text gives it: its category, or the axis's name, or else
+        its letter, and the number."""
+        cats = {p: s for s, p in self._cats[axis].items()}
+        if float(v) in cats:
+            return cats[float(v)]
+        name = next((getattr(ax, axis + 'label') for ax in self._share[axis] if getattr(ax, axis + 'label')), '')
+        return '%s %s' % (' '.join(''.join(t for t, _, _ in text.runs(name)).split()) or axis, self._number(v))
+
+    def _group_names(self, a, i):
+        """A box's, violin's, or strip's group by its category and hue level, without a level where it has none."""
+        return [str(g) for g in a['groups'][i] if g is not None and g != '']
+
+    def _group_hover(self, a, i):
+        """A box's or a violin's names and hover text: its group, median, quartiles, and number of values."""
+        group = tuple(self._group_names(a, i))
+        low, q1, median, q3, high = a['stats'][i][:5]
+        return group, (' · '.join(group) or self._says('y' if a['horizontal'] else 'x', a['x'][i]),
+                       'median ' + self._number(median),
+                       'quartiles %s to %s' % (self._number(q1), self._number(q3)), 'n %d' % len(a['values'][i]))
+
     def _draw_marks(self, c):
         x0, y0, w, h = self.rect
         c.saveState()
-        # In PowerPoint, each artist's shapes take its legend entry's name, or its kind and its place among its kind
-        shapes, labels, kinds = getattr(c, 'shapes', False), {}, {}
-        if shapes:
-            labels = {id(s): self.legend_items[i][0] for i, found in self._sources.items() for s in found or ()}
-        for a in sorted(self.artists, key = lambda r: (r['z'], r['order'])):
-            k = a['kind']
-            n = len(c.ops)
-            if shapes and k != 'text':
-                kinds[k] = kinds.get(k, -1) + 1
-            # Color 'none' draws nothing but an edge, while a dendrogram's None means the palette's choice
-            if k == 'text' or (k != 'dendro' and a.get('rgb', k) is None and not a.get('edge')):
-                continue
-            pad = 9.0 if k in ('points', 'box', 'violin') else 0.0 if k == 'heat' else 1.0
-            # A named element stays a bare path, for the code that looks for it in the SVG
-            gid = a.get('gid')
-            free = gid or k == 'image' or not a.get('clip', True)
-            c.state['clip'] = None if free else [((x0 - pad, y0 - pad, w + 2 * pad, h + 2 * pad), c.state['ctm'])]
-            getattr(self, '_d_' + k)(c, a)
-            for op in c.ops[n:]:
-                op['gid'] = gid
-                if k not in ('hline', 'vline', 'vspan', 'hspan', 'image', 'contour', 'aline', 'rect', 'bracket'):
-                    op['mark'] = True
-            marks.tag(c, n, artist = '%s %s' % (k, labels.get(id(a), kinds.get(k))))
+        ordered = sorted(self.artists, key = lambda r: (r['z'], r['order']))
+        # In PowerPoint, each artist's shapes take its legend entry's name, or its kind and its place among its kind,
+        # and in an interactive SVG, its series links them to what else that label names
+        names, series, kinds = {}, self._series() if getattr(c, 'shapes', False) else {}, {}
+        if getattr(c, 'shapes', False):
+            for a in ordered:
+                if a['kind'] != 'text':
+                    kinds[a['kind']] = kinds.get(a['kind'], -1) + 1
+                    names[id(a)] = '%s %s' % (a['kind'], series.get(id(a), kinds[a['kind']]))
+        # With a highlight, all that recedes draws first, and what it keeps in full shade over it
+        focusing = self._focus is not None or any(a.get('focus') is not None for a in self.artists)
+        # What never recedes, such as guides and error bars, keeps its order with the marks in focus: under all of them
+        # in the first pass, else among them in the second, so that a highlight of everything draws what none does
+        floor = min((a['z'] for a in ordered if a['kind'] in FOCUS_KINDS), default = math.inf)
+        for done in ('context', 'focus') if focusing else (None, ):
+            c.passing = done
+            for a in ordered:
+                k = a['kind']
+                # Color 'none' draws nothing but an edge, while a dendrogram's None means the palette's choice
+                if k == 'text' or (k != 'dendro' and a.get('rgb', k) is None and not a.get('edge')):
+                    continue
+                if k not in FOCUS_KINDS and done is not None and (done == 'focus') != (a['z'] >= floor):
+                    continue
+                n = len(c.ops)
+                pad = 9.0 if k in ('points', 'box', 'violin') else 0.0 if k == 'heat' else 1.0
+                # A named element stays a bare path, for the code that looks for it in the SVG
+                gid = a.get('gid')
+                free = gid or k == 'image' or not a.get('clip', True)
+                c.state['clip'] = None if free else [((x0 - pad, y0 - pad, w + 2 * pad, h + 2 * pad),
+                                                      c.state['ctm'])]
+                getattr(self, '_d_' + k)(c, a)
+                for op in c.ops[n:]:
+                    op['gid'] = gid
+                    # What recedes casts no shadow
+                    if (k not in ('hline', 'vline', 'vspan', 'hspan', 'image', 'contour', 'aline', 'rect', 'bracket')
+                            and not (done == 'context' and k in FOCUS_KINDS)):
+                        op['mark'] = True
+                marks.tag(c, n, artist = names.get(id(a)), **({'series': series[id(a)]} if id(a) in series else {}))
+        c.passing = None
         c.restoreState()
 
     def _in_x(self, v):
@@ -2481,6 +2731,10 @@ class Axes:
         return bool(np.all((np.asarray(v) >= lo) & (np.asarray(v) <= hi)))
 
     def _d_line(self, c, a):
+        pick, back = self._chosen(c, a, 1)
+        if not pick[0]:
+            return
+        rgb = self.pal.recede(a['rgb']) if back else a['rgb']
         mask = np.isfinite(a['x']) & np.isfinite(a['y'])
         # A log axis has no place for zero or below, so those points break the line too
         if self._xscale == 'log':
@@ -2495,15 +2749,28 @@ class Axes:
             xs, ys = xs + a['offset'][:, 0], ys + a['offset'][:, 1]
         for run in _runs(mask):
             if run.stop - run.start > 1:
-                marks.line(c, self.pal, xs[run], ys[run], a['rgb'], a['lw'], a['alpha'], a['dash'])
+                marks.line(c, self.pal, xs[run], ys[run], rgb, a['lw'], a['alpha'], a['dash'])
 
     def _d_vsegs(self, c, a):
-        by_color = {}
-        for x, lo, hi, rgb in zip(self._tx(a['x']), self._ty(a['y0']), self._ty(a['y1']), a['rgb']):
-            if rgb is not None and np.isfinite((x, lo, hi)).all():
+        pick, back = self._chosen(c, a, len(a['x']))
+        by_color, sticks = {}, []
+        for i, (x, lo, hi, rgb) in enumerate(zip(self._tx(a['x']), self._ty(a['y0']), self._ty(a['y1']), a['rgb'])):
+            if pick[i] and rgb is not None and np.isfinite((x, lo, hi)).all():
+                rgb = self.pal.recede(rgb) if back else rgb
                 by_color.setdefault(rgb, []).append(((x, x), (lo, hi)))
+                sticks.append((i, x, lo, hi, rgb))
+        n = len(c.ops)
         for rgb, lines in by_color.items():
             marks.polylines(c, lines, rgb, a['lw'], a['alpha'], cap = 0, dash = a['dash'])
+        if getattr(c, 'hover', False) and sticks:
+            # As for points drawn in groups, the sticks fade with their panel, and an unpainted line over each, which
+            # the pointer finds, fills in while it is lit
+            marks.tag(c, n, hover = ((), ()))
+            for i, x, lo, hi, rgb in sticks:
+                at, own = len(c.ops), () if a['names'] is None else (str(a['names'][i]), )
+                marks.polyline(c, [x, x], [lo, hi], rgb, a['lw'], 0.0, cap = 0)
+                marks.tag(c, at, part = i, hit = True, hover = (own, own + (self._says('x', a['x'][i]),
+                                                                            self._says('y', a['y1'][i]))))
 
     def _d_vspan(self, c, a):
         _, y0, _, h = self.rect
@@ -2529,26 +2796,59 @@ class Axes:
                          cy + a['dy'] - a['h'] / 2))
         c.ops.append(op)
 
+    def _visible(self, b):
+        """Which of a scatter artist's points are drawn: a point beyond the limits is not, while one at the edge is
+        drawn whole, which the clip's margin allows."""
+        mask = np.isfinite(b['x']) & np.isfinite(b['y'])
+        for v, (lo, hi) in ((b['x'], sorted(self.xlim)), (b['y'], sorted(self.ylim))):
+            slack = 1e-9 * (hi - lo)
+            mask &= (v >= lo - slack) & (v <= hi + slack)
+        return mask
+
+    def hidden(self, a):
+        """Which of a scatter artist's points a density field hides on the page as laid out, as a boolean array over
+        its points, for whatever answers the mouse, such as slate's dot map: a hidden point is part of the field, not a
+        dot of its own. Kept for the page as laid out."""
+        crowd = a.get('crowd') if a['kind'] == 'points' else None
+        empty = np.zeros(len(np.atleast_1d(a.get('x', ()))), dtype = bool)
+        if crowd is None:
+            return empty
+        key = (self.rect, tuple(self.xlim), tuple(self.ylim), crowd)
+        if self._hidden_points[0] != key:
+            # The field as the call's first artist lays it, on the clip that the marks are drawn in
+            call = [b for b in self.artists if b['kind'] == 'points' and b.get('crowd') == crowd
+                    and (b['rgb'] is not None or b['edge'])]
+            masks = [self._visible(b) for b in call]
+            parts = [(self._tx(b['x'][m]), self._ty(b['y'][m]), np.sqrt(np.maximum(np.asarray(
+                b['s'] if np.ndim(b['s']) == 0 else np.asarray(b['s'])[m], dtype = float), 0.0) * self.pal.point_scale)
+                      / 2.0, b['rgb'] if b['rgb'] is not None else b['edge'][0]) for b, m in zip(call, masks)]
+            x0, y0, w, h = self.rect
+            found = {}
+            for b, m, (_, keep) in zip(call, masks, marks.crowd(self.pal, parts, (x0 - 9.0, y0 - 9.0, w + 18.0,
+                                                                                  h + 18.0))):
+                out = np.zeros(len(b['x']), dtype = bool)
+                out[np.flatnonzero(m)[~np.asarray(keep, dtype = bool)]] = True
+                found[id(b)] = out
+            self._hidden_points = (key, found)
+        return self._hidden_points[1].get(id(a), empty)
+
     def _d_points(self, c, a):
         # A rasterized scatter is one image in vector output, which its first artist draws for all of them
         spec = a.get('raster') if not getattr(c, 'stamp_dpi', None) else None
         group = [b for b in self.artists if b['kind'] == 'points' and b.get('raster') == spec] if spec else [a]
         if group[0] is not a:
             return
-        # Where a call's points pile up, its first artist lays a field for each color under all of them
+        # Where a call's points pile up, its first artist lays a field for each color under all of them, once, under
+        # the context and the focus alike where a highlight draws them in turn
         crowd = a.get('crowd')
         call = ([b for b in self.artists if b['kind'] == 'points' and b.get('crowd') == crowd] if crowd is not None
                 else [])
+        lays = call and call[0] is a and c.passing != 'focus'
         drawn, kept = [], {}
-        for b in call if call and call[0] is a else group:
-            mask = np.isfinite(b['x']) & np.isfinite(b['y'])
-            # A point beyond the limits is not drawn, while one at the edge is drawn whole, which the clip's margin
-            # allows
-            for v, (lo, hi) in ((b['x'], sorted(self.xlim)), (b['y'], sorted(self.ylim))):
-                slack = 1e-9 * (hi - lo)
-                mask &= (v >= lo - slack) & (v <= hi + slack)
+        for b in call if lays else group:
+            mask = self._visible(b)
             drawn.append((self._tx(b['x'][mask]), self._ty(b['y'][mask]),
-                          b['s'] if np.ndim(b['s']) == 0 else np.asarray(b['s'])[mask], b))
+                          b['s'] if np.ndim(b['s']) == 0 else np.asarray(b['s'])[mask], b, mask))
         layer, (bx, by, bw, bh) = c, c.state['clip'][0][0] if c.state['clip'] else (0.0, 0.0, c.width, c.height)
         if spec:
             xs, ys = np.concatenate([d[0] for d in drawn]), np.concatenate([d[1] for d in drawn])
@@ -2566,15 +2866,17 @@ class Axes:
             layer = pdfwrite.Canvas(BytesIO(), pagesize = (nx / sc, ny / sc))
             layer.stamp_dpi = spec[0]
             layer.state['clip'] = [((bx - ox, by - oy, bw, bh), layer.state['ctm'])]
-            drawn = [(px - ox, py - oy, s, b) for px, py, s, b in drawn]
+            drawn = [(px - ox, py - oy, s, b, mask) for px, py, s, b, mask in drawn]
             bx, by = bx - ox, by - oy
-        if call and call[0] is a:
-            # Hollow rings pile up in their edge's color
+        if lays:
+            # Hollow rings pile up in their edge's color, and what a highlight leaves as context recedes
             colored = [(d, d[3]['rgb'] if d[3]['rgb'] is not None else d[3]['edge'][0]) for d in drawn
                        if d[3]['rgb'] is not None or d[3]['edge']]
+            colored = [(d, self.pal.recede(rgb) if c.passing == 'context' and not self._focused(
+                d[3], len(d[3]['x'])).all() else rgb) for d, rgb in colored]
             parts = [(px, py, np.sqrt(np.maximum(np.asarray(s, dtype = float), 0.0) * self.pal.point_scale) / 2.0, rgb)
-                     for (px, py, s, _), rgb in colored]
-            for (bands, keep), ((_, _, _, b), _) in zip(marks.crowd(self.pal, parts, (bx, by, bw, bh)), colored):
+                     for (px, py, s, _, _), rgb in colored]
+            for (bands, keep), ((_, _, _, b, _), _) in zip(marks.crowd(self.pal, parts, (bx, by, bw, bh)), colored):
                 kept[id(b)] = keep
                 if bands is not None:
                     marks.crowd_op(layer, self.pal, bands)
@@ -2583,19 +2885,34 @@ class Axes:
             drawn = [d for d in drawn if d[3] is a or spec]
         elif call:
             kept = getattr(c, 'crowd', {})
-        for px, py, s, b in drawn:
+        for px, py, s, b, mask in drawn:
             keep = kept.get(id(b))
-            # Each point's own name or place in the call's data, which PowerPoint names its shape by
-            ids = None
+            # With a highlight, the context recedes and the focus draws over it
+            pick, back = self._chosen(c, b, len(b['x']))
+            # Points a highlight names one by one draw over the field, which recedes under them, as they may lie in it
+            single = c.passing == 'focus' and not self._focused(b, len(b['x'])).all()
+            keep = pick[mask] if keep is None or single else keep & pick[mask]
+            # Each point's own name or place in the call's data, which PowerPoint names its shape by, and in an
+            # interactive SVG, its name, series, and place, which its hover text gives
+            ids = hovers = None
             if getattr(c, 'shapes', False):
-                mask = np.isfinite(b['x']) & np.isfinite(b['y'])
-                for v, (lo, hi) in ((b['x'], sorted(self.xlim)), (b['y'], sorted(self.ylim))):
-                    mask &= (v >= lo - 1e-9 * (hi - lo)) & (v <= hi + 1e-9 * (hi - lo))
                 ids = np.flatnonzero(mask) if b.get('names') is None else b['names'][mask]
-            if keep is not None and not keep.all():
+            if getattr(c, 'hover', False):
+                series, named = self._series().get(id(b)), b.get('names') is not None
+                # Axes switched off carry no meaning in their positions, as in a network
+                where = 'ticks' not in self._hidden
+                hovers = [((str(t), ) if named else (), tuple(v for v in (str(t) if named else None, series) if v) + (
+                    (self._says('x', u), self._says('y', w)) if where else ()))
+                    for t, u, w in zip(ids, b['x'][mask], b['y'][mask])]
+            if not keep.all():
                 px, py, s = px[keep], py[keep], s if np.ndim(s) == 0 else s[keep]
                 ids = None if ids is None else ids[keep]
-            marks.points(layer, self.pal, px, py, s, b['rgb'], b['alpha'], b['marker'], b['edge'], ids)
+                hovers = None if hovers is None else [h for h, k in zip(hovers, keep) if k]
+            rgb, edge = b['rgb'], b['edge']
+            if back:
+                rgb = None if rgb is None else self.pal.recede(rgb)
+                edge = None if edge is None else (self.pal.recede(edge[0]), edge[1])
+            marks.points(layer, self.pal, px, py, s, rgb, b['alpha'], b['marker'], edge, ids, hovers)
         if not spec:
             return
         if len(layer.ops) == 1 and layer.ops[0]['kind'] == 'image':
@@ -2614,11 +2931,14 @@ class Axes:
         c.ops.append(op)
 
     def _d_band(self, c, a):
+        pick, back = self._chosen(c, a, 1)
+        if not pick[0]:
+            return
         for run in _runs(np.isfinite(a['x']) & np.isfinite(a['y1']) & np.isfinite(a['y2'])):
             x, y1, y2 = a['x'][run], a['y1'][run], a['y2'][run]
             if len(x) > 1:
                 marks.polygon(c, np.r_[self._tx(x), self._tx(x[::-1])], np.r_[self._ty(y1), self._ty(y2[::-1])],
-                              a['rgb'], a['alpha'])
+                              self.pal.recede(a['rgb']) if back else a['rgb'], a['alpha'])
 
     def _base(self, v, scale, limits):
         """Where a bar or a stem starts: a log axis has no place for zero or below, so the start of the axis."""
@@ -2632,9 +2952,14 @@ class Axes:
             free = (np.diff(a['x'][order]) - (a['w'][order][:-1] + a['w'][order][1:]) / 2) / 2
             room[order[:-1]] = np.maximum(free, 0.0)
             room[order[1:]] = np.fmin(room[order[1:]], np.maximum(free, 0.0))
+        pick, back = self._chosen(c, a, len(a['x']))
+        hover = getattr(c, 'hover', False)
+        own, series = (self._own(a), self._series().get(id(a))) if hover else (None, None)
+        across, along = ('y', 'x') if a['horizontal'] else ('x', 'y')
         for i, (x, b, v, w, rgb, free) in enumerate(zip(a['x'], a['b'], a['h'], a['w'], a['rgb'], room)):
-            if rgb is None or not np.isfinite((x, b, v, w)).all():
+            if rgb is None or not pick[i] or not np.isfinite((x, b, v, w)).all():
                 continue
+            rgb = self.pal.recede(rgb) if back else rgb
             n = len(c.ops)
             if a['horizontal']:
                 x1, x2 = self._tx(self._base(b, self._xscale, self.xlim)), self._tx(b + v)
@@ -2651,6 +2976,9 @@ class Axes:
                 marks.bar(c, self.pal, lx, ly, bw, bh, rgb, a['horizontal'], a['alpha'],
                           x2 < x1 if a['horizontal'] else y2 < y1, min(0.7, free / w) if w else 0.0)
             marks.tag(c, n, part = i)
+            if hover:
+                marks.tag(c, n, hover = (tuple(own[i]), tuple(t for t in (
+                    own[i][0] if own[i] else self._says(across, x), series, self._says(along, v)) if t is not None)))
 
     def _d_errors(self, c, a):
         for x, lo, hi in zip(self._tx(a['x']), self._ty(a['lo']), self._ty(a['hi'])):
@@ -2729,38 +3057,55 @@ class Axes:
         across, along, (plo, phi), (vlo, vhi) = self._across(a)
         v, px = a['values'][i], a['x'][i] + offsets
         keep = (v >= vlo) & (v <= vhi) & (px >= plo) & (px <= phi)
-        # Named in PowerPoint by their group and their own names or places in it
-        names = a['names'][i] if a['names'] is not None and a['names'][i] is not None else range(len(v))
-        group = ' '.join(str(g) for g in a['groups'][i] if g is not None)
-        ids = ['%s %s' % (group, t) for t, k in zip(names, keep) if k]
-        marks.points(c, self.pal, *marks.turn(a['horizontal'], across(px[keep]), along(v[keep])), size, rgb,
-                     a['alpha'], ids = ids)
+        # Named in PowerPoint by their group and their own names or places in it, and found by a highlight or a hover
+        # by their own names and their group's
+        named = a['names'] is not None and a['names'][i] is not None
+        names = a['names'][i] if named else range(len(v))
+        group = self._group_names(a, i)
+        pick, back = self._chosen(c, a, len(v), [[str(t)] + group for t in names] if named else [group] * len(v))
+        keep &= pick
+        ids = ['%s %s' % (' '.join(group), t) for t, k in zip(names, keep) if k]
+        hovers = None
+        if getattr(c, 'hover', False):
+            axis, title = 'x' if a['horizontal'] else 'y', ' · '.join(group)
+            hovers = [((str(t), ) if named else (), (str(t), title, self._says(axis, u)) if named else
+                       (title, self._says(axis, u))) for t, u, k in zip(names, v, keep) if k]
+        n = len(c.ops)
+        marks.points(c, self.pal, *marks.turn(a['horizontal'], across(px[keep]), along(v[keep])), size,
+                     self.pal.recede(rgb) if back else rgb, a['alpha'], ids = ids, hovers = hovers)
+        # In an interactive SVG, they light up with their group, which they belong to as a series
+        marks.tag(c, n, series = tuple(group))
 
     def _d_box(self, c, a):
         dots = a['offsets'] is not None
         offsets, sizes = self._spread(a)
         across, along, _, _ = self._across(a)
+        pick, back = self._chosen(c, a, len(a['x']))
         for i, (x, w, stats, rgb) in enumerate(zip(a['x'], a['w'], a['stats'], a['rgb'])):
             if stats is None:
                 continue
             n = len(c.ops)
             x0, x1 = float(across(x - w / 2)), float(across(x + w / 2))
             fill, ink = self._paired(rgb) if dots and a['box'] else (rgb, rgb)
-            if a['box']:
+            if a['box'] and pick[i]:
                 # In order up or across the page, which a turned axis reverses
-                marks.box(c, self.pal, min(x0, x1), abs(x1 - x0), sorted(float(along(v)) for v in stats[:5]), fill,
-                          a['alpha'], a['horizontal'])
+                marks.box(c, self.pal, min(x0, x1), abs(x1 - x0), sorted(float(along(v)) for v in stats[:5]),
+                          self.pal.recede(fill) if back else fill, a['alpha'], a['horizontal'])
             if dots:
                 self._group_points(c, a, i, offsets[i], sizes[i], ink)
-            elif a['fliers'] and len(stats[5]):
+            elif a['fliers'] and len(stats[5]) and pick[i]:
                 marks.points(c, self.pal, *marks.turn(a['horizontal'], np.full(len(stats[5]), (x0 + x1) / 2),
-                                                      along(stats[5])), 12.0, rgb, a['alpha'])
-            marks.tag(c, n, part = ' '.join(str(g) for g in a['groups'][i] if g is not None))
+                                                      along(stats[5])), 12.0, self.pal.recede(rgb) if back else rgb,
+                             a['alpha'])
+            marks.tag(c, n, part = ' '.join(self._group_names(a, i)))
+            if getattr(c, 'hover', False):
+                marks.tag(c, n, hover = self._group_hover(a, i))
 
     def _d_violin(self, c, a):
         pal = self.pal
         offsets, sizes = self._spread(a)
         across, along, _, _ = self._across(a)
+        pick, back = self._chosen(c, a, len(a['x']))
         for i, (x, w, stats, shape, rgb) in enumerate(zip(a['x'], a['w'], a['stats'], a['shapes'], a['rgb'])):
             if stats is None:
                 continue
@@ -2768,36 +3113,43 @@ class Axes:
             fill, ink = self._paired(rgb) if dots else (rgb, rgb)
             cx = float(across(x))
             n = len(c.ops)
-            if shape is not None:
+            if shape is not None and pick[i]:
                 grid, half = shape
                 ys = along(grid)
                 left, right = across(x - half), across(x + half)
                 marks.violin(c, pal, np.r_[left, right[::-1]], np.r_[ys, ys[::-1]], cx,
-                             float(np.max(np.abs(right - left))) / 2, fill, a['alpha'], a['horizontal'])
+                             float(np.max(np.abs(right - left))) / 2, pal.recede(fill) if back else fill, a['alpha'],
+                             a['horizontal'])
             if dots or shape is None:
                 self._group_points(c, a, i, offsets[i], sizes[i], ink)
-            elif a['inner'] == 'box':
+            elif a['inner'] == 'box' and pick[i]:
                 low, q1, median, q3, high = sorted(float(along(v)) for v in stats[:5])
                 span = abs(float(across(x + w / 2) - across(x - w / 2)))
-                marks.inner_box(c, pal, cx, min(max(span * 0.08, 2.5), 7.0), (low, q1, median, q3, high), rgb,
-                                a['alpha'], a['horizontal'])
-            marks.tag(c, n, part = ' '.join(str(g) for g in a['groups'][i] if g is not None))
+                marks.inner_box(c, pal, cx, min(max(span * 0.08, 2.5), 7.0), (low, q1, median, q3, high),
+                                pal.recede(rgb) if back else rgb, a['alpha'], a['horizontal'])
+            marks.tag(c, n, part = ' '.join(self._group_names(a, i)))
+            if getattr(c, 'hover', False):
+                marks.tag(c, n, hover = self._group_hover(a, i))
 
     def _d_stems(self, c, a):
         pal = self.pal
-        keep = np.isfinite(a['x']) & np.isfinite(a['y'])
+        pick, back = self._chosen(c, a, len(a['x']))
+        rgb = pal.recede(a['rgb']) if back else a['rgb']
+        keep = np.flatnonzero(np.isfinite(a['x']) & np.isfinite(a['y']) & pick)
+        if not len(keep):
+            return
         xs, ys = self._tx(a['x'][keep]), self._ty(a['y'][keep])
         zero = float(self._ty(self._base(0.0, self._yscale, self.ylim)))
         scale = {'needle': 0.35, 'flat': 1.6}.get(pal.bar, 1.0)
-        for i, (x, y) in enumerate(zip(xs, ys)):
+        for i, x, y, u, v in zip(keep.tolist(), xs, ys, a['x'][keep], a['y'][keep]):
             n = len(c.ops)
             if pal.bar in ('deep', 'soft'):
-                dark, base, light = pal.shades(a['rgb'])
+                dark, base, light = pal.shades(rgb)
                 hw = a['lw'] / 2.0
                 grad = ((x, zero, x, y), (dark, light) if pal.bar == 'deep' else (light, base))
                 marks.polygon(c, [x - hw, x + hw, x + hw, x - hw], [zero, zero, y, y], None, 1.0, grad)
             elif pal.bar == 'sear':
-                dark, base, light = pal.shades(a['rgb'])
+                dark, base, light = pal.shades(rgb)
                 hw = a['lw'] / 2.0
                 # As a bar: one scale across the plot, on either side of zero, so that a tall stem browns at its tip
                 (_, by, _, bh), _ = c.state['clip'][0] if c.state['clip'] else ((0.0, min(zero, y), 0.0, abs(y - zero)),
@@ -2805,10 +3157,13 @@ class Axes:
                 grad = ((x, zero, x, by if y < zero else by + bh), (light, base, dark))
                 marks.polygon(c, [x - hw, x + hw, x + hw, x - hw], [zero, zero, y, y], None, 1.0, grad)
             else:
-                marks.polyline(c, [x, x], [zero, y], a['rgb'], a['lw'] * scale, cap = 0)
+                marks.polyline(c, [x, x], [zero, y], rgb, a['lw'] * scale, cap = 0)
             marks.tag(c, n, part = i)
+            if getattr(c, 'hover', False):
+                own = () if a.get('names') is None else (str(a['names'][i]), )
+                marks.tag(c, n, hover = (own, own + (self._says('x', u), self._says('y', v))))
         if a['cap']:
-            marks.points(c, pal, xs, ys, 26.0, a['rgb'])
+            marks.points(c, pal, xs, ys, 26.0, rgb)
 
     def _d_hsegs(self, c, a):
         for y, x0, x1 in zip(self._ty(a['y']), self._tx(a['x0']), self._tx(a['x1'])):
@@ -2822,8 +3177,15 @@ class Axes:
         if not math.isfinite(x0 + y0 + x1 + y1) or n <= sum(a['shrink']):
             return
         (s0, s1), ux, uy = a['shrink'], (x1 - x0) / n, (y1 - y0) / n
+        at = len(c.ops)
         marks.arrow(c, self.pal, x0 + ux * s0, y0 + uy * s0, x1 - ux * s1, y1 - uy * s1, a['rgb'], a['lw'], a['alpha'],
                     a['head'], a['bend'])
+        if getattr(c, 'hover', False) and a.get('name') is not None:
+            # A thin arrow is hard to find, so an unpainted line along it, part of the same element, widens its grip
+            if not a['bend']:
+                marks.polyline(c, [x0 + ux * s0, x1 - ux * s1], [y0 + uy * s0, y1 - uy * s1], a['rgb'],
+                               max(a['lw'], ARROW_GRIP), 0.0, cap = 0)
+            marks.tag(c, at, hover = ((str(a['name']), ), (str(a['name']), )))
 
     def _d_aline(self, c, a):
         x0, y0, w, h = self.rect
@@ -2892,9 +3254,21 @@ class Axes:
         ny, nx = a['m'].shape
         # Through the limits, as they decide which way up the cells are and which of them show
         xs, ys = self._tx(np.arange(nx + 1)), self._ty(ny - np.arange(ny + 1))
+        # The rows and columns a highlight names keep their shades, and the other cells recede
+        rgb, kept = a['rgb'], None
+        if c.passing is not None:
+            kept = np.ones((ny, nx), dtype = bool)
+            focus = a['focus'] if a.get('focus') is not None else self._focus
+            if focus is not None:
+                named = lambda given, n: np.isin(np.array([str(v) for v in (given or range(n))]), list(focus))
+                kept = named(a['rows'], ny)[:, None] | named(a['columns'], nx)[None, :]
+                rgb = np.where(kept[..., None], rgb, self.pal.recede(rgb))
         if nx * ny > HEAT_IMAGE_CELLS:
+            # One image holds the context and the focus alike
+            if c.passing == 'focus':
+                return
             op = dict(c.state)
-            px = (a['rgb'] * 255.0 + 0.5).astype(np.uint8)
+            px = (rgb * 255.0 + 0.5).astype(np.uint8)
             seen = (np.isfinite(a['m']) * 255).astype(np.uint8)
             rows, columns = -1 if ys[-1] > ys[0] else 1, -1 if xs[-1] < xs[0] else 1
             op.update(kind = 'image', w = nx, h = ny, rgb = px[::rows, ::columns].tobytes(),
@@ -2906,13 +3280,19 @@ class Axes:
         cw, ch = float(abs(xs[1] - xs[0])), float(abs(ys[1] - ys[0]))
         # Each cell named in PowerPoint by its row and column, so that reordered rows carry their cells along
         rows, columns = a['rows'] or range(ny), a['columns'] or range(nx)
+        hover = getattr(c, 'hover', False)
+        scale = self._cbar['label'] if self._cbar and self._cbar['label'] else 'value'
         for r in range(ny):
             for j in range(nx):
-                if np.isfinite(a['m'][r, j]):
+                if np.isfinite(a['m'][r, j]) and (kept is None or kept[r, j] == (c.passing == 'focus')):
                     n = len(c.ops)
                     marks.heat_cell(c, self.pal, float(min(xs[j], xs[j + 1])), float(min(ys[r], ys[r + 1])), cw, ch,
-                                    tuple(a['rgb'][r, j]))
+                                    tuple(rgb[r, j]))
                     marks.tag(c, n, part = '%s | %s' % (rows[r], columns[j]))
+                    if hover:
+                        marks.tag(c, n, hover = ((str(rows[r]), str(columns[j])) if a['rows'] and a['columns'] else
+                                                 (), (str(rows[r]), str(columns[j]), '%s %s' % (
+                                                     scale, self._number(a['m'][r, j])))))
 
     def _d_ridges(self, c, a):
         pal = self.pal
@@ -3003,24 +3383,27 @@ class Axes:
                 # Its root at the tick once it runs up the page, else centered on it, and its edge facing the axis
                 text.draw_glyph(c, g, x if self.xrot else x - (left + right) / 2,
                                 rise - bottom if above else y0 - pad - top, pts, sticker)
-                continue
-            rgb, bold = ((pal.color(self._xemph[s]), True) if s in self._xemph else
-                         (ink if heat and self.xrot else tick_rgb, pal.tick_bold))
-            figures = self._numbers['x']
-            if self.xrot and above:
-                # The label starts at its tick and runs up and away from the axes
-                text.draw(c, x - small * 0.36 * math.sin(math.radians(self.xrot)), rise, s, small, rgb, bold,
-                          ha = 'left' if self.xrot > 0 else 'right', rotation = self.xrot, va = 'baseline',
-                          tabular = figures)
-            elif self.xrot:
-                # The label's end sits at its tick, and it hangs below the axis either way
-                text.draw(c, x + small * 0.36 * math.sin(math.radians(self.xrot)), y0 - pad, s, small, rgb, bold,
-                          ha = 'right' if self.xrot > 0 else 'left', rotation = self.xrot, va = 'baseline',
-                          tabular = figures)
             else:
-                text.draw(c, x, rise if above else y0 - pad, s, small, rgb, bold, ha = 'center',
-                          va = 'bottom' if above else 'top', tabular = figures)
-            marks.tag(c, n, name = 'x label ' + s)
+                rgb, bold = ((pal.color(self._xemph[s]), True) if s in self._xemph else
+                             (ink if heat and self.xrot else tick_rgb, pal.tick_bold))
+                figures = self._numbers['x']
+                if self.xrot and above:
+                    # The label starts at its tick and runs up and away from the axes
+                    text.draw(c, x - small * 0.36 * math.sin(math.radians(self.xrot)), rise, s, small, rgb, bold,
+                              ha = 'left' if self.xrot > 0 else 'right', rotation = self.xrot, va = 'baseline',
+                              tabular = figures)
+                elif self.xrot:
+                    # The label's end sits at its tick, and it hangs below the axis either way
+                    text.draw(c, x + small * 0.36 * math.sin(math.radians(self.xrot)), y0 - pad, s, small, rgb, bold,
+                              ha = 'right' if self.xrot > 0 else 'left', rotation = self.xrot, va = 'baseline',
+                              tabular = figures)
+                else:
+                    text.draw(c, x, rise if above else y0 - pad, s, small, rgb, bold, ha = 'center',
+                              va = 'bottom' if above else 'top', tabular = figures)
+                marks.tag(c, n, name = 'x label ' + s)
+            # In an interactive SVG, a category's label, or its glyph, lights up what it names
+            if getattr(c, 'hover', False) and s and not self._numbers['x']:
+                marks.tag(c, n, hover = ((s, ), ()), tick = True)
         yw, offsets = self._ytick_columns(ytext)
         # Numbers line up on their decimal points, the column's widest fraction in from its edge away from the plot
         split = self._decimals(self.ylabels, ytext)
@@ -3042,17 +3425,21 @@ class Axes:
                 pts = ytext * text.GLYPH_SYMBOL * self._gscale['y']
                 # Its edge facing the axes, and its root level with the tick
                 text.draw_glyph(c, g, start - left if self._yright else start - right, y, pts, sticker)
-                continue
-            rgb, bold = ((pal.color(self._yemph[s]), True) if s in self._yemph else
-                         (ink if heat else tick_rgb, pal.tick_bold))
-            if part is not None:
-                text.draw(c, (start + point if self._yright else start - point) - part[0], y, s, ytext, rgb, bold,
-                          ha = 'left', va = 'center', tabular = True)
-            elif self._yright:
-                text.draw(c, start, y, s, ytext, rgb, bold, ha = 'left', va = 'center', tabular = self._numbers['y'])
             else:
-                text.draw(c, start, y, s, ytext, rgb, bold, ha = 'right', va = 'center', tabular = self._numbers['y'])
-            marks.tag(c, n, name = 'y label ' + s)
+                rgb, bold = ((pal.color(self._yemph[s]), True) if s in self._yemph else
+                             (ink if heat else tick_rgb, pal.tick_bold))
+                if part is not None:
+                    text.draw(c, (start + point if self._yright else start - point) - part[0], y, s, ytext, rgb, bold,
+                              ha = 'left', va = 'center', tabular = True)
+                elif self._yright:
+                    text.draw(c, start, y, s, ytext, rgb, bold, ha = 'left', va = 'center',
+                              tabular = self._numbers['y'])
+                else:
+                    text.draw(c, start, y, s, ytext, rgb, bold, ha = 'right', va = 'center',
+                              tabular = self._numbers['y'])
+                marks.tag(c, n, name = 'y label ' + s)
+            if getattr(c, 'hover', False) and s and not self._numbers['y']:
+                marks.tag(c, n, hover = ((s, ), ()), tick = True)
         label_rgb = pal.color(pal.label_color or pal.ink)
         track = 0.9 if pal.caps else 0.0
         # Long axis names shrink to stay within their cell, centered on the axes
@@ -3097,9 +3484,11 @@ class Axes:
                               pal.text_bold,
                               ha = 'right', tracking = track)
         lo, hi = sorted(self.ylim)
+        # A label held to a share of the height shows while its x is within the limits, as an image so held does
         texts = [a for a in sorted((r for r in self.artists if r['kind'] == 'text'), key = lambda r: r['order'])
                  if math.isfinite(a['x'] + a['y'])
-                 and not (a['clip'] and not (self._in_x(a['x']) and lo <= a['y'] <= hi))]
+                 and not ((a['clip'] or a.get('yfrac')) and not (self._in_x(a['x']) and (a.get('yfrac')
+                                                                                          or lo <= a['y'] <= hi)))]
         placed, groups, spans, spots = {}, [], [], self._place_glyphs()
         # Only labels whose spans across the page overlap can collide, on either side of their points, so each run of
         # those moves on its own; glyphs find their own places around their points
@@ -3130,16 +3519,39 @@ class Axes:
             floor = y0 + gap / 2
             fit = np.clip(fit, floor, max(floor, y0 + h - gap / 2 - gap * (len(group) - 1)))
             placed.update((id(group[i]), (y, gap)) for i, y in zip(order, fit + gap * np.arange(len(group))))
+        # An annotation follows the point it sits on: where a highlight leaves that point as context, and names neither
+        # the annotation nor another point there, it recedes with it, while notes placed away from the points stay
+        focus = [f for f in [self._focus] + [r.get('focus') for r in self.artists] if f is not None]
+        held, left = set(), set()
+        for r in self.artists if focus else ():
+            if r['kind'] == 'points':
+                xs, ys = np.atleast_1d(r['x']).tolist(), np.atleast_1d(r['y']).tolist()
+                for xy, kept in zip(zip(xs, ys), self._focused(r, len(xs)).tolist()):
+                    (held if kept else left).add(xy)
+        keys = set().union(*focus)
+        back = lambda a: (not a.get('direct') and not a['frac'] and not a.get('yfrac') and a['s'] not in keys
+                          and (a['x'], a['y']) in left
+                          and (a['x'], a['y']) not in held)
+        def fade(n):
+            # A glyph's colors, its cut's included, recede all alike, as a heatmap's cells do, since SNFG's are fixed
+            for op in c.ops[n:]:
+                for paint in ('fill_rgb', 'stroke_rgb'):
+                    if op.get(paint) is not None:
+                        op[paint] = tuple(float(v) for v in pal.recede(np.array([[op[paint]]], dtype = float))[0, 0])
         for a in texts:
             bold = pal.text_bold if a['bold'] is None else a['bold']
-            px = x0 + a['x'] * w if a['frac'] else float(self._tx(a['x']))
-            py = y0 + a['y'] * h if a['frac'] else float(self._ty(a['y']))
+            px, py = self._anchor(a)
+            n = len(c.ops)
             if id(a) in spots:
                 gx, gy, leader, pts = spots[id(a)]
                 if leader:
                     marks.polyline(c, leader[::2], leader[1::2], a['rgb'], 0.5 * pal.spacing, 0.6, cap = 0)
                 text.draw_glyph(c, self._note(a)[0], gx, gy, pts, (1.0, 1.0, 1.0) if pal.is_dark else
                                 pal.color('paper') if a['halo'] > 0 else None)
+                if focus and back(a):
+                    fade(n)
+                # In an interactive SVG, a drawing lights up what shares its label, such as its point, and says it
+                marks.tag(c, n, hover = ((a['s'], ), (a['s'], )))
                 continue
             if a.get('direct') in ('cloud', 'peak'):
                 px, py = self._place_direct()[id(a)]
@@ -3158,14 +3570,33 @@ class Axes:
                 gy = ty - {'top': top, 'bottom': bottom, 'baseline': bottom}.get(a['va'], 0.0)
                 text.draw_glyph(c, g, gx, gy, pts, (1.0, 1.0, 1.0) if pal.is_dark else pal.color('paper') if
                                 a['halo'] > 0 else None)
+                if focus and back(a):
+                    fade(n)
+                # In an interactive SVG, a drawing lights up what shares its label, such as its point, and says it
+                marks.tag(c, n, hover = ((a['s'], ), (a['s'], )))
                 continue
+            # A label that names a series takes its color, receded with it, and one on a receded point recedes too, as
+            # dark or light as text must be to read
+            rgb, receding = a['rgb'], focus and back(a)
+            if (a.get('direct') and self._receding(a['order'] - 10 ** 9)) or receding:
+                rgb = pal.recede(rgb)
+            if (a.get('direct') or receding) and self.figure.legible:
+                rgb = legible(rgb, pal.color('paper'), LC_TEXT)
+            if receding:
+                # Its leader, drawn before it, recedes with it
+                for op in c.ops[n:]:
+                    if op.get('stroke_rgb') is not None:
+                        op['stroke_rgb'] = pal.recede(op['stroke_rgb'])
             n = len(c.ops)
-            # A label that names a series takes its color, as dark or light as text must be to read
-            rgb = (legible(a['rgb'], pal.color('paper'), LC_TEXT) if a.get('direct') and self.figure.legible else
-                   a['rgb'])
             text.draw(c, px + a['_dx'], ty, a['s'], a['size'] or size, rgb, bold, ha = a['_ha'],
                       va = a['va'], rotation = a['rotation'], halo = a['halo'], halo_color = pal.color('paper'),
                       linespacing = a['linespacing'], tracking = a.get('tracking', 0.0))
+            # In an interactive SVG, it lights up what it names, and needs no hover text of its own
+            if a.get('direct'):
+                marks.tag(c, n, series = self.legend_items[a['order'] - 10 ** 9][0], hover = ((), ()))
+            elif not a['frac'] and not a.get('placed'):
+                # An annotation lights up what shares its text, such as its point, and says nothing it does not show
+                marks.tag(c, n, hover = ((a['s'], ), ()))
             if a['tag']:
                 for op in c.ops[n:]:
                     op['label'] = (a['order'], id(self), a['s'])
@@ -3241,7 +3672,7 @@ class Axes:
         else:
             left = x0 + w - tw - 8.0 * u if 'right' in loc else x0 + 10.0 * u
             top = y0 + h - 12.0 * u if 'upper' in loc else y0 + 12.0 * u + th - row
-        for (dx, dy), (s, rgb, k, marker, area, _, g, _) in zip(spots, entries):
+        for (dx, dy), (s, rgb, k, marker, area, _, g, _), i in zip(spots, entries, self._legend_keep):
             x, y = left + dx, top - dy
             # In PowerPoint, an entry's swatch and name are named after it, so that they stay its own in the next figure
             n = len(c.ops)
@@ -3249,6 +3680,9 @@ class Axes:
                 text.draw(c, x, y, s, size, pal.color(pal.ink), True, va = 'center', tracking = track)
                 marks.tag(c, n, name = 'legend ' + s)
                 continue
+            # An entry for what a highlight leaves as context recedes with it
+            back = self._receding(i)
+            rgb = pal.recede(rgb) if back else rgb
             if k == 'line':
                 marks.polyline(c, [x, x + 12.0 * u], [y, y], rgb, max(pal.line_width, 1.2 * u), cap = 0, dash = marker)
             elif k == 'point':
@@ -3263,10 +3697,11 @@ class Axes:
                 gl, gb, _, gt = g.extent(size * text.GLYPH_SYMBOL, cut is not None or self._cut)
                 text.draw_glyph(c, g, x + 17.0 * u - gl, y - (gb + gt) / 2, size * text.GLYPH_SYMBOL, cut)
             else:
-                text.draw(c, x + 17.0 * u, y, s, size, pal.color(pal.ink), pal.text_bold, va = 'center',
-                          tracking = track, halo = 0.0 if loc in ('right', 'below') else 2.6 * u,
+                text.draw(c, x + 17.0 * u, y, s, size, pal.color(pal.muted if back else pal.ink), pal.text_bold,
+                          va = 'center', tracking = track, halo = 0.0 if loc in ('right', 'below') else 2.6 * u,
                           halo_color = pal.color('paper'))
-            marks.tag(c, n, name = 'legend ' + s)
+            # In an interactive SVG, it lights up what it names, and needs no hover text of its own
+            marks.tag(c, n, name = 'legend ' + s, series = self.legend_items[i][0], hover = ((), ()))
 
 
 def _recorded(method):
@@ -3288,5 +3723,6 @@ def _recorded(method):
 
 # All that only asks or converts is left out; a method that fails records nothing, as it changed nothing to replay
 for _name, _method in list(vars(Axes).items()):
-    if callable(_method) and _name[0] != '_' and _name not in ('get_xlim', 'get_ylim', 'page', 'data', 'boxes'):
+    if callable(_method) and _name[0] != '_' and _name not in ('get_xlim', 'get_ylim', 'page', 'data', 'boxes',
+                                                               'hidden'):
         setattr(Axes, _name, _recorded(_method))
