@@ -3463,7 +3463,8 @@ def test_spread_glyphs_move_with_their_points_while_a_window_drafts():
         axf.annotate('abcd|ab', (x, y), glyph = _beads, spread = True)
     axf.set_xlim(-0.5, 3.4)
     fresh.layout()
-    assert sorted(v[:2] for v in full.values()) == pytest.approx(sorted(v[:2] for v in axf._place_glyphs().values()))
+    places = [np.array(sorted(v[:2] for v in p.values()), dtype = float) for p in (full, axf._place_glyphs())]
+    assert places[0] == pytest.approx(places[1])
 
 
 def test_named_arrows_and_annotations_answer_the_mouse():

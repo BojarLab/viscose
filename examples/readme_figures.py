@@ -1,6 +1,14 @@
 """Draws every image in the README into examples/readme/: python examples/readme_figures.py
 Needs matplotlib and seaborn for the comparison, pillow for arranging the panels, glycowork for the glycan drawings and
-the talk's data, and PowerPoint with pywin32 and OpenCV for the animation of the talk."""
+the talk's data, and PowerPoint with pywin32 and OpenCV for the animation of the talk.
+`python examples/readme_figures.py trailer` draws the 41-second trailer instead, built from viscose figures,
+which needs matplotlib, seaborn, glycowork, and OpenCV, and Windows with PowerPoint and pywin32 for Morph and H.264."""
+import os
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ProcessPoolExecutor
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 import numpy as np
@@ -61,7 +69,7 @@ def card(palette):
     return fig
 
 
-def seaborn_volcano():
+def seaborn_volcano(figsize = (8, 8), dpi = 200):
     """gallery.volcano's data and labels as matplotlib and seaborn draw them by default."""
     import matplotlib
     matplotlib.use('Agg')
@@ -75,7 +83,7 @@ def seaborn_volcano():
             (3.7, 8.4, 'Fuc(a1-3)[Gal(b1-4)]GlcNAc'), (-3.6, 7.4, 'Man(a1-2)Man(a1-3)Man'),
             (3.1, 6.5, 'GalNAc(b1-4)Gal(b1-4)Glc'), (-2.9, 5.6, 'Fuc(a1-2)Gal(b1-3)GalNAc')]
     group = np.where((np.abs(x) > 1) & (y > 2), np.where(x < 0, 'Down', 'Up'), 'Unchanged')
-    fig, ax = plt.subplots(figsize = (8, 8))
+    fig, ax = plt.subplots(figsize = figsize)
     sns.scatterplot(x = x, y = y, hue = group, ax = ax)
     for hx, hy, lab in hits:
         ax.scatter([hx], [hy], s = 120, color = 'C1' if hx < 0 else 'C2')
@@ -88,19 +96,26 @@ def seaborn_volcano():
     ax.set_ylabel('-log10 adjusted p')
     ax.set_title('Differential abundance')
     buf = BytesIO()
-    fig.savefig(buf, dpi = 200, format = 'png')
+    fig.savefig(buf, dpi = dpi, format = 'png')
     plt.close(fig)
     return Image.open(buf).convert('RGB')
 
 
-def glycan_volcano():
+def glycan_volcano(figsize = (7, 7), rise = 1.0, glyphs = True):
+    """Below a `rise` of 1, each point is that far on its way up from the axis, each at its own time, for the trailer,
+    which also leaves the glycans out with glyphs = False."""
     rng = np.random.default_rng(1729)
     x = np.clip(rng.normal(0, 1.3, 412), -4.6, 4.6)
     y = 0.72 * np.abs(x) ** 1.75 * rng.uniform(.8, 1.05, 412) + rng.exponential(0.42, 412)
     hits = [(0.6, 12.8, 'Neu5Ac(a2-6)Gal(b1-4)GlcNAc'), (-3.6, 11.2, 'Gal(a1-3)Gal(b1-4)GlcNAc'),
             (2.2, 9.9, 'Neu5Ac(a2-3)Gal(b1-3)GalNAc'), (-3.2, 9.0, 'GlcNAc(b1-2)Man(a1-3)Man'),
             (3.0, 8.2, 'Fuc(a1-3)[Gal(b1-4)]GlcNAc'), (-3.8, 5.6, 'Fuc(a1-2)Gal(b1-3)GalNAc')]
-    fig, ax = vc.subplots(figsize = (7, 7), palette = 'aura')
+    if rise < 1:
+        late = np.random.default_rng(5).uniform(0, .4, 412 + len(hits))
+        up = ease((rise - late) / .6)
+        y = y * up[:412]
+        hits = [(hx, hy * u, lab) for (hx, hy, lab), u in zip(hits, up[412:])]
+    fig, ax = vc.subplots(figsize = figsize, palette = 'aura')
     fig.suptitle('Glycans as labels', 'SNFG drawings beside their points')
     sig = (np.abs(x) > 1) & (y > 2)
     ax.scatter(x[~sig], y[~sig], s = 22, color = 'a3', z = 2)
@@ -108,7 +123,8 @@ def glycan_volcano():
     ax.scatter(x[sig & (x > 0)], y[sig & (x > 0)], s = 30, color = 'a1')
     for hx, hy, lab in hits:
         ax.scatter([hx], [hy], s = 120, color = 'b1' if hx < 0 else 'a1', z = 5)
-        ax.annotate(lab, (hx, hy), glyph = 'glycan', spread = True)
+        if glyphs:
+            ax.annotate(lab, (hx, hy), glyph = 'glycan', spread = True)
     ax.axvline(-1)
     ax.axvline(1)
     ax.axhline(2)
@@ -119,13 +135,13 @@ def glycan_volcano():
     return fig
 
 
-def glycan_bars():
+def glycan_bars(figsize = (7, 7)):
     from glycowork.glycan_data.loader import glycomics_data_loader
     table = glycomics_data_loader.human_colorectal_N_PMID26085185
     shares = table.iloc[:, 1:].astype(float)
     shares = (shares / shares.sum() * 100).mean(axis = 1)
     top = shares.sort_values().index[-8:]
-    fig, ax = vc.subplots(figsize = (7, 7), palette = 'aura')
+    fig, ax = vc.subplots(figsize = figsize, palette = 'aura')
     fig.suptitle('Glycans as ticks', 'The most abundant N-glycans of colorectal tissue')
     ax.barh(list(table.iloc[top, 0]), shares[top].values)
     ax.tick_params('y', glyphs = 'glycan')
@@ -133,8 +149,10 @@ def glycan_bars():
     return fig
 
 
-def linked(highlight, palette = 'aura'):
-    """Colorectal O-glycomes by sample in four panels, with samples C3 and T3 and the largest changes in focus."""
+def linked(highlight, palette = 'aura', figsize = (13, 10), mosaic = 'ab;cd', width_ratios = (1, 1.4)):
+    """Colorectal O-glycomes by sample in four panels, with samples C3 and T3 and the largest changes in focus, or
+    with what a list names in every panel: samples, groups, glycans, or, as numbers, the glycans of the largest changes
+    from 0 on."""
     from glycowork.glycan_data.loader import glycomics_data_loader
     table = glycomics_data_loader.human_colorectal_O_PMC9254241.groupby('glycan', sort = False).sum()
     samples = [c for c in table.columns if c[0] in 'CT']
@@ -150,8 +168,10 @@ def linked(highlight, palette = 'aura'):
     z = (clr[top] - clr[top].mean(axis = 1, keepdims = True)) / clr[top].std(axis = 1, keepdims = True)
     change = clr[top][:, tumor].mean(axis = 1) - clr[top][:, ~tumor].mean(axis = 1)
     sialylated = shares[np.array(['Neu5Ac' in g for g in table.index])].sum(axis = 0)
-    pick = ['C3', 'T3'] if highlight else None
-    fig, axes = vc.subplot_mosaic('ab;cd', figsize = (13, 10), palette = palette, width_ratios = [1, 1.4])
+    ranked = np.argsort(-np.abs(change))
+    pick = ['C3', 'T3'] if highlight is True else None if not highlight else [
+        glycans[ranked[k]] if isinstance(k, int) else k for k in highlight]
+    fig, axes = vc.subplot_mosaic(mosaic, figsize = figsize, palette = palette, width_ratios = list(width_ratios))
     fig.suptitle('Colorectal O-glycome', '12 tumor and 12 control tissues')
     ax = axes['a']
     ax.scatter(*(u[:, :2] * sv[:2]).T, hue = np.where(tumor, 'Tumor', 'Control'), names = samples, s = 60,
@@ -166,20 +186,20 @@ def linked(highlight, palette = 'aura'):
     ax.set_ylabel('Sialylated (%)')
     ax = axes['d']
     ax.barh(glycans, change, color = ['a1' if v > 0 else 'b1' for v in change],
-            highlight = [glycans[i] for i in np.argsort(-np.abs(change))[:3]] if highlight else None)
+            highlight = [glycans[i] for i in ranked[:3]] if highlight is True else pick)
     ax.tick_params('y', glyphs = 'glycan')
     ax.axvline(0)
     ax.set_xlabel('Tumor - control (CLR)')
     return fig
 
 
-def markers():
+def markers(figsize = (8, 6)):
     rng = np.random.default_rng(3)
     n = 150
     stage = np.repeat(['Healthy', 'Early', 'Late'], n // 3)
     shift = np.select([stage == 'Healthy', stage == 'Early'], [-1.6, 0.2], 1.8)
     x, y = rng.normal(shift, 0.8), rng.normal(shift ** 2 / 2 - 0.8, 0.7)
-    fig, ax = vc.subplots(figsize = (8, 6), palette = 'aura')
+    fig, ax = vc.subplots(figsize = figsize, palette = 'aura')
     fig.suptitle('Glycomes by disease stage', '150 patients')
     ax.scatter(x, y, hue = stage, style = rng.choice(['Serum', 'Tissue'], n), size = rng.random(n) * 10,
                hue_label = 'Stage', style_label = 'Source', size_label = 'Abundance')
@@ -188,10 +208,10 @@ def markers():
     return fig
 
 
-def labels(palette):
+def labels(palette, figsize = (15, 4.6)):
     """Every series named where it is: at the ends of lines, beside groups of points, and right of stacked bars."""
     rng = np.random.default_rng(11)
-    fig, axes = vc.subplots(1, 3, figsize = (15, 4.6), palette = palette)
+    fig, axes = vc.subplots(1, 3, figsize = figsize, palette = palette)
     t = np.linspace(0, 48, 49)
     for name, rate, top in [('Wild type', 0.11, 1.0), ('ΔFUT8', 0.09, 0.94), ('ST6GAL1 KO', 0.06, 0.72),
                             ('MGAT5 KO', 0.035, 0.55)]:
@@ -210,32 +230,45 @@ def labels(palette):
     return fig
 
 
-def crowd(density):
-    """100,000 cells from two populations, as points alone or with the field that takes over where they pile up."""
+def crowd(density, figsize = (6, 5), share = None):
+    """100,000 cells from two populations, as points alone or with the field that takes over where they pile up, or
+    the first `share` of them in a random order on fixed axes, for the trailer."""
     rng = np.random.default_rng(3)
     a = rng.normal(0, 1, (50000, 2)) @ [[1, .6], [0, .8]]
     b = rng.normal(0, .5, (50000, 2)) + [2.5, -1.5]
-    fig, ax = vc.subplots(figsize = (6, 5), palette = 'poster')
+    fig, ax = vc.subplots(figsize = figsize, palette = 'poster')
     fig.suptitle('100,000 cells', 'Where points pile up, their density' if density else 'Every point')
-    ax.scatter(*np.vstack([a, b]).T, s = 12, density = density)
+    cells = np.vstack([a, b])
+    if share is not None:
+        cells = cells[np.random.default_rng(4).permutation(len(cells))[:max(1, round(share * len(cells)))]]
+        ax.set_xlim(-4.74, 4.77)
+        ax.set_ylim(-4.56, 5.16)
+    ax.scatter(*cells.T, s = 12, density = density)
     ax.set(xlabel = 'UMAP 1', ylabel = 'UMAP 2')
     return fig
+
+
+def milk():
+    """Human milk oligosaccharides by day of lactation, as shares of all measured, with the seven most abundant and
+    how many mothers each day has."""
+    from glycowork.glycan_data.loader import glycomics_data_loader
+    table = glycomics_data_loader.time_series_HMO_PMID22649065
+    day = table['ID'].str.extract(r'_d(\d+)_')[0].astype(int).values
+    shares = table.iloc[:, 1:].astype(float)
+    by_day = (shares.div(shares.sum(axis = 1), axis = 0) * 100).groupby(day).mean()
+    return by_day, list(by_day.mean().sort_values().index[-7:]), dict(zip(*np.unique(day, return_counts = True)))
 
 
 def talk():
     """Real data as slides: human milk oligosaccharides on days 1, 4, and 14 of lactation, then the most abundant
     colorectal N-glycans as a heatmap in sample order and clustered."""
     from glycowork.glycan_data.loader import glycomics_data_loader
-    milk = glycomics_data_loader.time_series_HMO_PMID22649065
-    day = milk['ID'].str.extract(r'_d(\d+)_')[0].astype(int).values
-    shares = milk.iloc[:, 1:].astype(float)
-    by_day = (shares.div(shares.sum(axis = 1), axis = 0) * 100).groupby(day).mean()
-    top = by_day.mean().sort_values().index[-7:]
+    by_day, top, mothers = milk()
     figs = []
     for d in (1, 4, 14):
         fig, ax = vc.subplots(figsize = (13.333, 7.5), palette = 'aura')
-        fig.suptitle('Milk oligosaccharides over lactation', f'Day {d}, mean of {(day == d).sum()} mothers')
-        ax.barh(list(top), by_day.loc[d, top].values)
+        fig.suptitle('Milk oligosaccharides over lactation', f'Day {d}, mean of {mothers[d]} mothers')
+        ax.barh(top, by_day.loc[d, top].values)
         ax.tick_params('y', glyphs = 'glycan')
         ax.set_xlim(0, 40)
         ax.set_xlabel('Share of measured HMOs (%)')
@@ -257,25 +290,21 @@ def talk():
     return figs
 
 
-def morph_video(deck, name, width = 960, fps = 15):
-    """A deck as PowerPoint plays it, exported by PowerPoint itself as video and turned into an animated WebP, so that
-    what the README shows is Morph's own work. Needs Windows with PowerPoint, pywin32, and OpenCV, and is skipped
-    elsewhere."""
-    import tempfile
+def powerpoint_frames(deck, height, fps):
+    """A deck as PowerPoint plays it, exported by PowerPoint itself as video, as RGB frames, each slide held for a
+    second after its transition, or None without Windows, PowerPoint, pywin32, and OpenCV."""
     import time
     try:
         import cv2
         import win32com.client
     except ImportError:
-        print('Skipping', name, 'which needs PowerPoint, pywin32, and OpenCV')
-        return
+        return None
     with tempfile.TemporaryDirectory() as tmp:
         video = str(Path(tmp) / 'deck.mp4')
         app = win32com.client.DispatchEx('PowerPoint.Application')
         pres = app.Presentations.Open(str(Path(deck).resolve()), True, False, False)
         try:
-            # Each slide holds for a second after its transition
-            pres.CreateVideo(video, False, 1, 720, fps, 90)
+            pres.CreateVideo(video, False, 1, height, fps, 90)
             while pres.CreateVideoStatus in (1, 2):
                 time.sleep(1)
         finally:
@@ -286,9 +315,19 @@ def morph_video(deck, name, width = 960, fps = 15):
             ok, f = cap.read()
             if not ok:
                 break
-            frames.append(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).resize(
-                (width, round(width * f.shape[0] / f.shape[1])), Image.LANCZOS))
+            frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
         cap.release()
+    return frames
+
+
+def morph_video(deck, name, width = 960, fps = 15):
+    """A deck as PowerPoint plays it, turned into an animated WebP, so that what the README shows is Morph's own
+    work. Skipped without Windows, PowerPoint, pywin32, and OpenCV."""
+    frames = powerpoint_frames(deck, 720, fps)
+    if frames is None:
+        print('Skipping', name, 'which needs PowerPoint, pywin32, and OpenCV')
+        return
+    frames = [Image.fromarray(f).resize((width, round(width * f.shape[0] / f.shape[1])), Image.LANCZOS) for f in frames]
     # A slide held still is one frame shown for as long, which the video repeats at every tick
     kept, times = [], []
     for f in frames:
@@ -302,8 +341,359 @@ def morph_video(deck, name, width = 960, fps = 15):
                  method = 6)
 
 
+# The trailer: 40.6 seconds at 30 frames per second, each frame viscose figures of 12.8 by 7.2 inches drawn at 150 dpi,
+# so 1920 by 1080 pixels, blended by fades, diagonal wipes, and an iris where a dark page meets a light one; only the
+# matplotlib figure it starts from and PowerPoint's Morph of viscose's own slides come from elsewhere
+FPS, PAGE, SIZE = 30, (12.8, 7.2), (1920, 1080)
+TAGLINE = 'Scientific plots that are pieces of art'
+# Settled points keep shimmering, by this much in inches
+SHIMMER = 0.016
+# Captions sit in a band of this many pixels at the top, as a figure's title does; the wall's six figures fill the rest
+TOP = 175
+WALL, TILE = ['volcano', 'heatmap', 'ridges', 'spectrum', 'embedding', 'groups'], (610, 430)
+# Each feature card shows for this many seconds
+CARD = 1.0
+INKS = [(0, 174, 239), (236, 0, 140), (255, 242, 0), (35, 31, 32)]
+
+
+def ease(t):
+    """Smootherstep from 0 to 1, flat at both ends."""
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * t * (t * (6 * t - 15) + 10)
+
+
+@lru_cache(None)
+def letters(n = 24000):
+    """Points spread over the ink of the word viscose set large, in page inches, and the letter each lies on."""
+    fig = vc.Figure(*PAGE, palette = 'aura')
+    fig.text(0.5, 0.42, 'viscose', size = 190, bold = True, ha = 'center')
+    ink = fig.to_rgba(40, background = 'white')[..., :3].mean(axis = 2) < 128
+    rows, cols = np.nonzero(ink)
+    rng = np.random.default_rng(1)
+    k = rng.integers(0, rows.size, n)
+    x = (cols[k] + rng.random(n)) / ink.shape[1] * PAGE[0]
+    inked = np.unique(cols)
+    letter = np.searchsorted(inked[1:][np.diff(inked) > 1], cols[k], side = 'right')
+    return x, PAGE[1] - (rows[k] + rng.random(n)) / ink.shape[0] * PAGE[1], letter
+
+
+def gathering(palette, t, caption, span, colors):
+    """Points that swirl in from beyond the page over `span` seconds and settle into the word, where the field of their
+    density takes over from them as they pile up. `colors` take turns letter by letter."""
+    tx, ty, letter = letters()
+    n = tx.size
+    rng = np.random.default_rng(7)
+    angle, r = rng.uniform(0, 2 * np.pi, n), 2.5 + 9 * rng.random(n) ** .6
+    cx, cy = PAGE[0] / 2, PAGE[1] / 2
+    e = ease((t / span - rng.uniform(0, .35, n)) / .65)
+    px, py = r * np.cos(angle) * (1 - e) + (tx - cx) * e, r * np.sin(angle) * (1 - e) + (ty - cy) * e
+    spin, phase = 2.4 * (1 - e) ** 2, rng.uniform(0, 2 * np.pi, n)
+    x = cx + px * np.cos(spin) - py * np.sin(spin) + SHIMMER * np.sin(3.1 * t + phase)
+    y = cy + px * np.sin(spin) + py * np.cos(spin) + SHIMMER * np.cos(2.3 * t + 1.7 * phase)
+    fig = vc.Figure(*PAGE, palette = palette)
+    ax = fig.add_axes((0, 0, 1, 1))
+    for k, c in enumerate(colors):
+        ax.scatter(x[letter % len(colors) == k], y[letter % len(colors) == k], s = 6, color = c)
+    ax.set_xlim(0, PAGE[0])
+    ax.set_ylim(0, PAGE[1])
+    ax.off()
+    if caption:
+        fig.text(0.5, 0.2, caption, size = 24, ha = 'center', color = 'muted')
+    return fig
+
+
+def render(fig, size = SIZE):
+    """A figure's pixels at the width given, and a page that grew for its labels fitted back in, on its own paper."""
+    img = fig.to_rgba(size[0] * 72 / fig.width)[..., :3]
+    if img.shape[:2] != size[::-1]:
+        small = Image.fromarray(img)
+        small.thumbnail(size, Image.LANCZOS)
+        frame = Image.new('RGB', size, tuple(int(v) for v in img[0, 0]))
+        frame.paste(small, ((size[0] - small.width) // 2, (size[1] - small.height) // 2))
+        img = np.asarray(frame)
+    return np.array(img)
+
+
+def header(palette, title, subtitle):
+    """An empty page with a caption as its title, for frames put together from several figures."""
+    return render(vc.Figure(*PAGE, palette = palette).suptitle(title, subtitle))
+
+
+@lru_cache(64)
+def wall_tile(kind, palette, t):
+    """One of the wall's figures, the ridges flowing and the embedding turning `t` seconds in."""
+    size = (7.2, 7.2 * TILE[1] / TILE[0])
+    fig = gallery.ridges(palette, t, size) if kind == 'ridges' else gallery.embedding(
+        palette, .35 * np.sin(.9 * t), size) if kind == 'embedding' else getattr(gallery, kind)(palette, size)
+    return render(fig, TILE)
+
+
+def wall(palette, t):
+    """Six kinds of figure in one palette, under the word that sets it."""
+    dark = palette.endswith('-dark')
+    img = header(palette, 'Every palette, also by night' if dark else 'One word changes everything',
+                 f"palette = '{palette}'")
+    for i, kind in enumerate(WALL):
+        x, y = 20 + i % 3 * (TILE[0] + 25), TOP + i // 3 * (TILE[1] + 25)
+        img[y:y + TILE[1], x:x + TILE[0]] = wall_tile(kind, palette, t if kind in ('ridges', 'embedding') else 0.0)
+    return img
+
+
+def feature_card(i):
+    """One of the rapid-fire features, by its place in CARDS."""
+    make, title, subtitle = CARDS[i]
+    if make == 'themes':
+        # One SVG holds the light page and its dark twin; here they meet on a diagonal
+        light, dark = (render(gallery.trial(p, PAGE).suptitle(title, subtitle)) for p in ('poster', 'poster-dark'))
+        yy, xx = np.mgrid[0:SIZE[1], 0:SIZE[0]] / SIZE[1]
+        return np.where(((xx + .45 * yy) / (SIZE[0] / SIZE[1] + .45) > .5)[..., None], dark, light)
+    if make == 'print':
+        # The figure beside its four printing plates, each in its ink, as separated for U.S. web offset
+        img, art = header('poster', title, subtitle), render(gallery.ridges('poster', 0.0, (7.0, 6.2)), (1000, 886))
+        img[TOP:TOP + 886, 20:1020] = art
+        plates = vc.Press().separate(art.reshape(-1, 3) / 255.0).reshape(*art.shape[:2], 4)
+        for k, ink in enumerate(INKS):
+            plate = 255 - plates[..., k:k + 1] * (255 - np.array(ink, float))
+            small = np.asarray(Image.fromarray(np.round(plate).astype(np.uint8)).resize((420, 372), Image.LANCZOS))
+            x, y = 1050 + k % 2 * 440, TOP + 40 + k // 2 * 400
+            img[y:y + 372, x:x + 420] = small
+        return img
+    if make == 'open':
+        # Saved in Lumen, and brought back from the file alone in Couture's dark version
+        size = (7.2, 7.2 * 880 / 930)
+        with tempfile.TemporaryDirectory() as tmp:
+            gallery.volcano('lumen', size).save(Path(tmp) / 'volcano.pdf')
+            back = vc.open(Path(tmp) / 'volcano.pdf', palette = 'couture-dark')
+        img = header('lumen', title, subtitle)
+        img[TOP:TOP + 880, 20:950] = render(gallery.volcano('lumen', size), (930, 880))
+        img[TOP:TOP + 880, 970:1900] = render(back, (930, 880))
+        return img
+    return render(make().suptitle(title, subtitle))
+
+
+def still(key):
+    """One state of the trailer as RGB pixels, from its key: the kind of scene and what sets it."""
+    kind, *args = key
+    if kind == 'gather':
+        return render(gathering(*args))
+    if kind == 'box' and args[0] == 'seaborn':
+        img = header('aura', 'Out of the box', 'matplotlib and seaborn, by default')
+        img[180:] = np.asarray(seaborn_volcano((12.8, 6.0), 150))
+        return img
+    if kind == 'box':
+        return render(gallery.volcano('aura', PAGE).suptitle('Out of the box', 'viscose, by default'))
+    if kind == 'wall':
+        return wall(*args)
+    if kind == 'erupt':
+        return render(glycan_volcano(PAGE, *args).suptitle('Glycans as glyphs',
+                                                           'Real SNFG drawings find open room beside their points'))
+    if kind == 'crowd':
+        return render(crowd(True, PAGE, args[0]).suptitle(
+            f'{round(args[0] * 100000):,} points', "Their density takes over where they pile up. As PDF in 0.13 s, "
+            "where matplotlib takes 1.64 s"))
+    return feature_card(args[0])
+
+
+def word_scene(palette, colors, span, caption, at):
+    """The word gathering, with its caption fading in `at` seconds in."""
+    def scene(u, s):
+        plain = ('gather', palette, round(u, 4), '', span, colors)
+        captioned, share = (*plain[:3], caption, span, colors), ease((u - at) / .6)
+        return [(plain, None)] if share <= 0 else [(captioned, None)] if share >= 1 else [
+            (plain, None), (captioned, ('fade', float(share)))]
+    return scene
+
+
+def box_scene(u, s):
+    """matplotlib's and seaborn's defaults, wiped into viscose's."""
+    share = ease((u - 1.5) / .7)
+    return [(('box', 'seaborn'), None)] if share <= 0 else [(('box', 'viscose'), None)] if share >= 1 else [
+        (('box', 'seaborn'), None), (('box', 'viscose'), ('wipe', float(share)))]
+
+
+def wall_scene(u, s):
+    """The wall through every palette, each wiping in over the last, and then into the night."""
+    seq = [*vc.palettes, 'aura-dark']
+    k = int(np.clip(u // 1.2, 0, 4))
+    now, share = ('wall', seq[k], round(s, 4)), (u - 1.2 * k) / (.6 if k == 4 else .35)
+    return [(('wall', seq[k - 1], round(s, 4)), None), (now, ('iris' if k == 4 else 'wipe', float(ease(share))))] if (
+        k and share < 1) else [(now, None)]
+
+
+def erupt_scene(u, s):
+    """A volcano plot whose points rise from the axis, and then the glycans of its hits."""
+    share = ease((u - 2.1) / .5)
+    plain, drawn = ('erupt', round(min(u / 2.0, 1.0), 4), False), ('erupt', 1.0, True)
+    return [(plain, None)] if share <= 0 else [(drawn, None)] if share >= 1 else [
+        (plain, None), (drawn, ('fade', float(share)))]
+
+
+def crowd_scene(u, s):
+    """Points pouring in, a hundred to a hundred thousand, until their density forms bands."""
+    return [(('crowd', round(float(.001 + .999 * ease(u / 2.1)), 5)), None)]
+
+
+def morph_scene(u, s):
+    """PowerPoint's own video of the deck viscose wrote, frame by frame."""
+    return [(('ppt', round(u * FPS)), None)]
+
+
+def cards_scene(u, s):
+    """Feature after feature, each fading in over the last."""
+    i = min(int(u // CARD), len(CARDS) - 1)
+    share = ease((u - i * CARD) / .12)
+    return [(('card', i), None)] if not i or share >= 1 else [(('card', i - 1), None),
+                                                              (('card', i), ('fade', float(share)))]
+
+
+CARDS = [(lambda: labels('lumen', PAGE), 'Labels where the data are',
+          'Every series named in its own color, with no legend to decode'),
+         (lambda: gallery.groups('lumen', PAGE), 'Every sample, every bracket',
+          'Boxes, violins, and p-values that stack themselves'),
+         (lambda: gallery.subgroups('couture'), 'Swarms and subgroups', 'Straight from a tidy table, side by side'),
+         (lambda: markers(PAGE), 'Hue, style, and size', 'Mapped as in seaborn, each group named where it lies'),
+         (lambda: gallery.spectrum('couture', PAGE), 'Mirror spectra',
+          'Observed against library, every fragment annotated'),
+         (lambda: gallery.trial('aura', PAGE), 'Panels, bands, and points', 'Response and benchmark on one page'),
+         (lambda: gallery.stacked('poster', PAGE), 'Stacked bars', 'Shares by tissue in shades of two hues'),
+         (lambda: glycan_bars(PAGE), 'Glycans as ticks', 'Real SNFG drawings, scaled to fit their rows'),
+         (lambda: gallery.heatmap('lumen', PAGE), 'Clustermaps',
+          'The exact optimal leaf order, a 300 × 100 PDF in 0.02 s where seaborn takes 1.57 s'),
+         (lambda: linked(True, 'aura', (16, 9), 'abd;cbd', (1, 1.5, 1.15)), 'Focus in shades',
+          'Highlight anything, and every panel follows, live in interactive SVG'),
+         ('themes', 'One SVG, both themes', "It follows the reader's light or dark mode"),
+         ('print', 'Ready for print', 'PDF/X-4 in CMYK, separated for the press'),
+         ('open', 'Figures that remember', 'Every file carries its source: reopen it in any palette')]
+# (start, end, scene, entry) in seconds, where each scene comes in over the last for FADE seconds, by a fade, or by an
+# iris where a dark page meets a light one, which a fade would pass through gray; so each scene ends FADE seconds after
+# the next one starts
+FADE = 0.4
+SCRIPT = [(0.0, 5.0, word_scene('aura-dark', ('a1', ), 3.0, TAGLINE, 3.2), None), (4.6, 8.2, box_scene, 'iris'),
+          (7.8, 14.4, wall_scene, 'fade'), (14.0, 18.0, erupt_scene, 'iris'), (17.6, 20.6, crowd_scene, 'fade'),
+          (20.2, 23.2, morph_scene, 'fade'), (22.8, 36.2, cards_scene, 'fade'),
+          (35.8, 40.6, word_scene('poster', ('a1', 'b1'), 2.0, 'pip install viscose', 2.3), 'fade')]
+# Morph starts this many seconds into its scene
+MORPH_LEAD = 0.5
+
+
+def trailer_frames():
+    """Each frame of the trailer as layers [(key, how)] blended in order, `how` None for the first and otherwise
+    ('fade', share), ('wipe', share), or ('iris', share)."""
+    frames = []
+    for i in range(round(SCRIPT[-1][1] * FPS)):
+        s, layers = i / FPS, []
+        for start, end, scene, entry in SCRIPT:
+            if start <= s < end:
+                own = scene(s - start, s)
+                if layers:
+                    own[0] = (own[0][0], (entry, float(ease((s - start) / FADE))))
+                layers += own
+        frames.append(layers)
+    return frames
+
+
+def compose(layers, images):
+    """One frame from its layers' pixels."""
+    h, w = SIZE[1], SIZE[0]
+    yy, xx = np.mgrid[0:h, 0:w] / h
+    out = None
+    for key, how in layers:
+        img = images[key].astype(np.float32)
+        if how is None:
+            out = img
+            continue
+        kind, share = how
+        if kind == 'fade':
+            m = np.float32(share)
+        else:
+            # A soft edge, a fifth of the frame's height, sweeping diagonally or opening as a circle from the middle
+            d = (xx + .45 * yy) / (w / h + .45) if kind == 'wipe' else np.hypot(xx - w / h / 2, yy - .5) / 1.02
+            m = np.clip((share * 1.2 - d) / .2, 0, 1).astype(np.float32)[..., None]
+        out = out * (1 - m) + img * m
+    return np.round(out).astype(np.uint8)
+
+
+def morphed(tmp):
+    """PowerPoint's video of the README's colorectal N-glycans, a heatmap in sample order and then clustered, as
+    viscose writes them for Morph, keyed by frame from MORPH_LEAD seconds before the cells start to fly."""
+    figs = [f.suptitle('Clustered, then morphed', 'viscose writes PowerPoint, and Morph flies every cell to its place')
+            for f in talk()[-2:]]
+    vc.deck(figs, Path(tmp) / 'morph.pptx')
+    video = powerpoint_frames(Path(tmp) / 'morph.pptx', SIZE[1], FPS)
+    video = [f if f.shape[:2] == SIZE[::-1] else np.asarray(Image.fromarray(f).resize(SIZE, Image.LANCZOS))
+             for f in video]
+    moving = [k for k in range(5, len(video)) if np.abs(video[k].astype(np.int16) - video[0]).mean() > 0.5]
+    first = moving[0] - round(MORPH_LEAD * FPS)
+    return {('ppt', k): video[min(max(first + k, 0), len(video) - 1)] for k in range(len(video))}
+
+
+def trailer(name = 'trailer.mp4', bitrate = 8_000_000):
+    """The trailer, drawn on all but two cores, written by Media Foundation as H.264, and then encoded again at
+    `bitrate` by Windows' own transcoder, as OpenCV's writer has a fixed and very high one."""
+    import cv2
+    frames = trailer_frames()
+    keys, last = {}, {}
+    for i, layers in enumerate(frames):
+        for key, _ in layers:
+            keys.setdefault(key, i)
+            last[key] = i
+    print(len(frames), 'frames from', len(keys), 'stills')
+    workers = max(1, (os.cpu_count() or 4) - 2)
+    with tempfile.TemporaryDirectory() as tmp, ProcessPoolExecutor(workers) as pool:
+        images = morphed(tmp)
+        raw = str(Path(tmp) / 'raw.mp4')
+        writer = cv2.VideoWriter(raw, cv2.CAP_MSMF, cv2.VideoWriter_fourcc(*'H264'), FPS, SIZE)
+        order, futures = iter(k for k in keys if k[0] != 'ppt'), {}
+        for i, layers in enumerate(frames):
+            # Stills are drawn ahead in the order frames first need them, and dropped once no frame needs them
+            while len(futures) < 3 * workers and (key := next(order, None)) is not None:
+                futures[key] = pool.submit(still, key)
+            for key, _ in layers:
+                if key not in images:
+                    images[key] = futures.pop(key).result()
+            writer.write(np.ascontiguousarray(compose(layers, images)[..., ::-1]))
+            for key, _ in layers:
+                if last[key] == i:
+                    images.pop(key, None)
+            if i % 60 == 0:
+                print('frame', i, flush = True)
+        writer.release()
+        subprocess.run(['powershell', '-NoProfile', '-Command', TRANSCODE.format(src = raw, out = OUT.resolve() / name,
+                                                                                  bitrate = bitrate)], check = True)
+    print(name, (OUT / name).stat().st_size // 1024, 'kB')
+
+
+# Windows' MediaTranscoder through PowerShell, which reaches WinRT without any package
+TRANSCODE = """
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$m = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and
+    $_.GetParameters().Count -eq 1 }}
+$op = ($m | Where-Object {{ $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }})[0]
+$act = ($m | Where-Object {{ $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncActionWithProgress`1' }})[0]
+function Await($o, [Type]$t) {{
+    $k = $op.MakeGenericMethod($t).Invoke($null, @($o)); $k.Wait(-1) | Out-Null; $k.Result }}
+function WinRT($name, $space) {{ [Type]::GetType("Windows.$space.$name, Windows.$space, ContentType=WindowsRuntime") }}
+$file, $folder = (WinRT 'StorageFile' 'Storage'), (WinRT 'StorageFolder' 'Storage')
+$coder, $ready = (WinRT 'MediaTranscoder' 'Media.Transcoding'), (WinRT 'PrepareTranscodeResult' 'Media.Transcoding')
+$encoding = WinRT 'MediaEncodingProfile' 'Media.MediaProperties'
+$src = Await ($file::GetFileFromPathAsync('{src}')) $file
+$dir = Await ($folder::GetFolderFromPathAsync((Split-Path '{out}'))) $folder
+$dst = Await ($dir.CreateFileAsync((Split-Path '{out}' -Leaf), 'ReplaceExisting')) $file
+$profile = $encoding::CreateMp4('HD1080p')
+$profile.Video.Bitrate = {bitrate}
+$profile.Audio = $null
+$transcoder = New-Object $coder
+$prep = Await ($transcoder.PrepareFileTranscodeAsync($src, $dst, $profile)) $ready
+if (-not $prep.CanTranscode) {{ throw "Cannot transcode: $($prep.FailureReason)" }}
+$act.MakeGenericMethod([double]).Invoke($null, @($prep.TranscodeAsync())).Wait(-1) | Out-Null
+"""
+
+
 if __name__ == '__main__':
     OUT.mkdir(exist_ok = True)
+    if sys.argv[1:] == ['trailer']:
+        trailer()
+        sys.exit()
     # Real data as a talk, which the README links to as a deck and shows as PowerPoint plays it
     vc.deck(talk(), OUT / 'talk.pptx')
     morph_video(OUT / 'talk.pptx', 'talk.webp')

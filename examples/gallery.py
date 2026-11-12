@@ -5,7 +5,7 @@ import numpy as np
 import viscose as vc
 
 
-def volcano(palette):
+def volcano(palette, figsize = (8.0, 8.0)):
     rng = np.random.default_rng(1729)
     x = np.clip(rng.normal(0, 1.3, 412), -4.6, 4.6)
     y = 0.72 * np.abs(x) ** 1.75 * rng.uniform(.8, 1.05, 412) + rng.exponential(0.42, 412)
@@ -13,7 +13,7 @@ def volcano(palette):
             (2.7, 10.4, 'Neu5Ac(a2-3)Gal(b1-3)GalNAc'), (-2.4, 9.4, 'GlcNAc(b1-2)Man(a1-3)Man'),
             (3.7, 8.4, 'Fuc(a1-3)[Gal(b1-4)]GlcNAc'), (-3.6, 7.4, 'Man(a1-2)Man(a1-3)Man'),
             (3.1, 6.5, 'GalNAc(b1-4)Gal(b1-4)Glc'), (-2.9, 5.6, 'Fuc(a1-2)Gal(b1-3)GalNAc')]
-    fig, ax = vc.subplots(palette = palette)
+    fig, ax = vc.subplots(figsize = figsize, palette = palette)
     fig.suptitle('Differential abundance', 'Tumor vs. healthy tissue, 412 glycans')
     sig = (np.abs(x) > 1) & (y > 2)
     ax.scatter(x[~sig], y[~sig], s = 22, color = 'a3', z = 2)
@@ -34,7 +34,7 @@ def volcano(palette):
     return fig
 
 
-def heatmap(palette):
+def heatmap(palette, figsize = (8.0, 8.0)):
     rng = np.random.default_rng(42)
     samples = [f'{t} {i + 1}' for t in ['Liver', 'Colon', 'Brain', 'Serum'] for i in range(4)]
     glycans = ['Man(a1-2)Man(a1-3)Man', 'Man(a1-3)[Man(a1-6)]Man', 'GlcNAc(b1-2)Man', 'Gal(b1-4)GlcNAc',
@@ -49,32 +49,37 @@ def heatmap(palette):
         m[r, g * 4:g * 4 + 4] += rng.uniform(1.4, 2.5)
         m[r, ((g + 2) % 4) * 4:((g + 2) % 4) * 4 + 4] -= rng.uniform(0.6, 1.5)
     m = (m - m.mean(1, keepdims = True)) / m.std(1, keepdims = True)
-    fig, _ = vc.clustermap(m, samples, glycans, palette = palette, title = 'Glycan abundance by tissue',
-                           subtitle = 'z-scores, 26 glycans across 16 samples')
+    fig, _ = vc.clustermap(m, samples, glycans, figsize = figsize, palette = palette,
+                           title = 'Glycan abundance by tissue', subtitle = 'z-scores, 26 glycans across 16 samples')
     return fig
 
 
-def ridges(palette):
+def ridges(palette, flow = 0.0, figsize = (8.0, 8.0)):
+    """`flow` in seconds sets the peaks drifting, each ridge on its own phase, which the trailer animates."""
     x = np.linspace(0, 100, 500)
     names = ['Serum', 'Liver', 'Kidney', 'Lung', 'Colon', 'Spleen', 'Skin', 'Brain']
     params = [(18, 7, 44, 12, .7), (24, 8, 52, 9, .55), (30, 9, 58, 8, .6), (35, 8, 66, 10, .55),
               (42, 10, 72, 7, .6), (48, 8, 68, 11, .5), (55, 9, 80, 6, .6), (64, 7, 88, 5, .55)]
+    if flow:
+        drift = [np.sin(2.2 * flow + k) - np.sin(k) for k in range(8)]
+        params = [(a + 5 * d, s, b - 6 * d, t * (1 + .15 * d), w + .12 * d) for (a, s, b, t, w), d in
+                  zip(params, drift)]
     ys = [w * np.exp(-.5 * ((x - a) / s) ** 2) / s + (1 - w) * np.exp(-.5 * ((x - b) / t) ** 2) / t for a, s, b, t,
           w in params]
-    fig, ax = vc.subplots(palette = palette)
+    fig, ax = vc.subplots(figsize = figsize, palette = palette)
     fig.suptitle('Sialylation across tissues', 'Per-glycan distribution')
     ax.ridgeline(x, ys, names)
     ax.set_xlabel('Sialylated glycans (%)')
     return fig
 
 
-def spectrum(palette):
+def spectrum(palette, figsize = (8.0, 8.0)):
     rng = np.random.default_rng(7)
     ann = [(222.10, 34, 'Y1'), (290.09, 100, 'B1'), (308.10, 46, 'C1'), (384.15, 28, 'Y2'), (452.14, 22, 'B2'),
            (470.15, 38, 'C2'), (513.19, 54, 'Y2β'), (675.24, 82, 'Y3'), (966.34, 63, '[M-H]-')]
     amz, ait = np.array([a[0] for a in ann]), np.array([a[1] for a in ann], float)
     lib = ait * rng.uniform(.8, 1.15, len(ann))
-    fig, ax = vc.subplots(palette = palette)
+    fig, ax = vc.subplots(figsize = figsize, palette = palette)
     fig.suptitle('MS/MS of disialyl core 1', 'Negative mode, precursor m/z 966.34')
     ax.stem(rng.uniform(190, 1000, 150), rng.exponential(3.2, 150) + .6, color = 'a3', lw = 1.0, z = 2)
     ax.stem(rng.uniform(190, 1000, 28), -(rng.exponential(2.5, 28) + .5), color = 'b3', lw = 1.0, z = 2)
@@ -93,11 +98,11 @@ def spectrum(palette):
     return fig
 
 
-def stacked(palette):
+def stacked(palette, figsize = (8.0, 8.0)):
     rng = np.random.default_rng(11)
     names = ['Colon', 'Liver', 'Lung', 'Serum', 'Kidney', 'Skin', 'Spleen', 'Brain']
     vals = rng.dirichlet([2.2, 3.5, 1.1, 2.4, 1.4], 8) * 100
-    fig, ax = vc.subplots(palette = palette)
+    fig, ax = vc.subplots(figsize = figsize, palette = palette)
     fig.suptitle('Glycan classes across tissues', 'Share of each class, by tissue')
     ax.stacked_bar(names, vals, ['High-mannose', 'Complex', 'Hybrid', 'O-linked', 'Lipid-linked'],
                    colors = fig.pal.groups(3, 2))
@@ -108,18 +113,23 @@ def stacked(palette):
     return fig
 
 
-def embedding(palette):
+def embedding(palette, turn = 0.0, figsize = (8.0, 8.0)):
+    """`turn` in radians spins the embedding about its vertical axis, its classes at depths of their own, which the
+    trailer animates."""
     rng = np.random.default_rng(2024)
     specs = [(-4.3, .7, 2.4, .5, 2.4, 1500), (4.9, 2.6, 1.8, 2.8, 1.7, 1000), (-3.3, -4.0, 2.0, 1.2, 2.0, 1100),
              (1.2, -1.3, 1.9, 4.0, 2.4, 1200), (5.0, -3.5, 1.5, 5.4, 1.6, 700), (.5, 5.9, 1.5, 3.6, 1.5, 500)]
     names = ['Complex N', 'High-mannose', 'Core 1 O', 'Core 2 O', 'Ganglio', 'Lewis']
-    fig, ax = vc.subplots(palette = palette)
+    fig, ax = vc.subplots(figsize = figsize, palette = palette)
     fig.suptitle('Structural embedding', '6,000 glycans by class')
-    pick = np.random.default_rng(8)
+    pick, deep = np.random.default_rng(8), np.random.default_rng(9)
     for (cx, cy, R, a0, span, n), name, c in zip(specs, names, fig.pal.groups(3, 3)):
         t = rng.uniform(a0, a0 + span, n)
         r = R + rng.normal(0, .23 * R ** .5, n)
         x, y = cx + r * np.cos(t) + rng.normal(0, .17, n), cy + r * np.sin(t) + rng.normal(0, .17, n)
+        if turn:
+            z = deep.uniform(-3, 3) + r * np.sin(t + 1) * .5 + deep.normal(0, .3, n)
+            x = x * np.cos(turn) + z * np.sin(turn)
         idx = pick.choice(n, min(650, n), replace = False)
         ax.scatter(x[idx], y[idx], s = 8, color = c)
         ax.text(np.median(x), np.percentile(y, 99.5) + .6, name, size = 11.5, bold = True, ha = 'center', halo = 3.0)
@@ -129,13 +139,13 @@ def embedding(palette):
     return fig
 
 
-def trial(palette):
+def trial(palette, figsize = (8.0, 8.0)):
     rng = np.random.default_rng(99)
     t = np.linspace(0, 48, 160)
     curves = {'Control': .08 + .05 * t / 48, 'Low dose': .1 + .42 * (1 - np.exp(-t / 22)), 'High dose': .1
               + .82 * (1 - np.exp(-t / 11))}
     times = np.array([0, 4, 8, 12, 24, 36, 48.])
-    fig, (a, b) = vc.subplots(1, 2, palette = palette, width_ratios = [2.9, 1.25])
+    fig, (a, b) = vc.subplots(1, 2, figsize = figsize, palette = palette, width_ratios = [2.9, 1.25])
     fig.suptitle('Response and benchmark', 'a, response over 48 h. b, score per method')
     a.set_title('a')
     b.set_title('b')
@@ -160,13 +170,13 @@ def trial(palette):
     return fig
 
 
-def groups(palette):
+def groups(palette, figsize = (10, 6)):
     rng = np.random.default_rng(31)
     stages = ['Healthy', 'Adenoma', 'Carcinoma', 'Metastasis']
     sialyl = {s: rng.normal(m, sd, n) for s, m, sd, n in zip(stages, (2.1, 2.7, 3.6, 4.4), (.5, .7, .8, .9),
                                                                 (28, 21, 34, 14))}
     fucose = {s: rng.gamma(k, .55, n) + 1 for s, k, n in zip(stages, (5.2, 4.4, 3.1, 2.6), (28, 21, 34, 14))}
-    fig, (a, b) = vc.subplots(1, 2, figsize = (10, 6), palette = palette, sharey = True)
+    fig, (a, b) = vc.subplots(1, 2, figsize = figsize, palette = palette, sharey = True)
     fig.suptitle('Glycan motifs by stage', '97 colorectal samples')
     a.boxplot(sialyl)
     a.bracket('Healthy', 'Adenoma', 0.003)
