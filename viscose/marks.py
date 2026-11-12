@@ -3,6 +3,7 @@ import math
 from io import BytesIO
 import numpy as np
 from glycorender import pdfwrite, raster
+from .palettes import mix, ramp
 
 
 KAPPA = 0.5522847498
@@ -38,6 +39,133 @@ SPRITE_PHASES, SPRITE_SIZES = 8, 4
 CELL = 8
 # A glowing line's strokes under it, as (width in line widths, alpha), from the bottom up
 GLOW = ((4.2, 0.06), (2.7, 0.1), (1.6, 0.2))
+# A scatter whose marks pile up this many deep somewhere, on average around a spot, gets a field in their place where
+# they lie CROWD_EDGE deep or more, in CROWD_BANDS bands of its hue's shades, one hairline of the page CROWD_GAP points
+# wide apart. Depth is counted on a grid of CROWD_CELL points and spread over CROWD_SPREAD mark radii, or CROWD_SMOOTH
+# points at least, which keeps the bands' edges smooth where the marks are few enough to count
+CROWD, CROWD_EDGE, CROWD_BANDS, CROWD_GAP = 4.0, 1.2, 5, 0.5
+CROWD_CELL, CROWD_SPREAD, CROWD_SMOOTH = 1.0, 4.0, 3.0
+
+
+def isolines(m, level):
+    """Where a grid crosses a level, by marching squares: one (columns, rows) pair of arrays per stretch, in grid units
+    between cell centers, open stretches first, then loops. Each grid edge the level crosses holds one point, where a
+    straight line between its ends says, and a saddle's center says which corners stay joined."""
+    known, above = np.isfinite(m), m >= level
+    across = (above[:, :-1] != above[:, 1:]) & known[:, :-1] & known[:, 1:]
+    up = (above[:-1] != above[1:]) & known[:-1] & known[1:]
+    spots = {}
+    for r, j in np.argwhere(across):
+        spots['h', r, j] = j + (level - m[r, j]) / (m[r, j + 1] - m[r, j]), r
+    for r, j in np.argwhere(up):
+        spots['v', r, j] = j, r + (level - m[r, j]) / (m[r + 1, j] - m[r, j])
+    links = {k: [] for k in spots}
+    for r, j in np.argwhere(across[:-1] | across[1:] | up[:, :-1] | up[:, 1:]):
+        low, high, left, right = ('h', r, j), ('h', r + 1, j), ('v', r, j), ('v', r, j + 1)
+        ends = [k for k in (low, high, left, right) if k in spots]
+        if len(ends) == 2:
+            pairs = [ends]
+        elif len(ends) == 4:
+            center = m[r:r + 2, j:j + 2].mean() >= level
+            pairs = [(low, right), (left, high)] if above[r, j] == center else [(left, low), (high, right)]
+        else:
+            continue
+        for a, b in pairs:
+            links[a].append(b)
+            links[b].append(a)
+    lines = []
+    for start in [k for k, v in links.items() if len(v) == 1] + list(links):
+        if not links[start]:
+            continue
+        chain, at = [start], start
+        while links[at]:
+            step = links[at].pop()
+            links[step].remove(at)
+            chain.append(step)
+            at = step
+        lines.append(tuple(np.array(v, dtype = float) for v in zip(*[spots[k] for k in chain])))
+    return lines
+
+
+def _upscale(plane, h, w, box):
+    """The (y0, y1, x0, x1) window of a bilinear resize to (h, w) of one channel, for a layer so soft that its
+    full-resolution detail would be wasted. Plane by plane, whose long inner loops run several times faster, and columns
+    first, on only the rows of the small grid that the window reaches, so that the large one only gathers whole rows."""
+    spots = []
+    for axis, n, lo, hi in ((0, h, box[0], box[1]), (1, w, box[2], box[3])):
+        u = np.clip((np.arange(lo, hi) + 0.5) * plane.shape[axis] / n - 0.5, 0.0, plane.shape[axis] - 1.0)
+        i = np.minimum(u.astype(int), plane.shape[axis] - 2)
+        spots.append((i, (u - i).astype(np.float32)))
+    (ri, rt), (ci, ct) = spots
+    plane = plane[ri[0]:ri[-1] + 2]
+    plane = np.take(plane, ci, axis = 1) * (1 - ct) + np.take(plane, ci + 1, axis = 1) * ct
+    return plane[ri - ri[0]] * (1 - rt)[:, None] + plane[ri - ri[0] + 1] * rt[:, None]
+
+
+def tones(pal, rgb):
+    """A color's field scale, from faint to strong against the page: its hue's four shades where it is one of the
+    palette's, else mixes towards the page and away from it."""
+    for hue in (pal.a, pal.b):
+        shades = [pal.color(s) for s in hue]
+        if any(np.allclose(s, rgb, atol = 1e-3) for s in shades):
+            return shades[::-1]
+    away = (1.0,) * 3 if pal.is_dark else (0.0,) * 3
+    return [mix(rgb, 0.3, pal.color('paper')), mix(rgb, 0.65, pal.color('paper')), tuple(rgb), mix(rgb, 0.6, away)]
+
+
+def crowd(pal, parts, box):
+    """Where a scatter's marks pile up past telling them apart. `parts` are (xs, ys, radii, rgb) per color in page
+    points, and `box` the (x, y, width, height) they may reach. Gives per part its bands, or None where its marks never
+    pile up CROWD deep, and which of its marks stay drawn: those outside the field. Depth is the marks' area per cell,
+    spread over CROWD_SPREAD mark radii, so that a depth of one covers the page once. The field holds what lies
+    CROWD_EDGE deep or more, cut into CROWD_BANDS bands on a log scale up to nearly the deepest, each the outline of
+    where the depth reaches its level, as (color, outlines in page points), from the faintest of its hue's shades
+    outside to the strongest at the core, so that dense data read as a map of its density and sparse data as points."""
+    bx, by, bw, bh = box
+    gw, gh = max(2, int(math.ceil(bw / CROWD_CELL))), max(2, int(math.ceil(bh / CROWD_CELL)))
+    out = []
+    for xs, ys, rs, rgb in parts:
+        rs = np.broadcast_to(np.asarray(rs, dtype = float), np.shape(xs))
+        if not len(xs):
+            out.append((None, np.ones(0, bool)))
+            continue
+        ix = np.clip(((xs - bx) / CROWD_CELL).astype(int), 0, gw - 1)
+        iy = np.clip(((by + bh - ys) / CROWD_CELL).astype(int), 0, gh - 1)
+        depth = np.bincount(iy * gw + ix, weights = math.pi * rs * rs / CROWD_CELL ** 2,
+                            minlength = gw * gh).reshape(gh, gw).astype(np.float32)
+        depth = raster._box_blur(depth, max(CROWD_SMOOTH, CROWD_SPREAD * float(np.median(rs))) / CROWD_CELL)
+        if depth.max() < CROWD:
+            out.append((None, np.ones(len(xs), bool)))
+            continue
+        # Band levels from the edge to nearly the deepest, so that the strongest band holds a core, not a speck
+        top = max(float(np.percentile(depth[depth >= CROWD_EDGE], 99.5)), CROWD_EDGE * 1.5)
+        level = np.log(np.maximum(depth, 1e-9) / CROWD_EDGE) / math.log(top / CROWD_EDGE) * CROWD_BANDS
+        # Bordered below the edge, so that every outline closes on itself
+        grid = np.pad(level, 1, constant_values = -1.0)
+        shades = ramp(tones(pal, rgb), (np.arange(CROWD_BANDS) + 0.5) / CROWD_BANDS)
+        bands = [(tuple(float(v) for v in shades[k]),
+                  [(bx + (u - 0.5) * CROWD_CELL, by + bh - (v - 0.5) * CROWD_CELL) for u, v in isolines(grid, k)])
+                 for k in range(CROWD_BANDS)]
+        out.append(([b for b in bands if b[1]], level[iy, ix] < 0.0))
+    return out
+
+
+def crowd_op(c, pal, bands):
+    """A field's bands from `crowd`, from the edge in, each filled in its shade and outlined by a hairline of the page,
+    so that the bands lie apart as the palette's marks and cells do. Outlines fill by the even-odd rule, as a band's
+    holes are outlines of their own."""
+    for rgb, outlines in bands:
+        p = c.beginPath()
+        for xs, ys in outlines:
+            p.moveTo(xs[0], ys[0])
+            for x, y in zip(xs[1:], ys[1:]):
+                p.lineTo(x, y)
+            p.close()
+        c.saveState()
+        _style(c, rgb, 1.0, pal.color('paper'), CROWD_GAP * pal.spacing, 1.0, join = 1)
+        c.state['even_odd'] = True
+        c.drawPath(p, fill = 1, stroke = 1)
+        c.restoreState()
 
 
 def _style(c, rgb = None, alpha = 1.0, stroke = None, lw = None, stroke_alpha = 1.0, cap = 0, join = 0, dash = None):

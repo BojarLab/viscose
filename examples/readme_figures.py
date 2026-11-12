@@ -148,6 +148,18 @@ def markers():
     return fig
 
 
+def crowd(density):
+    """100,000 cells from two populations, as points alone or with the field that takes over where they pile up."""
+    rng = np.random.default_rng(3)
+    a = rng.normal(0, 1, (50000, 2)) @ [[1, .6], [0, .8]]
+    b = rng.normal(0, .5, (50000, 2)) + [2.5, -1.5]
+    fig, ax = vc.subplots(figsize = (6, 5), palette = 'poster')
+    fig.suptitle('100,000 cells', 'Where points pile up, their density' if density else 'Every point')
+    ax.scatter(*np.vstack([a, b]).T, s = 12, density = density)
+    ax.set(xlabel = 'UMAP 1', ylabel = 'UMAP 2')
+    return fig
+
+
 if __name__ == '__main__':
     OUT.mkdir(exist_ok = True)
     names = list(vc.palettes)
@@ -167,6 +179,7 @@ if __name__ == '__main__':
     arrange([[fit(Image.open(BytesIO(gallery.subgroups('couture').to_png(200))).convert('RGB'), 1400, 840)]],
             'subgroups.png')
     arrange([[tile(gallery.heatmap('aura'), 1100)]], 'clustermap.png')
+    arrange([[tile(crowd(False), 900), tile(crowd(True), 900)]], 'crowd.png')
     arrange([[tile(figures[k](p + '-dark'), 640) for k, p in zip(('trial', 'volcano', 'stacked', 'embedding'), names)]],
             'dark.png')
     for path in sorted(OUT.glob('*.png')):

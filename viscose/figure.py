@@ -1,19 +1,29 @@
 """Figure: lays out axes, draws through glycorender's display list and writes PNG, PDF, or SVG."""
+import base64
 import builtins
 import functools
+import importlib
+import json
 import math
+import numbers
 import os
+import re
+import struct
 import subprocess
 import sys
 import tempfile
+import warnings
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
+from dataclasses import fields, replace
 import numpy as np
 from glycorender import pdfwrite, raster
 from . import marks, text
 from .axes import Axes, LABEL_MIN
-from .palettes import get_palette
+from .palettes import (AURA, COUTURE, CVD_MIN, LC_LARGE, LC_MARK, LC_TEXT, LUMEN, POSTER, Palette, _from_oklch, _hex,
+                       _named, _oklab, _oklch, apart, apca, get_palette, legible, press as _press)
 
 
 # Shadow offset and blur in points; a blur cannot stay vector, so the PDF and SVG carry it as an image at this
@@ -33,6 +43,19 @@ METRICS = ('euclidean', 'sqeuclidean', 'cityblock', 'chebyshev', 'cosine', 'corr
 MINPLUS_BLOCK = 1 << 16
 # Points per unit of a page's size, and of a position given in millimeters from a page's top left
 UNITS = {'in': 72.0, 'mm': 72.0 / 25.4}
+# Marks whose colors carry data, which APCA's floor for what must be discernible applies to; guides, such as grid lines,
+# spans, and reference lines, recede on purpose, and translucent marks are pale on purpose
+LEVELS = ('points', 'line', 'stems', 'vsegs', 'hsegs', 'bars', 'box', 'violin')
+# Palettes made legible by Figure._legible, by id of the palette, each kept with it so that the id stays its own
+_legibles = {}
+# A figure's source, the calls and data that drew it, travels in its own file as JSON in this format, under this name
+# and type: in a PDF as an attachment, in an SVG as base64 in a <metadata>, and in a PNG as a chunk of this type. Arrays
+# up to SOURCE_JSON values are JSON numbers, which deflate as tightly as bytes on real data; larger ones follow the JSON
+# as bytes, since JSON takes a second per 200,000 floats. A source past SOURCE_FLOOR bytes, deflated, that is larger
+# than the rest of its file stays out unless asked for
+SOURCE_FORMAT, SOURCE_NAME, SOURCE_MIME, SOURCE_CHUNK = 1, 'figure-source.json', 'application/vnd.viscose+json', b'vcSc'
+SOURCE_JSON, SOURCE_FLOOR = 10000, 1 << 16
+SOURCE_ABOUT = 'The calls and data that drew this figure, which viscose.open brings back as a figure'
 
 
 def show_png(png, viewer = True):
@@ -83,27 +106,12 @@ def _shadow_layer(ops, width, height, dpi, strength):
     return np.dstack([np.clip(rgb, 0, 1), np.clip(out_a, 0, 1)])
 
 
-def _upscale(plane, h, w, box):
-    """The (y0, y1, x0, x1) window of a bilinear resize to (h, w) of one channel, for a shadow so soft that its
-    full-resolution detail would be wasted. Plane by plane, whose long inner loops run several times faster, and columns
-    first, on only the rows of the small grid that the window reaches, so that the large one only gathers whole rows."""
-    spots = []
-    for axis, n, lo, hi in ((0, h, box[0], box[1]), (1, w, box[2], box[3])):
-        u = np.clip((np.arange(lo, hi) + 0.5) * plane.shape[axis] / n - 0.5, 0.0, plane.shape[axis] - 1.0)
-        i = np.minimum(u.astype(int), plane.shape[axis] - 2)
-        spots.append((i, (u - i).astype(np.float32)))
-    (ri, rt), (ci, ct) = spots
-    plane = plane[ri[0]:ri[-1] + 2]
-    plane = np.take(plane, ci, axis = 1) * (1 - ct) + np.take(plane, ci + 1, axis = 1) * ct
-    return plane[ri - ri[0]] * (1 - rt)[:, None] + plane[ri - ri[0] + 1] * rt[:, None]
-
-
 def _path_data(segments):
     return ''.join('Z' if s[0] == 'h' else {'m': 'M', 'l': 'L', 'c': 'C'}[s[0]]
                    + ' '.join('%.2f' % v for v in s[1:]) for s in segments)
 
 
-def _hex(rgb):
+def _css(rgb):
     return '#%02X%02X%02X' % tuple(max(0, min(255, int(round(v * 255)))) for v in rgb)
 
 
@@ -123,10 +131,10 @@ def _label_groups(c, ops, height):
                 segments = op['path']
                 paths.append('<path d="%s" fill="none" stroke="%s" stroke-width="%.2f" stroke-linecap="round" '
                              'stroke-linejoin="round" />'
-                             % (_path_data(segments), _hex(op['stroke_rgb']), op['line_width']))
+                             % (_path_data(segments), _css(op['stroke_rgb']), op['line_width']))
             else:
                 segments = text.outline(c, op['ttf'], op['text'], op['x'], op['y'], op['size']).ops
-                paths.append('<path d="%s" fill="%s" />' % (_path_data(segments), _hex(op['fill_rgb'])))
+                paths.append('<path d="%s" fill="%s" />' % (_path_data(segments), _css(op['fill_rgb'])))
             right = max([right] + [x for s in segments for x in s[1::2]])
         comment = '<!-- %s -->\n' % key[2] if '--' not in key[2] else ''
         out.append('%s<g transform="translate(%.2f %.2f) matrix(%.6g %.6g %.6g %.6g 0 0)" data-right="%.2f">%s</g>'
@@ -173,6 +181,162 @@ def _unit(unit, allowed):
     return unit
 
 
+def _encode(v, ctx):
+    """An argument of a plot call as JSON: numbers, text, lists, and dicts with text keys as they are, everything else
+    as a dict tagged by a key that starts with '$'. Arrays of numbers go into ctx's table once each, by content. Raises
+    TypeError for what has no such form."""
+    enc = lambda u: _encode(u, ctx)
+    if v is None or isinstance(v, str):
+        return v
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, numbers.Integral):
+        return int(v)
+    if isinstance(v, numbers.Real):
+        return float(v) if math.isfinite(v) else {'$f': repr(float(v))}
+    if isinstance(v, Axes):
+        return {'$ax': ctx['axes'][id(v)]}
+    if isinstance(v, tuple):
+        return {'$t': [enc(u) for u in v]}
+    if isinstance(v, list):
+        return [enc(u) for u in v]
+    if isinstance(v, range):
+        return {'$range': [v.start, v.stop, v.step]}
+    if isinstance(v, dict):
+        if all(isinstance(k, str) and k[:1] != '$' for k in v):
+            return {k: enc(u) for k, u in v.items()}
+        return {'$d': [[enc(k), enc(u)] for k, u in v.items()]}
+    if isinstance(v, Palette):
+        return {'$pal': v.name}
+    kind = type(v).__name__
+    if type(v).__module__.startswith('pandas') and kind in ('Series', 'DataFrame', 'Index', 'RangeIndex',
+                                                              'Categorical'):
+        # A default index, 0 to n - 1, goes without saying
+        plain = lambda index: (type(index).__name__ == 'RangeIndex' and index.start == 0 and index.step == 1)
+        if kind == 'DataFrame':
+            out = {'$frame': [[enc(c), enc(v[c].reset_index(drop = True))] for c in v.columns]}
+            return out if plain(v.index) else {**out, 'index': enc(v.index)}
+        if kind in ('Index', 'RangeIndex'):
+            return {'$index': enc(np.asarray(v)), 'name': enc(v.name)}
+        cat = v if kind == 'Categorical' else v.cat if str(v.dtype) == 'category' else None
+        out = {'$series' if kind == 'Series' else '$categorical': enc(np.asarray(v, dtype = object) if cat is not None
+                                                                     else v.to_numpy())}
+        if cat is not None:
+            out.update(categories = enc(list(cat.categories)), ordered = bool(cat.ordered))
+        if kind == 'Series':
+            out['name'] = enc(v.name)
+            if not plain(v.index):
+                out['index'] = enc(v.index)
+        return out
+    if isinstance(v, np.ndarray):
+        if v.dtype.kind in 'OUS':
+            return {'$o': [enc(u) for u in v.ravel().tolist()], 'dtype': v.dtype.str, 'shape': list(v.shape)}
+        if v.dtype.kind not in 'biuf':
+            raise TypeError(f'it holds an array of {v.dtype}')
+        key = (v.dtype.str, v.shape, v.tobytes())
+        if key not in ctx['seen']:
+            ctx['seen'][key] = len(ctx['arrays'])
+            entry = {'dtype': v.dtype.str, 'shape': list(v.shape)}
+            if v.size <= SOURCE_JSON:
+                values = v.ravel().tolist()
+                if v.dtype.kind == 'f' and not np.isfinite(v).all():
+                    values = [None if u != u else repr(u) if u in (math.inf, -math.inf) else u for u in values]
+                entry['values'] = values
+            else:
+                # The smallest type that holds every value exactly, its bytes grouped by significance, which deflates
+                # floats far better than bytes in their order
+                store = v.dtype
+                if v.dtype.kind == 'b':
+                    store = np.dtype('u1')
+                elif v.dtype.kind in 'iu':
+                    lo, hi = int(v.min()), int(v.max())
+                    store = next((np.dtype(t) for t in ('i1', 'i2', 'i4', 'i8') if np.iinfo(t).min <= lo and
+                                  hi <= np.iinfo(t).max), v.dtype)
+                elif v.dtype.itemsize == 8:
+                    with np.errstate(over = 'ignore'):
+                        store = np.dtype('f4') if np.array_equal(v.astype('f4'), v, equal_nan = True) else v.dtype
+                store = store.newbyteorder('<')
+                raw = np.frombuffer(v.astype(store).tobytes(), np.uint8).reshape(-1, store.itemsize).T.tobytes()
+                entry.update(store = store.str, offset = sum(map(len, ctx['tail'])), length = len(raw))
+                ctx['tail'].append(raw)
+            ctx['arrays'].append(entry)
+        return {'$a': ctx['seen'][key]}
+    if callable(v):
+        return {'$fn': f"{getattr(v, '__module__', None)}.{getattr(v, '__qualname__', kind)}"}
+    raise TypeError(f'it cannot write a {type(v).__module__}.{kind}')
+
+
+def _decode(v, arrays, axes, functions):
+    """What _encode wrote, back as it was: arrays as their table holds them, and a function by its name in
+    `functions`, as a file names a function but never holds its code."""
+    dec = lambda u: _decode(u, arrays, axes, functions)
+    if isinstance(v, list):
+        return [dec(u) for u in v]
+    if not isinstance(v, dict):
+        return v
+    if '$a' in v:
+        return arrays[v['$a']]
+    if '$t' in v:
+        return tuple(dec(u) for u in v['$t'])
+    if '$d' in v:
+        # A key that was a tuple comes back as one, as JSON has only lists
+        return {dec(k): dec(u) for k, u in v['$d']}
+    if '$f' in v:
+        return float(v['$f'])
+    if '$range' in v:
+        return range(*v['$range'])
+    if '$ax' in v:
+        return axes[v['$ax']]
+    if '$pal' in v:
+        return v['$pal']
+    if '$o' in v:
+        values = [dec(u) for u in v['$o']]
+        if np.dtype(v['dtype']).kind != 'O':
+            return np.array(values, dtype = v['dtype']).reshape(v['shape'])
+        # Element by element, as np.array would turn a list of lists into more dimensions
+        out = np.empty(len(values), dtype = object)
+        out[:] = values
+        return out.reshape(v['shape'])
+    if '$fn' in v:
+        name = v['$fn']
+        for key in (name, name.split('.')[-1]):
+            if key in (functions or {}):
+                return functions[key]
+        raise ValueError(f'The figure was drawn with the function {name}, which a file holds only by name; pass it '
+                         f"as open(..., functions = {{'{name.split('.')[-1]}': ...}})")
+    if any(k in v for k in ('$series', '$frame', '$index', '$categorical')):
+        pd = importlib.import_module('pandas')
+        index = dec(v['index']) if 'index' in v else None
+        if '$frame' in v:
+            frame = pd.DataFrame({dec(c): dec(s) for c, s in v['$frame']})
+            return frame if index is None else frame.set_axis(index)
+        if '$index' in v:
+            return pd.Index(dec(v['$index']), name = dec(v['name']))
+        values = dec(v.get('$series', v.get('$categorical')))
+        if 'categories' in v:
+            values = pd.Categorical(values, categories = dec(v['categories']), ordered = v['ordered'])
+        return values if '$categorical' in v else pd.Series(values, index = index, name = dec(v['name']))
+    return {k: dec(u) for k, u in v.items()}
+
+
+def _carried(made, force, size):
+    """The source a file takes, as (JSON with its tail, that deflated), from the future `made`, and why it stays out
+    if it does: it cannot be written, or, unless `force`, it is past SOURCE_FLOOR and larger than the file without it,
+    whose size `size` gives when asked."""
+    if made is None:
+        return None, None
+    try:
+        raw, packed = made.result()
+    except TypeError as e:
+        if force:
+            raise
+        return None, f"the figure's source stays out of the file, as {e}"
+    if not force and len(packed) > SOURCE_FLOOR and len(packed) > size():
+        return None, (f"the figure's source ({len(packed) / 1024:.0f} kB) is larger than the file and stays out of it; "
+                      'source = True keeps it')
+    return (raw, packed), None
+
+
 class Figure:
     def __init__(self, width = 8.0, height = 8.0, palette = None, unit = 'in'):
         """A figure of the given size, in inches or with unit = 'mm' in millimeters, as a journal gives its columns
@@ -186,6 +350,9 @@ class Figure:
         self._title, self._subtitle = '', ''
         self._grid, self._held = None, False
         self._texts = []
+        # Every text and mark meets APCA's contrast and every color of a plot stays apart for every reader, by shades
+        # adjusted where they fail, which `adjusted` lists as (was, is, why)
+        self.legible, self.adjusted = True, []
 
     def suptitle(self, title, subtitle = ''):
         """The figure's title in the palette's manner, with an optional line under it."""
@@ -198,7 +365,7 @@ class Figure:
         fig = Figure(palette = palette)
         fig._base, fig.width, fig.height = self._base, *self._base
         fig._title, fig._subtitle, fig._grid, fig._held = self._title, self._subtitle, self._grid, self._held
-        fig._texts = list(self._texts)
+        fig._texts, fig.legible = list(self._texts), self.legible
         twins, cats = {id(ax): Axes(fig, fig.pal) for ax in self.axes}, {}
         for ax in self.axes:
             twin = twins[id(ax)]
@@ -214,6 +381,49 @@ class Figure:
         if hasattr(self, 'row_order'):
             fig.row_order, fig.col_order = self.row_order, self.col_order
         return fig
+
+    def _source(self):
+        """The calls and data that drew the figure, as JSON followed by the bytes of large arrays, and all of that
+        deflated: what in_palette copies, with each Axes as its place in `axes` and the palette by name where it is a
+        shipped one or its dark version, else by its settings. Raises TypeError for an argument it cannot write."""
+        ctx = {'axes': {id(ax): i for i, ax in enumerate(self.axes)}, 'arrays': [], 'seen': {}, 'tail': []}
+        enc = lambda v: _encode(v, ctx)
+        calls = []
+        for ax, name, args, kwargs in self._calls:
+            # A table in long form keeps only the columns the call names, as a DataFrame may hold many more
+            named = [kwargs[k] for k in ('x', 'y', 'hue', 'names') if isinstance(kwargs.get(k), str)]
+            data = kwargs.get('data', args[0] if args else None)
+            if named and name in ('boxplot', 'stripplot', 'violinplot') and hasattr(data, 'columns') and all(
+                    k in data.columns for k in named):
+                data = data[list(dict.fromkeys(named))]
+                args, kwargs = ((data, *args[1:]), kwargs) if 'data' not in kwargs else (args, {**kwargs, 'data': data})
+            calls.append([ctx['axes'][id(ax)], name, enc(list(args)), enc(kwargs)])
+        # The palette as asked for, before Figure._legible fixed its text colors, which it does again on reopening
+        pal = next((was for was, made, _ in _legibles.values() if made is self.pal), self.pal)
+        shipped = {p.name: p for p in (LUMEN, COUTURE, POSTER, AURA)}
+        base = shipped.get(pal.name[:-5]) if pal.name.endswith('-dark') else None
+        palette = (pal.name if shipped.get(pal.name) == pal else {'dark': base.name, 'paper': pal.paper} if base and
+                   base.dark(pal.paper) == pal else {'settings': {f.name: enc(getattr(pal, f.name)) for f in
+                                                                   fields(Palette) if f.init}})
+        axes = [{'cell': enc(ax._cell), 'span': enc(ax._span), 'fixed': enc(ax._fixed), 'outer': enc(ax._outer),
+                 'share': {k: [ctx['axes'][id(other)] for other in group] for k, group in ax._share.items()},
+                 'cats': {k: next(i for i, other in enumerate(self.axes) if other._cats.get(k) is found)
+                          for k, found in ax._cats.items()},
+                 'align': {k: ctx['axes'][id(other)] for k, other in ax._align.items()}} for ax in self.axes]
+        head = {'viscose': getattr(sys.modules.get('viscose'), '__version__', None), 'format': SOURCE_FORMAT,
+                'about': SOURCE_ABOUT, 'palette': palette,
+                'figure': {'size': enc(self._base), 'title': self._title, 'subtitle': self._subtitle,
+                           'grid': enc(self._grid), 'held': self._held, 'texts': enc(self._texts),
+                           'legible': bool(self.legible)},
+                'axes': axes, 'calls': calls}
+        if hasattr(self, 'row_order'):
+            head['figure']['order'] = enc([list(map(int, self.row_order)), list(map(int, self.col_order))])
+        head['arrays'] = ctx['arrays']
+        # JSON escapes every line break inside it, so the first one ends it
+        raw = json.dumps(head, ensure_ascii = False, allow_nan = False, separators = (',', ':')).encode()
+        raw += b'\n' + b''.join(ctx['tail']) if ctx['tail'] else b''
+        # Level 1 packs a megabyte of floats 1% less tightly in half the time, and level 9 gains nothing over 6
+        return raw, zlib.compress(raw, 6 if len(raw) < 1 << 20 else 1)
 
     def add_axes(self, rect, unit = 'fraction'):
         """Axes whose plot area is a fixed rectangle: (left, bottom, width, height) in figure fractions, or with
@@ -276,6 +486,120 @@ class Figure:
             lifted = [ax._fit_brackets() for ax in self.axes]
             if not any([ax._fit_labels() for ax in self.axes]) and not any(lifted):
                 break
+        if self.legible:
+            self._legible()
+
+    def _legible(self):
+        """Every text and mark meets APCA's contrast for what it is against the page (LC_TEXT for text that is read,
+        LC_LARGE for large or heavy text, LC_MARK for marks that carry data), and colors of different hues that tell an
+        axes' data apart stay CVD_MIN apart for every reader, as normal vision and protanopia, deuteranopia, and
+        tritanopia see them; a hue's own shades differ in lightness, which all readers see. A color that fails takes the
+        nearest of its hue's shades that passes, by lightness, or else its own hue at most 0.2 lighter or darker with
+        most of its chroma, in every axes alike; colors from a scale, whose shades are data, and glyphs, which keep
+        their own, stay as they are. A color that passes is never touched, so a figure checks out the same each time it
+        is laid out, and a pale shade set on purpose stays as long as it can be seen."""
+        pal = self.pal
+        page = pal.color('paper')
+        # The palette's own text, of which the axis lines and guides keep the colors they had
+        if id(pal) not in _legibles:
+            texts = {'tick_color': (pal.tick_color or pal.muted, LC_TEXT), 'label_color': (pal.label_color or pal.ink,
+                     LC_TEXT), 'subtitle_color': (pal.subtitle_color or pal.muted, LC_TEXT), 'ink': (pal.ink, LC_TEXT),
+                     'title_color': (pal.title_color or pal.ink, LC_LARGE if pal.title_size >= 24 else LC_TEXT)}
+            fixed = {k: _css(legible(pal.color(c), page, target)) for k, (c, target) in texts.items()
+                     if apca(pal.color(c), page) < target}
+            _legibles[id(pal)] = (pal, replace(pal, **fixed) if fixed else pal,
+                                  [(_css(pal.color(texts[k][0])), v, 'contrast') for k, v in fixed.items()])
+        _, self.pal, notes = _legibles[id(pal)]
+        self.adjusted += [n for n in notes if n not in self.adjusted]
+        for ax in self.axes:
+            ax.pal = self.pal
+        swap = {}
+        hues = [[_hex(s) for s in hue] for hue in (pal.a, pal.b)]
+        # Which of the palette's hues a color is a shade of, if any; a hue's shades differ in lightness, which every
+        # reader sees, and are ordered so on purpose
+        hue = lambda rgb: next((i for i, h in enumerate(hues) if any(np.allclose(s, rgb, atol = 1e-3) for s in h)),
+                               None)
+        origin = {}
+        family = lambda rgb: hue(origin.get(rgb, rgb))
+        def best(rgb, target, others, taken, kin = ()):
+            # The least change in OKLab from the color as drawn that reaches the target, stays apart from the other
+            # hues' colors, keeps clear of the colors in `taken`, and keeps its place by lightness among the shades in
+            # `kin`, as two categories must never merge or trade places: its own hue at most 0.2 lighter or darker
+            # with most of its chroma, which keeps the palette's effects through Palette.shades, or another shade of
+            # its hue where that is nearer, so that a figure keeps the look it was drawn with
+            L, C, h = _oklch(rgb)
+            own = [] if hue(rgb) is None else [s for s in hues[hue(rgb)] if not np.allclose(s, rgb, atol = 1e-3)]
+            steps = [_hex(_from_oklch(L + k * 0.02, C, h)) for k in range(-10, 11) if k and 0 <= L + k * 0.02 <= 1]
+            near = lambda v: float(np.linalg.norm(_oklab(v) - _oklab(rgb)))
+            ranked = sorted([(near(v), v) for v in own] + [(near(v), v) for v in steps if _oklch(v)[1] >= 0.6 * C])
+            for d, cand in ranked:
+                lc = _oklch(cand)[0]
+                if (apca(cand, page) >= target and all(apart(cand, o) >= CVD_MIN for o in others)
+                        and all(np.linalg.norm(_oklab(cand) - _oklab(t)) >= 0.03 for t in taken)
+                        and all((lc - _oklch(t)[0]) * (L - _oklch(t)[0]) > 0 for t in kin)):
+                    return d, tuple(float(v) for v in cand)
+            return None
+        def move(rgb, cand, why):
+            swap[rgb] = cand
+            origin[cand] = rgb
+            self.adjusted.append((_css(rgb), _css(cand), why))
+        for ax in self.axes:
+            # Each color an axes shows, with what it must reach, and those that tell its data apart, in order
+            need, kinds = {}, []
+            for a in ax.artists:
+                if a['kind'] == 'text' and not a.get('glyph'):
+                    size, bold = a['size'] or ax.pal.tick_size, pal.text_bold if a['bold'] is None else a['bold']
+                    found, target = [a['rgb']], LC_LARGE if size >= 24 or bold and size >= 16 else LC_TEXT
+                elif a['kind'] in LEVELS and a.get('alpha', 1.0) >= 1.0 and not a.get('mapped'):
+                    found = a['rgb'] if isinstance(a['rgb'], list) else [a['rgb'] if a['rgb'] is not None else
+                                                                         (a.get('edge') or (None,))[0]]
+                    target = LC_MARK
+                    kinds += [tuple(float(v) for v in rgb) for rgb in found if rgb is not None]
+                else:
+                    continue
+                for rgb in found:
+                    if rgb is not None:
+                        key = tuple(float(v) for v in rgb)
+                        need[key] = max(need.get(key, 0.0), target)
+            # A mark keeps clear of the other marks; text may share a color with them
+            for rgb, target in need.items():
+                found = best(rgb, target, [], [swap.get(o, o) for o in kinds if o != rgb] if rgb in kinds else []) if (
+                    rgb not in swap and apca(rgb, page) < target) else None
+                if found:
+                    move(rgb, found[1], 'contrast')
+            kinds = list(dict.fromkeys(swap.get(rgb, rgb) for rgb in kinds))
+            apart_hues = lambda i, k: family(kinds[i]) is None or family(kinds[i]) != family(kinds[k])
+            # Only colors of different hues can run together for a reader; of a pair that does, whichever needs the
+            # smaller change moves
+            for j in range(1, len(kinds)):
+                for _ in range(len(kinds)):
+                    clash = [i for i in range(j) if apart_hues(i, j) and apart(kinds[i], kinds[j]) < CVD_MIN]
+                    if not clash:
+                        break
+                    options = []
+                    for k in [j] + clash:
+                        was = origin.get(kinds[k], kinds[k])
+                        found = best(was, need.get(was, LC_MARK), [kinds[i] for i in range(len(kinds))
+                                                                   if i != k and apart_hues(i, k)],
+                                     kinds[:k] + kinds[k + 1:], [kinds[i] for i in range(len(kinds))
+                                                                 if i != k and not apart_hues(i, k)])
+                        if found:
+                            options.append((found[0], k, was, found[1]))
+                    if not options:
+                        break
+                    _, k, was, cand = min(options)
+                    move(was, cand, 'color vision')
+                    kinds[k] = cand
+        if not swap:
+            return
+        recolor = lambda rgb: swap.get(tuple(float(v) for v in rgb), rgb) if rgb is not None else None
+        for ax in self.axes:
+            for a in ax.artists:
+                if isinstance(a.get('rgb'), (tuple, list)) and not a.get('mapped'):
+                    a['rgb'] = [recolor(v) for v in a['rgb']] if isinstance(a['rgb'], list) else recolor(a['rgb'])
+                if a.get('edge'):
+                    a['edge'] = (recolor(a['edge'][0]), a['edge'][1])
+            ax.legend_items = [(s, recolor(rgb), *rest) for s, rgb, *rest in ax.legend_items]
 
     def _place(self):
         """Rectangles for all axes. Labels that would take most of a cell, or run off the page, widen the figure instead
@@ -460,7 +784,7 @@ class Figure:
         def plane(job):
             k, r0 = job
             r1 = min(y1, r0 + step)
-            v = arr[r0:r1, x0:x1, k] if dpi <= SHADOW_DPI else _upscale(arr[..., k], h, w, (r0, r1, x0, x1))
+            v = arr[r0:r1, x0:x1, k] if dpi <= SHADOW_DPI else marks._upscale(arr[..., k], h, w, (r0, r1, x0, x1))
             v = np.multiply(v, 255.0, dtype = np.float32)
             v += 0.5
             np.take(BYTES, v.astype(np.uint8), out = out[k, r0 - y0:r1 - y0])
@@ -482,9 +806,19 @@ class Figure:
             return raster.render(c.ops, self.width, self.height, dpi / 72.0, dpi / 72.0, self.pal.color(background),
                                  under = shadow.result)
 
-    def to_png(self, dpi = 300.0, background = 'paper'):
-        """PNG bytes; background is any color, by default the palette's page, and None keeps the page transparent."""
-        return raster.encode_png(self._raster(dpi, background), (), (dpi, dpi))
+    def to_png(self, dpi = 300.0, background = 'paper', press = None):
+        """PNG bytes; background is any color, by default the palette's page, and None keeps the page transparent.
+        With a `press` (see to_pdf), a soft proof: the page as that press prints it, with its paper as white."""
+        page = self._raster(dpi, background)
+        if press:
+            # Each color once, as a page holds few beside its many pixels
+            flat = page[..., :3].reshape(-1, 3)
+            found, back = np.unique(flat[:, 0].astype(np.int32) << 16 | flat[:, 1].astype(np.int32) << 8 | flat[:, 2],
+                                    return_inverse = True)
+            proof = _press(press).printed(np.stack([found >> 16, found >> 8 & 255, found & 255], 1) / 255.0)
+            page[..., :3] = (np.clip(proof, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)[back.ravel()].reshape(
+                page.shape[:2] + (3,))
+        return raster.encode_png(page, (), (dpi, dpi))
 
     def to_rgba(self, dpi = 144.0, background = 'paper'):
         """The page as an array of shape (rows, columns, 4) of 8-bit RGBA, first row at the top, for showing it in a
@@ -499,12 +833,27 @@ class Figure:
         are not part of it. layout = False takes the page as `layout` last settled it."""
         return self._canvas(layout = layout).ops
 
-    def to_pdf(self):
-        """PDF bytes, with marks and text as vector; only a blurred shadow and very large heatmaps are images."""
+    def to_pdf(self, press = None):
+        """PDF bytes, with marks and text as vector; only a blurred shadow and very large heatmaps are images. With a
+        `press`, a PDF/X-4 for print in that press's CMYK, with its ICC profile as the output intent: True for U.S. web
+        offset on coated paper (CGATS TR 001, SWOP), or a printer's or a journal's own profile as a path or a Press.
+        Every color goes through Press.separate, so that one the press cannot print keeps its lightness and hue and
+        gives up only the chroma it must, rather than whatever a print shop's conversion would make of it."""
+        return self._pdf(press)[0]
+
+    def _pdf(self, press = None, made = None, force = False):
+        """PDF bytes as to_pdf makes them, carrying the source that the future `made` gives, if it comes (see
+        _carried), as an attachment, and why it stays out if it does."""
         target = BytesIO()
         op = self._shadow_op(SHADOW_DPI)
         c = self._canvas(marker_forms = True)
         c.target = target
+        if press:
+            ink = _press(press)
+            c.cmyk = ink.separate
+            c.pdfx = dict(profile = ink.icc(), condition = ink.condition, info = ink.info, registry = ink.registry,
+                          title = ''.join(t for t, _, _ in text.runs(self._title.split('\n')[0])) or 'Figure',
+                          creator = 'viscose')
         if op is not None:
             c.ops.insert(0, op)
         # A PDF's page is white unless something covers it
@@ -512,8 +861,22 @@ class Figure:
             marks.polygon(c, [0.0, self.width, self.width, 0.0], [0.0, 0.0, self.height, self.height],
                           self.pal.color('paper'))
             c.ops.insert(0, c.ops.pop())
+        # The file without its source, written only when a large source has to be weighed against it
+        bare = []
+        def size():
+            c.save()
+            bare.append(target.getvalue())
+            return len(bare[0])
+        carried, why = _carried(made, force, size)
+        if carried is None and bare:
+            return bare[0], why
+        target.seek(0)
+        target.truncate()
+        if carried:
+            c.attachments = [dict(name = SOURCE_NAME, data = carried[0], packed = carried[1], mime = SOURCE_MIME,
+                                  description = SOURCE_ABOUT, relationship = 'Source')]
         c.save()
-        return target.getvalue()
+        return target.getvalue(), why
 
     def to_svg(self):
         """SVG text on the palette's page, with text as outlines and images embedded."""
@@ -534,19 +897,46 @@ class Figure:
         svg = svg[:top] + '<metadata>viscose</metadata>\n' + svg[top:]
         return svg.replace('</svg>', _label_groups(c, labels, self.height) + '\n</svg>') if labels else svg
 
-    def save(self, path, dpi = 300.0, background = 'paper'):
+    def save(self, path, dpi = 300.0, background = 'paper', press = None, source = None):
         """Write the file format that the path's suffix names: png, pdf, or svg. `dpi` and `background` are for PNG, as
-        PDF and SVG are vector on the palette's page."""
+        PDF and SVG are vector on the palette's page. `press` makes a PDF a PDF/X-4 in that press's CMYK, and a PNG its
+        soft proof (see to_pdf), which SVG, a screen format, has no place for. The file carries the figure's source, the
+        calls and data that drew it, as JSON: vc.open brings the figure back from the file alone, in another palette,
+        dark, or at a journal's column width, and anyone can read its numbers. A figure's source takes a few kB, and is
+        written while the page draws. source = False leaves it out, as a PDF/X does, which is the page alone for print;
+        a source past 64 kB that is larger than the rest of the file, such as of 100,000 points, stays out with a
+        warning, unless source = True."""
         path = Path(path)
         suffix = path.suffix.lower()
-        if suffix == '.png':
-            path.write_bytes(self.to_png(dpi, background))
-        elif suffix == '.pdf':
-            path.write_bytes(self.to_pdf())
-        elif suffix == '.svg':
-            path.write_text(self.to_svg(), encoding = 'utf-8', newline = '\n')
-        else:
+        if press and suffix == '.svg':
+            raise ValueError('SVG is for screens and has no CMYK; for print, save a PDF with press, or a PNG for its '
+                             'proof')
+        if suffix not in ('.png', '.pdf', '.svg'):
             raise ValueError(f'Unsupported format {suffix!r}; use .png, .pdf, or .svg')
+        force = source is True
+        with ThreadPoolExecutor(1) as pool:
+            made = None if source is False or press and suffix == '.pdf' else pool.submit(self._source)
+            if suffix == '.pdf':
+                data, why = self._pdf(press, made, force)
+            elif suffix == '.png':
+                data = self.to_png(dpi, background, press)
+                carried, why = _carried(made, force, lambda: len(data))
+                if carried:
+                    # A private chunk that editors may copy, just before the end
+                    chunk = SOURCE_CHUNK + carried[1]
+                    data = data[:-12] + struct.pack('>I', len(carried[1])) + chunk + struct.pack(
+                        '>I', zlib.crc32(chunk)) + data[-12:]
+            else:
+                data = self.to_svg()
+                carried, why = _carried(made, force, lambda: len(data))
+                if carried:
+                    end = data.rindex('</svg>')
+                    data = (data[:end] + '<metadata id="viscose-source">' + base64.b64encode(carried[1]).decode('ascii')
+                            + '</metadata>\n' + data[end:])
+                data = data.encode('utf-8')
+        if why:
+            warnings.warn(f'{path.name}: {why}', stacklevel = 2)
+        path.write_bytes(data)
         return path
 
     def show(self, dpi = 144.0, viewer = True):
@@ -892,3 +1282,77 @@ def clustermap(data, xticklabels = None, yticklabels = None, method = 'average',
     top._align, left._align = {'x': heat}, {'y': heat}
     fig.row_order, fig.col_order = row_order, col_order
     return fig, heat
+
+
+def open(file, palette = None, size = None, unit = 'in', functions = None):
+    """A figure back from a PDF, SVG, or PNG that viscose saved, from the calls and data the file carries (see
+    Figure.save), with no script needed: as it was drawn, or in another `palette`, such as a name, a dark version, or
+    a palette with larger type through dataclasses.replace, at another `size`, (width, height) in inches or with
+    unit = 'mm' in millimeters, such as a journal's column. The file can also come as its bytes. Nothing in a file runs
+    as code: it names Axes' plot methods and holds JSON and arrays, so a function that a plot call took, such as a
+    heatmap's `fmt`, comes back only from `functions`, a dict by the name the error gives."""
+    data = bytes(file) if isinstance(file, (bytes, bytearray, memoryview)) else Path(file).read_bytes()
+    raw = None
+    if data[:4] == b'%PDF':
+        # The last such attachment, as an edited PDF appends; a stream is never inside an object stream, so its
+        # dictionary is found as written, whichever program wrote the file last
+        spots = list(re.finditer(rb'/Subtype\s*/application#2Fvnd\.viscose\+json', data))
+        if spots:
+            begin = re.compile(rb'stream\r?\n').search(data, spots[-1].end())
+            entry = data[data.rfind(b'obj', 0, spots[-1].start()):begin.start()]
+            length = re.search(rb'/Length\s+(\d+)(\s+\d+\s+R)?', entry)
+            body = (data[begin.end():begin.end() + int(length.group(1))] if length and not length.group(2) else
+                    data[begin.end():data.index(b'endstream', begin.end())].rstrip(b'\r\n'))
+            raw = zlib.decompressobj().decompress(body) if b'FlateDecode' in entry else body
+    elif data[:8] == b'\x89PNG\r\n\x1a\n':
+        at = 8
+        while at + 8 <= len(data) and raw is None:
+            n, kind = struct.unpack('>I4s', data[at:at + 8])
+            raw = zlib.decompress(data[at + 8:at + 8 + n]) if kind == SOURCE_CHUNK else None
+            at += 12 + n
+    else:
+        found = re.search(rb'<metadata id="viscose-source">([A-Za-z0-9+/=\s]*)</metadata>', data)
+        raw = zlib.decompress(base64.b64decode(found.group(1))) if found else None
+    if raw is None:
+        raise ValueError('This file carries no figure source: it was saved with source = False or as a PDF/X, by '
+                         'another program, or before viscose 0.3.0, or an editor dropped it')
+    text_part, _, tail = raw.partition(b'\n')
+    head = json.loads(text_part)
+    if head.get('format', 0) > SOURCE_FORMAT:
+        raise ValueError(f"This figure's source is in a newer format, from viscose {head.get('viscose')}")
+    arrays = []
+    for t in head['arrays']:
+        if 'values' in t:
+            values = t['values']
+            if np.dtype(t['dtype']).kind == 'f':
+                values = [math.nan if u is None else float(u) if isinstance(u, str) else u for u in values]
+            arrays.append(np.array(values, dtype = t['dtype']).reshape(t['shape']))
+        else:
+            store = np.dtype(t['store'])
+            grouped = np.frombuffer(tail, np.uint8, t['length'], t['offset']).reshape(store.itemsize, -1)
+            arrays.append(np.frombuffer(grouped.T.tobytes(), store).astype(t['dtype']).reshape(t['shape']))
+    # A figure and axes that hold what in_palette copies, which then draws them anew
+    stub, axes, cats = Figure.__new__(Figure), [Axes.__new__(Axes) for _ in head['axes']], {}
+    dec = lambda v: _decode(v, arrays, axes, functions)
+    for ax, h in zip(axes, head['axes']):
+        ax._cell, ax._span, ax._fixed, ax._outer = dec(h['cell']), dec(h['span']), dec(h['fixed']), dec(h['outer'])
+        ax._share = {k: [axes[i] for i in group] for k, group in h['share'].items()}
+        ax._cats = {k: cats.setdefault((k, i), {}) for k, i in h['cats'].items()}
+        ax._align = {k: axes[i] for k, i in h['align'].items()}
+    found = head['figure']
+    stub.axes = axes
+    stub._base = dec(found['size']) if size is None else tuple(v * UNITS[_unit(unit, ('in', 'mm'))] for v in size)
+    stub._title, stub._subtitle, stub._held, stub.legible = found['title'], found['subtitle'], found['held'], found[
+        'legible']
+    stub._grid, stub._texts = dec(found['grid']), dec(found['texts'])
+    for _, name, _, _ in head['calls']:
+        if name[:1] == '_' or not hasattr(getattr(Axes, name, None), '__wrapped__'):
+            raise ValueError(f'{name!r} is not a plot method of Axes')
+    stub._calls = [(axes[i], name, dec(args), dec(kwargs)) for i, name, args, kwargs in head['calls']]
+    if 'order' in found:
+        stub.row_order, stub.col_order = dec(found['order'])
+    spec = head['palette']
+    if palette is None:
+        palette = (spec if isinstance(spec, str) else _named(spec['dark']).dark(spec['paper']) if 'dark' in spec else
+                   Palette(**{k: dec(v) for k, v in spec['settings'].items()}))
+    return stub.in_palette(palette)

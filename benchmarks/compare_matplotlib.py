@@ -81,7 +81,8 @@ def run(make_fig, ext, mpl, reps):
         f = make_fig()
         path = tmp / f'x.{ext}'
         t0 = time.perf_counter()
-        f.savefig(path, dpi = 300) if mpl else f.save(path, dpi = 300)
+        # The page alone, as matplotlib writes it: the figure's source, which viscose adds, is no part of drawing
+        f.savefig(path, dpi = 300) if mpl else f.save(path, dpi = 300, source = False)
         ts.append(time.perf_counter() - t0)
         size = path.stat().st_size
         if mpl:

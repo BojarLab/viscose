@@ -129,6 +129,34 @@ fig, heat = vc.clustermap(df, palette = 'aura', title = 'Glycan abundance by tis
 
 <p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/clustermap.png" alt="A clustermap of glycan abundance across tissues in Aura" width="80%"></p>
 
+## Every point, every reader, every press
+
+Where points pile up past telling them apart, viscose maps their density instead: smooth bands in their color's own
+shades, from the palest at the edge to the strongest at the core, each set apart by a hairline of the page, and every
+point kept where the data are sparse. 100,000 points read as a map of where the data lie, outliers stay in view, and the
+bands are true vector shapes, crisp at any zoom: 100,000 points take 45 kB of PDF, and a real LC-MS map of 152,000 peaks
+draws as PNG in 0.45 s where every point took 3.2 s. `density = False` keeps every point.
+
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/crowd.png" alt="100,000 points in Poster as a solid blob of points beside the same points as bands of density in Poster's greens, with the sparse points around them" width="100%"></p>
+
+Type is set as a typesetter would. Numbers on axes and color bars take tabular figures and line up on their decimal
+points, and every other line of text lines up by its ink rather than its letters' boxes, so a title stands flush with
+its axis by eye. At layout, every text and mark is checked against the page with APCA, the contrast measure of WCAG 3,
+and the colors that tell groups apart are checked as readers with protanopia, deuteranopia, and tritanopia see them. A
+shade that falls short takes the nearest shade of its own hue that passes, and `fig.adjusted` lists each change.
+
+For print, `fig.save('figure.pdf', press = True)` writes a PDF/X-4 in CMYK for web offset on coated paper (CGATS TR 001,
+SWOP), with its ICC profile as the output intent, and `press = 'FOGRA39.icc'` takes a printer's or a journal's own
+profile. Colors the press cannot reach keep their lightness and hue and give up only the chroma they must, so Aura's
+hues print as Aura's hues. `fig.save('proof.png', press = True)` shows on screen how the page prints, and
+`vc.Press().gamut('aura')` gives each shade's CIEDE2000 from screen to press.
+
+```python
+ax.scatter(umap[:, 0], umap[:, 1])
+fig.save('figure.pdf', press = True)
+fig.save('proof.png', press = True)
+```
+
 | | |
 |---|---|
 | **Plots** | `plot`, `step`, `scatter`, `bar`, `barh`, `stacked_bar`, `hist`, `fill_between`, `errorbar`, `boxplot`, `violinplot`, `stripplot`, `contour`, `stem`, `hlines`, `vlines`, `arrow`, `rectangle`, `heatmap`, `ridgeline`, `dendrogram`, `axhline`, `axvline`, `axline`, `axhspan`, `axvspan`, `image`, and `vc.clustermap` |
@@ -137,12 +165,13 @@ fig, heat = vc.clustermap(df, palette = 'aura', title = 'Glycan abundance by tis
 | **Pages** | `vc.Figure(183, 120, unit = 'mm')` is a journal page, `fig.add_axes((x, y, w, h), unit = 'mm')` places a panel from its top left, and `fig.letter(x, y, 'a', 'Heading')` and `fig.text` write panel letters and any other text on the page; `vc.subplot_mosaic('abc;ddd')` lets axes span cells of a grid |
 | **Axes** | `set_xscale` takes `linear`, `log`, `sqrt`, or any pair of functions; `fmt` on `set_xticks` and `set_yticks` writes the ticks, as `'{:.0%}'` or a function; `tick_params` sets each axis's tick length, pad, label size, and labels, puts x labels on top, or keeps labels exactly as set; `emphasis` sets chosen tick labels bold in a color; `set_spines` shows or hides each axis line |
 | **Layout** | Colliding tick labels turn and thin themselves, labels move to the side with room, legends wrap, long axis names shrink, and the page grows for anything that needs it; `vc.subplots(sharex = True, sharey = 'row')` shares limits, scales, and ticks across all panels, rows, or columns, as in matplotlib |
-| **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG; `scatter(rasterized = True)` makes tens of thousands of points one image there, as 100,000 points take 1.7 MB of SVG in place of 17.6 MB, with axes and text still vector; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window; `viscose.qt`, with `pip install "viscose[qt]"`, is that window: PySide6 widgets that paint a figure about ten times as fast as the rasterizer, with pan, zoom, and mouse targets |
+| **Output** | `fig.save` writes PNG, PDF, or SVG from the same geometry, with marks, gradients, and text as real vectors in PDF and SVG, and with `press` a CMYK PDF/X-4 for print or a soft proof; `scatter(rasterized = True)` makes tens of thousands of points one image there, as 100,000 points take 1.7 MB of SVG in place of 17.6 MB, with axes and text still vector; `fig.to_rgba` gives the pixels and `fig.display_list` the drawing operations, for showing a figure in a window; `viscose.qt`, with `pip install "viscose[qt]"`, is that window: PySide6 widgets that paint a figure about ten times as fast as the rasterizer, with pan, zoom, and mouse targets |
 | **Positions** | `fig.layout` settles the page, and `ax.page` and `ax.data` turn data positions into page points and back, and `ax.boxes()` gives the page boxes of everything drawn, for placing things yourself clear of it or answering a mouse |
 | **Display** | `fig.show()` works inline in Jupyter and slate, and in the system's image viewer from a terminal, with CI and coding agents kept silent |
 | **SVG hooks** | `gid` on `arrow` and `scatter` names elements for hover text and scripting |
 | **Names** | `names` on `scatter` labels each point, and on `heatmap` each row and column, which draws nothing but lets slate show what is under the mouse |
 | **Palettes** | `fig.in_palette('aura')` gives the same figure in another palette, exactly as if it had been drawn in that one |
+| **Source** | Every file `fig.save` writes carries the figure's own calls and data, a few kB of JSON, and `vc.open('fig3.pdf')` brings the figure back from that file alone: `vc.open('fig3.pdf', 'couture')` in another palette, `vc.open('fig3.pdf', 'aura-dark')` dark, `vc.open('fig3.pdf', size = (89, 70), unit = 'mm')` at a journal's column width, exactly as if drawn that way, and the numbers are there for anyone to read, as the PDF's attachment `figure-source.json`; `source = False` leaves it out |
 | **State** | None hidden: a figure is an object, with no current figure and nothing to close |
 
 ## Light and quick
@@ -157,7 +186,7 @@ matplotlib and seaborn, and its files can be far smaller. At 300 dpi, in Poster:
 | Clustermap, 300 x 100, SVG | 1.40 s, 5,943 kB | **0.02 s, 182 kB** |
 | Clustermap, 26 x 16, PDF | 0.11 s, 22 kB | **0.02 s**, 26 kB |
 | Three lines with a legend, PDF | 0.03 s, 12 kB | **under 0.01 s**, 13 kB |
-| Scatter, 100,000 points, PDF | 0.96 s, 1,524 kB | **0.19 s, 644 kB** |
+| Scatter, 100,000 points, PDF | 1.64 s, 1,523 kB | **0.13 s, 45 kB** |
 | Bars, PNG | 0.19 s, 43 kB | **0.20 s, 38 kB** |
 | Three lines with a legend, PNG | 0.27 s, 393 kB | 0.43 s, **370 kB** |
 | Scatter, 412 points, PNG | 0.23 s, 147 kB | 0.27 s, 180 kB |

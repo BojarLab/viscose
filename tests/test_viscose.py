@@ -1,3 +1,4 @@
+import dataclasses
 import os
 import re
 import subprocess
@@ -14,6 +15,7 @@ from viscose.figure import SHADOW_DPI
 from viscose.palettes import get_palette, ramp
 from viscose.text import runs, width
 from glycorender import pdfwrite, raster
+from glycorender.pdfwrite import pdfmetrics
 
 
 NAMES = ['lumen', 'couture', 'poster', 'aura']
@@ -941,6 +943,144 @@ def test_a_clustermap_in_another_palette_equals_one_drawn_in_it():
     direct = vc.clustermap(data, palette = 'aura', title = 'Map', colorbar_label = 'z')[0]
     moved = fig.in_palette('aura')
     assert moved.row_order == fig.row_order and moved.to_png(72.0) == direct.to_png(72.0)
+
+
+def _source_of(path):
+    """The JSON a saved PDF, SVG, or PNG carries, read without viscose."""
+    import base64
+    import json
+    import zlib
+    data = path.read_bytes()
+    if data[:4] == b'%PDF':
+        stream = re.search(rb'/Subtype /application#2Fvnd\.viscose\+json .*?/Length (\d+) >>\nstream\n', data)
+        packed = data[stream.end():stream.end() + int(stream.group(1))]
+    elif data[:4] == b'\x89PNG':
+        at = data.index(b'vcSc')
+        packed = data[at + 4:at + int.from_bytes(data[at - 4:at], 'big') + 4]
+    else:
+        packed = base64.b64decode(re.search(rb'<metadata id="viscose-source">([^<]*)</metadata>', data).group(1))
+    return json.loads(zlib.decompress(packed).partition(b'\n')[0])
+
+
+def test_a_figure_comes_back_from_its_own_file(tmp_path):
+    fig = _every_plot('poster')
+    direct = _every_plot('couture')
+    for suffix in ('pdf', 'svg', 'png'):
+        path = fig.save(tmp_path / f'every.{suffix}', dpi = 72)
+        back = vc.open(path)
+        assert back.pal.name == 'poster' and back.to_pdf() == fig.to_pdf() and back.to_png(72.0) == fig.to_png(72.0)
+        assert vc.open(path.read_bytes(), 'couture').to_png(72.0) == direct.to_png(72.0)
+        # Without its source, a file is what to_pdf, to_svg, and to_png give
+        assert fig.save(tmp_path / f'plain.{suffix}', dpi = 72, source = False).read_bytes() == {
+            'pdf': fig.to_pdf, 'svg': lambda: fig.to_svg().encode(), 'png': lambda: fig.to_png(72.0)}[suffix]()
+    # Saving twice writes the same file, and a reopened figure saves its own source again
+    assert fig.save(tmp_path / 'again.pdf').read_bytes() == fig.save(tmp_path / 'every.pdf').read_bytes()
+    assert vc.open(vc.open(tmp_path / 'every.svg').save(tmp_path / 'third.svg')).to_png(72.0) == fig.to_png(72.0)
+    assert 'open' not in vc.__all__
+
+
+def test_a_clustermap_a_journal_page_and_a_dark_or_custom_palette_come_back(tmp_path):
+    data = np.random.default_rng(1).normal(0, 1, (12, 6))
+    fig = vc.clustermap(data, palette = 'aura', title = 'Map', colorbar_label = 'z')[0]
+    back = vc.open(fig.save(tmp_path / 'map.pdf'))
+    assert back.row_order == fig.row_order and back.to_png(72.0) == fig.to_png(72.0)
+    # Clustered once: the file holds the tree's coordinates, and reopening never clusters again
+    with patch('viscose.figure.linkage', side_effect = AssertionError):
+        vc.open(tmp_path / 'map.pdf')
+    page = vc.Figure(89, 60, 'lumen', unit = 'mm')
+    ax = page.add_axes((12, 6, 70, 40), unit = 'mm')
+    ax.plot(range(5), [1, 3, 2, 5, 4])
+    page.letter(2, 3, 'a', 'Rises')
+    page.text(0.5, 0.02, 'note', ha = 'center')
+    assert vc.open(page.save(tmp_path / 'page.svg')).to_pdf() == page.to_pdf()
+    wide = vc.open(tmp_path / 'page.svg', size = (183, 60), unit = 'mm')
+    assert round(wide.width / vc.figure.UNITS['mm'], 6) == 183
+    previous = vc.dark_mode(True, '#2B2B2B')
+    try:
+        dark = _every_plot('lumen')
+    finally:
+        vc.dark_mode(*previous)
+    back = vc.open(dark.save(tmp_path / 'dark.png', dpi = 72))
+    assert back.pal.paper == '#2B2B2B' and back.to_png(72.0) == dark.to_png(72.0)
+    big = dataclasses.replace(vc.get_palette('couture'), name = 'couture-big', tick_size = 14.0)
+    custom = _every_plot(big)
+    assert vc.open(custom.save(tmp_path / 'custom.pdf')).to_png(72.0) == custom.to_png(72.0)
+    assert 'settings' in _source_of(tmp_path / 'custom.pdf')['palette']
+    assert _source_of(tmp_path / 'map.pdf')['palette'] == 'aura'
+
+
+def test_a_source_is_json_that_names_methods_and_runs_no_code(tmp_path):
+    fig, ax = vc.subplots(figsize = (5, 4))
+    pct = lambda v: f'{v:+.1f}'
+    ax.heatmap(np.arange(12.0).reshape(3, 4), annot = True, fmt = pct)
+    ax.set_title('With "quotes", ü, and a line\nbreak')
+    path = fig.save(tmp_path / 'fmt.svg')
+    source = _source_of(path)
+    assert source['format'] == 1 and source['calls'][0][1] == 'heatmap' and source['arrays'][0]['values'][:3] == [
+        0.0, 1.0, 2.0]
+    with pytest.raises(ValueError, match = 'functions'):
+        vc.open(path)
+    assert vc.open(path, functions = {'<lambda>': pct}).to_png(72.0) == fig.to_png(72.0)
+    # A file that names anything but a plot method opens nothing
+    import base64
+    import json
+    import zlib
+    source['calls'][0][1] = '_canvas'
+    forged = zlib.compress(json.dumps(source).encode())
+    text = path.read_text(encoding = 'utf-8')
+    text = re.sub(r'(<metadata id="viscose-source">)[^<]*', lambda m: m.group(1) + base64.b64encode(forged).decode(),
+                  text)
+    with pytest.raises(ValueError, match = 'not a plot method'):
+        vc.open(text.encode())
+    with pytest.raises(ValueError, match = 'carries no figure source'):
+        vc.open(fig.save(tmp_path / 'bare.pdf', source = False))
+
+
+def test_large_arrays_follow_the_json_exactly_and_a_large_source_stays_out(tmp_path, monkeypatch):
+    rng = np.random.default_rng(5)
+    n = 30000
+    x = rng.normal(size = n)
+    fig, ax = vc.subplots(figsize = (5, 4), palette = 'poster')
+    ax.scatter(x, x.astype(np.float32).astype(float), s = 4)
+    ax.plot(np.arange(n, dtype = np.int64), np.where(np.arange(n) % 7 == 0, np.nan, x), alpha = 0.2)
+    path = fig.save(tmp_path / 'large.png', dpi = 40, source = True)
+    assert {a.get('store') for a in _source_of(path)['arrays']} == {'<f8', '<f4', '<i2'}
+    assert vc.open(path).to_png(40.0) == fig.to_png(40.0)
+    ctx = {'axes': {}, 'arrays': [], 'seen': {}, 'tail': []}
+    vc.figure._encode([np.arange(n) % 3 == 0, np.arange(n) % 3 == 0], ctx)
+    assert len(ctx['arrays']) == 1 and ctx['arrays'][0]['store'] == '|u1'
+    # Past SOURCE_FLOOR and larger than the file, a source stays out, with a warning naming the way to keep it
+    monkeypatch.setattr(vc.figure, 'SOURCE_FLOOR', 1000)
+    small, ax = vc.subplots(figsize = (3, 2))
+    # Names are kept for each point and never drawn, so these make a source far larger than the page
+    ax.scatter(rng.normal(size = 500), rng.normal(size = 500), s = 2,
+               names = [rng.bytes(800).hex() for _ in range(500)])
+    for suffix in ('pdf', 'svg', 'png'):
+        with pytest.warns(UserWarning, match = 'source = True keeps it'):
+            plain = small.save(tmp_path / f'small.{suffix}', dpi = 20)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            kept = small.save(tmp_path / f'kept.{suffix}', dpi = 20, source = True)
+        assert kept.stat().st_size > plain.stat().st_size and vc.open(kept).to_png(20.0) == small.to_png(20.0)
+    # A PDF/X is the page alone, for print
+    with pytest.raises(ValueError, match = 'carries no figure source'):
+        vc.open(fig.save(tmp_path / 'print.pdf', press = True))
+
+
+def test_long_form_keeps_only_its_columns_and_their_categories(tmp_path):
+    pd = pytest.importorskip('pandas')
+    rng = np.random.default_rng(3)
+    df = pd.DataFrame({'class': pd.Categorical(rng.choice(['high-Man', 'complex', 'hybrid'], 90),
+                                               categories = ['hybrid', 'complex', 'high-Man']),
+                       'tissue': rng.choice(['tumor', 'normal'], 90), 'value': rng.gamma(2, 3, 90),
+                       'unused': ['x' * 500] * 90}, index = np.arange(100, 190))
+    fig, ax = vc.subplots(figsize = (6, 4))
+    ax.boxplot(df, x = 'class', y = 'value', hue = 'tissue')
+    ax.bracket('hybrid', 'complex', 0.003)
+    path = fig.save(tmp_path / 'long.pdf')
+    frame = _source_of(path)['calls'][0][2][0]['$frame']
+    assert [c for c, _ in frame] == ['class', 'value', 'tissue'] and frame[0][1]['categories'][0] == 'hybrid'
+    assert vc.open(path).to_png(72.0) == fig.to_png(72.0)
 
 
 def test_a_figure_held_to_a_window_stays_held_in_another_palette():
@@ -3369,10 +3509,222 @@ def test_a_halo_follows_tracked_letters():
     vc.text.draw(c, 10, 50, 'HALO', 20, (0, 0, 0), tracking = 6.0, halo = 2.0)
     halo, letters = c.ops[0], c.ops[1]
     xs = [s[i] + halo['ctm'][4] for s in halo['path'] for i in range(1, len(s), 2)]
-    # The halo's last letter ends where the tracked text does, not a tracking per letter short
-    assert max(xs) == pytest.approx(10 + width('HALO', 20) + 3 * 6.0, abs = 1.5) and letters['char_space'] == 6.0
+    _, w, (lead, tail) = vc.text._pieces('HALO', vc.text.fonts()[0], 20, 6.0, False)
+    # The ink starts at the anchor, and the halo's last letter ends where the tracked text's ink does, not a tracking
+    # per letter short
+    assert w == pytest.approx(width('HALO', 20) + 4 * 6.0) and min(xs) == pytest.approx(10, abs = 0.05)
+    assert max(xs) == pytest.approx(10 + w - lead - tail, abs = 0.05) and letters['char_space'] == 6.0
 
 
 def test_glycans_draw_through_glycowork():
     pytest.importorskip('glycowork')
     assert vc.text.glyph('glycan', 'Gal(b1-4)GlcNAc') is not None and vc.text.glyph('glycan', 'not a glycan') is None
+
+
+def _cloud(n = 20000, seed = 3):
+    rng = np.random.default_rng(seed)
+    return np.r_[rng.normal(0, 0.3, (n, 2)), rng.uniform(-4, 4, (40, 2))]
+
+
+def test_points_that_pile_up_give_way_to_a_field_and_sparse_ones_stay():
+    pal = get_palette('poster')
+    xy = _cloud() * 40 + 200
+    (bands, keep), = marks.crowd(pal, [(xy[:, 0], xy[:, 1], 3.0, pal.color('a1'))], (0.0, 0.0, 400.0, 400.0))
+    # The core is a map of bands in the hue's shades, faint outside to strong inside, and its points give way to it
+    shades = [pal.color(s) for s in pal.a[::-1]]
+    assert len(bands) == marks.CROWD_BANDS and keep[:20000].mean() < 0.3
+    assert bands[0][0] == pytest.approx(tuple(ramp(shades, 0.1)))
+    assert bands[-1][0] == pytest.approx(tuple(ramp(shades, 0.9)))
+    # Every outline closes on itself
+    assert all(xs[0] == xs[-1] and ys[0] == ys[-1] for _, outlines in bands for xs, ys in outlines)
+    far = np.hypot(*(xy[20000:] - 200).T) > 80
+    assert far.sum() > 30 and keep[20000:][far].all()
+    sparse = marks.crowd(pal, [(xy[20000:, 0], xy[20000:, 1], 3.0, pal.color('a1'))], (0.0, 0.0, 400.0, 400.0))
+    assert sparse[0][0] is None and sparse[0][1].all()
+
+
+def test_a_field_lies_under_the_points_in_every_format_and_density_false_keeps_them():
+    xy = _cloud()
+    fig, ax = vc.subplots(figsize = (4, 4), palette = 'aura')
+    ax.scatter(xy[:, 0], xy[:, 1], s = 12)
+    ops = fig.display_list()
+    bands = [i for i, op in enumerate(ops) if op.get('even_odd')]
+    shapes = [i for i, op in enumerate(ops) if op['kind'] in ('path', 'markers') and op.get('mark')
+              and not op.get('even_odd')]
+    # Vector bands, each outlined by a hairline of the page, under the points
+    assert len(bands) == marks.CROWD_BANDS and shapes and max(bands) < min(shapes)
+    assert all(ops[i]['stroke_rgb'] == fig.pal.color('paper') for i in bands)
+    plain, ax = vc.subplots(figsize = (4, 4), palette = 'aura')
+    ax.scatter(xy[:, 0], xy[:, 1], s = 12, density = False)
+    assert not any(op.get('even_odd') for op in plain.display_list())
+    # Raster output thins the same points, and draws faster for it
+    assert fig.to_png(dpi = 60) != plain.to_png(dpi = 60)
+
+
+def test_a_color_scale_keeps_every_point():
+    xy = _cloud()
+    fig, ax = vc.subplots(figsize = (4, 4))
+    ax.scatter(xy[:, 0], xy[:, 1], c = xy[:, 0], s = 12)
+    assert not any(op.get('even_odd') for op in fig.display_list())
+
+
+def _comfortaa():
+    root = os.path.join(os.path.dirname(pdfwrite.__file__), 'fonts')
+    pdfmetrics.registerFont(pdfwrite.TTFont('Comfortaa', os.path.join(root, 'Comfortaa-Regular.ttf')))
+    return 'Comfortaa'
+
+
+def test_tabular_figures_take_one_width_and_leave_tabular_fonts_alone():
+    name = _comfortaa()
+    cell = vc.text._figures(name)
+    pieces, w, _ = vc.text._pieces('11', name, 10, 0.0, True)
+    assert cell and w == pytest.approx(2 * cell * 10) and len(pieces) == 2
+    assert vc.text._pieces('10', name, 10, 0.0, True)[1] == pytest.approx(w)
+    try:
+        pdfmetrics.registerFont(pdfwrite.TTFont('CenturyGothic', 'GOTHIC.TTF'))
+    except FileNotFoundError:
+        return
+    # Century Gothic's figures are tabular already, so its numbers stay one piece
+    assert vc.text._figures('CenturyGothic') is None
+    assert len(vc.text._pieces('10.5', 'CenturyGothic', 10, 0.0, True)[0]) == 1
+
+
+def test_numeric_y_labels_line_up_on_their_decimal_points():
+    fig, ax = vc.subplots(figsize = (4, 3))
+    ax.plot([0, 1, 2], [0, 1.5, 0.2])
+    ax.set_yticks([0, 0.5, 1, 1.5])
+    ops = [op for op in fig.display_list() if op['kind'] == 'text']
+    rows = {}
+    for op in ops:
+        rows.setdefault(round(op['ctm'][5] + op['y'], 2), []).append(op)
+    points = []
+    for label in ('0', '0.5', '1', '1.5'):
+        row = next(r for r in rows.values() if ''.join(o['text'] for o in sorted(r, key = lambda o: o['x'])) == label)
+        left, size = min(o['ctm'][4] + o['x'] for o in row), row[0]['size']
+        points.append(left + width(label.split('.')[0], size, tabular = True))
+    assert max(points) - min(points) < 1e-6
+
+
+def test_text_lines_up_by_its_ink():
+    c = pdfwrite.Canvas(BytesIO(), (200, 100))
+    for ha in ('left', 'right'):
+        c.ops = []
+        vc.text.draw(c, 100, 50, 'Title', 20, (0, 0, 0), ha = ha)
+        op = c.ops[0]
+        name = vc.text.fonts()[0]
+        lsb, rsb = vc.text._bearings(name, 'T')[0], vc.text._bearings(name, 'e')[1]
+        start = op['ctm'][4] + op['x']
+        expect = 100 - lsb * 20 if ha == 'left' else 100 + rsb * 20 - width('Title', 20)
+        assert start == pytest.approx(expect)
+    # Numbers set as a table's line up by their cells instead
+    c.ops = []
+    vc.text.draw(c, 100, 50, '15', 20, (0, 0, 0), ha = 'right', tabular = True)
+    assert min(o['ctm'][4] + o['x'] for o in c.ops) == pytest.approx(100 - width('15', 20, tabular = True))
+
+
+def test_apca_and_ciede2000_match_their_references():
+    from viscose.palettes import apca, delta_e
+    # APCA-W3's own examples, and Sharma, Wu, and Dalal's (2005) CIEDE2000 test pairs
+    assert apca((0, 0, 0), (1, 1, 1)) == pytest.approx(106.04, abs = 0.05)
+    assert apca((1, 1, 1), (0, 0, 0)) == pytest.approx(107.88, abs = 0.05)
+    assert apca((0x88 / 255,) * 3, (1, 1, 1)) == pytest.approx(63.06, abs = 0.05)
+    assert apca((1, 1, 1), (0x88 / 255,) * 3) == pytest.approx(68.54, abs = 0.05)
+    pairs = [((50, 2.6772, -79.7751), (50, 0, -82.7485), 2.0425), ((50, 3.1571, -77.2803), (50, 0, -82.7485), 2.8615),
+             ((50, -1.3802, -84.2814), (50, 0, -82.7485), 1.0), ((50, 2.5, 0), (73, 25, -18), 27.1492),
+             ((60.2574, -34.0099, 36.2677), (60.4626, -34.1751, 39.4387), 1.2644)]
+    assert delta_e([p[0] for p in pairs], [p[1] for p in pairs]) == pytest.approx([p[2] for p in pairs], abs = 1e-4)
+
+
+def test_colors_of_different_hues_are_moved_apart_for_color_blind_readers():
+    from viscose.palettes import CVD_MIN, apart
+    rng = np.random.default_rng(5)
+    fig, ax = vc.subplots(figsize = (4, 4), palette = 'aura')
+    ax.scatter(rng.normal(size = 80), rng.normal(size = 80), hue = np.repeat(list('ABCD'), 20))
+    fig.layout()
+    colors = [a['rgb'] for a in ax.artists if a['kind'] == 'points']
+    assert any(why == 'color vision' for _, _, why in fig.adjusted) and len(set(colors)) == 4
+    # Each color's hue is its nearest palette shade's, as the check moves colors only within their hue
+    from viscose.palettes import _hex, _oklab
+    shades = [(i, fig.pal.color(s)) for i, h in enumerate((fig.pal.a, fig.pal.b)) for s in h]
+    hue = lambda c: min(shades, key = lambda s: np.linalg.norm(_oklab(s[1]) - _oklab(c)))[0]
+    assert all(apart(c, d) >= CVD_MIN for c in colors for d in colors if c != d and hue(c) != hue(d))
+    # Each move is a small one, so that the figure keeps its look
+    assert all(np.linalg.norm(_oklab(_hex(a)) - _oklab(_hex(b))) < 0.25 for a, b, _ in fig.adjusted)
+    # The legend shows what the plot does, and laying out again changes nothing
+    assert [e[1] for e in ax.legend_items] == colors
+    before = list(fig.adjusted)
+    fig.layout()
+    assert fig.adjusted == before
+
+
+def test_legibility_leaves_passing_colors_alone_and_can_be_switched_off():
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'lumen')
+    ax.plot([0, 1], [0, 1], color = 'a1')
+    ax.plot([0, 1], [1, 0], color = 'yellow')
+    ax.text(0.5, 0.5, 'pale', color = 'a3')
+    fig.layout()
+    found = {a['kind']: a['rgb'] for a in ax.artists}
+    assert ax.artists[0]['rgb'] == fig.pal.color('a1') and found['text'] != fig.pal.color('a3')
+    assert ax.artists[1]['rgb'] != (1.0, 1.0, 0.0)
+    off, ax = vc.subplots(figsize = (4, 3), palette = 'lumen')
+    off.legible = False
+    ax.plot([0, 1], [1, 0], color = 'yellow')
+    off.layout()
+    assert ax.artists[0]['rgb'] == (1.0, 1.0, 0.0) and off.adjusted == []
+
+
+def test_a_press_prints_what_it_can_and_keeps_the_hue_of_what_it_cannot():
+    from viscose.palettes import REACH, _oklch, cielab, delta_e
+    press = vc.Press()
+    inside = np.array([get_palette('aura').color('a1')])
+    assert delta_e(press.lab(press.separate(inside)), cielab(inside))[0] < REACH
+    pale = get_palette('lumen').color('a3')
+    printed = press.printed(np.array([pale]))[0]
+    (L0, C0, h0), (L1, C1, h1) = _oklch(pale), _oklch(printed)
+    # Out of the press's gamut, it gives up chroma, not hue or lightness
+    assert C1 < C0 and abs(L1 - L0) < 0.03 and abs((h1 - h0 + np.pi) % (2 * np.pi) - np.pi) < 0.1
+    ink = press.separate(np.array([[0.11, 0.1, 0.09], [1.0, 1.0, 1.0]]))
+    # Near-black text takes mostly black ink, and white takes none
+    assert ink[0, 3] > 0.6 and ink[1].max() < 1e-6 and (ink.sum(1) <= press.ink_limit + 1e-9).all()
+    rows = press.gamut('lumen')
+    assert rows[0][0] == 'a3' and rows[0][3] == max(r[3] for r in rows)
+
+
+def test_the_default_press_writes_an_output_profile_that_reads_back():
+    import struct
+    icc = vc.Press().icc()
+    assert icc[12:24] == b'prtrCMYKLab ' and icc[36:40] == b'acsp' and struct.unpack('>I', icc[:4])[0] == len(icc)
+    count = struct.unpack('>I', icc[128:132])[0]
+    tags = {sig for sig, _, _ in struct.iter_unpack('>4sII', icc[132:132 + 12 * count])}
+    assert {b'desc', b'cprt', b'wtpt', b'A2B0', b'A2B1', b'B2A0', b'B2A1', b'gamt'} <= tags
+    again = vc.Press(icc)
+    gray = np.array([[0.5, 0.5, 0.5]])
+    assert np.allclose(again.lab(vc.Press().separate(gray)), vc.Press().lab(vc.Press().separate(gray)))
+
+
+def test_a_pdf_for_a_press_is_a_pdf_x_in_cmyk(tmp_path):
+    import zlib
+    if not hasattr(pdfwrite.Canvas(BytesIO()), 'pdfx'):
+        pytest.skip('needs glycorender with CMYK output')
+    fig, ax = vc.subplots(figsize = (4, 3), palette = 'aura')
+    fig.suptitle('Print')
+    ax.bar(['a', 'b'], [1, 2], color = 'b2')
+    ax.scatter(*_cloud(3000).T, s = 10)
+    pdf = fig.to_pdf(press = True)
+    assert pdf.startswith(b'%PDF-1.6') and b'DeviceRGB' not in pdf and b'/DeviceCMYK' in pdf
+    for key in (b'/OutputIntents', b'/S /GTS_PDFX', b'(CGATS TR 001)', b'/DestOutputProfile', b'/TrimBox', b'/ID [',
+                b'/Trapped /False', b'<pdfxid:GTS_PDFXVersion>PDF/X-4</pdfxid:GTS_PDFXVersion>', b'(Print)'):
+        assert key in pdf
+    streams = []
+    for s in re.findall(rb'stream\n(.*?)\nendstream', pdf, re.S):
+        try:
+            streams.append(zlib.decompress(s))
+        except zlib.error:
+            pass
+    content = [s for s in streams if b' cm' in s and b'BT' in s][0]
+    assert re.search(rb' k\n', content) and not re.search(rb' rg\n', content) and not re.search(rb' RG\n', content)
+    assert any(s[12:24] == b'prtrCMYKLab ' for s in streams)
+    with pytest.raises(ValueError):
+        fig.save(tmp_path / 'print.svg', press = True)
+    proof = fig.to_png(dpi = 40, press = True)
+    assert proof[:8] == b'\x89PNG\r\n\x1a\n' and proof != fig.to_png(dpi = 40)

@@ -1,5 +1,9 @@
-"""Palettes: a few colors in shades, plus the special effects that belong to each palette."""
+"""Palettes: a few colors in shades, plus the special effects that belong to each palette, and the color science that
+keeps them legible on screen and true in print."""
+import itertools
+import struct
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 import numpy as np
 
 
@@ -96,6 +100,73 @@ def _night(c, chroma = None):
     if 50 < deg < 115:
         deg -= (deg - 50) * float(np.clip((0.80 - L2) / 0.28, 0.0, 1.0))
     return _from_oklch(L2, C if chroma is None else chroma, np.radians(deg))
+
+
+def _linear(rgb):
+    c = np.asarray(rgb, dtype = float)
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def _oklab(rgb):
+    """OKLab of sRGB triples, along the last axis."""
+    return np.cbrt(_linear(rgb) @ _LMS.T) @ _LAB.T
+
+
+# APCA-W3 0.0.98G-4g (Somers, Myndex): what a color reaches against the page as lightness contrast Lc, by its bronze
+# levels: text that is read (tick labels, axis names, legends, annotations), large or heavy text (from 24 points, or 16
+# bold), and marks that carry data, which need to be discernible, while their shades stay free to recede
+LC_TEXT, LC_LARGE, LC_MARK = 60.0, 45.0, 15.0
+# Machado, Oliveira, and Fernandes (2009) at full severity, on linear sRGB
+CVD = {'protan': np.array([[0.152286, 1.052583, -0.204868], [0.114503, 0.786281, 0.099216],
+                           [-0.003882, -0.048116, 1.051998]]),
+       'deutan': np.array([[0.367322, 0.860646, -0.227968], [0.280085, 0.672501, 0.047413],
+                           [-0.011820, 0.042940, 0.968881]]),
+       'tritan': np.array([[1.255528, -0.076749, -0.178779], [-0.078411, 0.930809, 0.147602],
+                           [0.004733, 0.691367, 0.303900]])}
+# How far apart in OKLab two colors of one plot stay for every reader, as normal vision and each simulated deficiency
+# see them; the closest pair of Okabe and Ito's palette, made for color-blind readers, is 0.076 apart
+CVD_MIN = 0.07
+
+
+def apca(color, page):
+    """APCA's lightness contrast Lc of a color on a page, from 0 up to about 106 for black on white, as an absolute
+    value: dark on light and light on dark count alike, each by its own curve."""
+    ys = []
+    for c in (color, page):
+        y = float(np.dot(np.asarray(c, dtype = float) ** 2.4, (0.2126729, 0.7151522, 0.0721750)))
+        ys.append(y if y > 0.022 else y + (0.022 - y) ** 1.414)
+    fg, bg = ys
+    if abs(bg - fg) < 0.0005:
+        return 0.0
+    sapc = (bg ** 0.56 - fg ** 0.57) * 1.14 if bg > fg else (bg ** 0.65 - fg ** 0.62) * 1.14
+    return 0.0 if abs(sapc) < 0.1 else (abs(sapc) - 0.027) * 100.0
+
+
+def seen(rgb):
+    """A color as normal vision and as protanopia, deuteranopia, and tritanopia see it, as OKLab rows."""
+    lin = _linear(rgb)
+    rows = [lin] + [np.clip(m @ lin, 0.0, 1.0) for m in CVD.values()]
+    return np.cbrt(np.array(rows) @ _LMS.T) @ _LAB.T
+
+
+def apart(c1, c2):
+    """How far apart two colors stay for every reader: their least OKLab distance under normal vision and the three
+    simulated deficiencies."""
+    return float(np.linalg.norm(seen(c1) - seen(c2), axis = 1).min())
+
+
+def legible(rgb, page, target, step = 0.01):
+    """A color that reaches APCA's `target` against `page`: the color itself if it does, else the nearest by lightness
+    in its own hue, moved away from the page's, with its chroma kept where sRGB holds it."""
+    if apca(rgb, page) >= target:
+        return tuple(rgb)
+    L, C, h = _oklch(rgb)
+    way = -1.0 if _oklch(page)[0] > 0.5 else 1.0
+    for k in range(1, int(1.0 / step) + 1):
+        moved = _hex(_from_oklch(float(np.clip(L + way * k * step, 0.0, 1.0)), C, h))
+        if apca(moved, page) >= target:
+            return moved
+    return (0.0, 0.0, 0.0) if way < 0 else (1.0, 1.0, 1.0)
 
 
 def ramp(colors, t):
@@ -296,12 +367,23 @@ class Palette:
         return _darks[key][1]
 
     def shades(self, c):
-        """The (dark, mid, light) neighbors of a color: its own hue's shades if it is in the palette, else mixes."""
+        """The (dark, mid, light) neighbors of a color: its own hue's shades if it is in the palette, or theirs moved
+        by as much lightness where it is one of them made lighter or darker in its own hue, as the legibility check
+        makes them, so that it keeps the palette's gradients; else mixes."""
         rgb = self.color(c)
         for hue in (self.a, self.b):
             for i, s in enumerate(hue):
                 if np.allclose(_hex(s), rgb, atol = 1e-3):
                     return _hex(hue[max(i - 1, 0)]), _hex(s), _hex(hue[min(i + 1, 3)])
+        L, C, h = _oklch(rgb)
+        for hue in (self.a, self.b):
+            for i, s in enumerate(hue):
+                Ls, Cs, hs = _oklch(_hex(s))
+                turned = abs((h - hs + np.pi) % (2 * np.pi) - np.pi)
+                if turned < 0.02 and abs(L - Ls) <= 0.21 and 0.6 * Cs <= C <= Cs + 1e-3:
+                    moved = [_oklch(_hex(hue[j])) for j in (max(i - 1, 0), min(i + 1, 3))]
+                    dark, light = (_hex(_from_oklch(min(max(Lj + L - Ls, 0.0), 1.0), Cj, hj)) for Lj, Cj, hj in moved)
+                    return dark, rgb, light
         return mix(rgb, 0.62, (0.0, 0.0, 0.0)), rgb, mix(rgb, 0.55)
 
 
@@ -397,3 +479,302 @@ def register_palette(pal):
     """Add a custom palette under its own name."""
     palettes[pal.name] = pal
     return pal
+
+
+# sRGB in linear light to CIE XYZ under D50, the connection space of ICC profiles, by Bradford adaptation
+_XYZ = np.array([[0.4360747, 0.3850649, 0.1430804], [0.2225045, 0.7168786, 0.0606169],
+                 [0.0139322, 0.0971045, 0.7141733]])
+_D50 = np.array([0.9642, 1.0, 0.8249])
+# A print's colors count as reached within this CIEDE2000 difference, about the least a viewer notices side by side
+REACH = 1.0
+# Ink coverage the solved separations keep to, 300% as SWOP asks; a grid of this many steps per channel, through which
+# large images go; and the steps of the grid over CIELAB that the default press's own profile is built on
+INK_LIMIT, IMAGE_GRID, PROFILE_GRID = 3.0, 17, 9
+
+
+def _xyz_lab(xyz):
+    """CIELAB of CIE XYZ under D50, along the last axis."""
+    t = np.asarray(xyz, dtype = float) / _D50
+    f = np.where(t > (6 / 29) ** 3, np.cbrt(np.maximum(t, 0.0)), t / (3 * (6 / 29) ** 2) + 4 / 29)
+    return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], axis = -1)
+
+
+def _lab_xyz(lab):
+    """CIE XYZ under D50 of CIELAB, along the last axis."""
+    lab = np.asarray(lab, dtype = float)
+    fy = (lab[..., 0] + 16) / 116
+    f = np.stack([fy + lab[..., 1] / 500, fy, fy - lab[..., 2] / 200], axis = -1)
+    return np.where(f > 6 / 29, f ** 3, 3 * (6 / 29) ** 2 * (f - 4 / 29)) * _D50
+
+
+def cielab(rgb):
+    """CIELAB under D50 of sRGB colors along the last axis, as ICC profiles connect them."""
+    return _xyz_lab(_linear(rgb) @ _XYZ.T)
+
+
+def _srgb(lab):
+    """sRGB of CIELAB colors under D50, clipped into its gamut."""
+    lin = np.clip(_lab_xyz(lab) @ np.linalg.inv(_XYZ).T, 0.0, 1.0)
+    return np.where(lin <= 0.0031308, 12.92 * lin, 1.055 * lin ** (1 / 2.4) - 0.055)
+
+
+def _oklab_srgb(ok):
+    """sRGB of OKLab colors along the last axis, clipped into its gamut."""
+    lin = np.clip((ok @ np.linalg.inv(_LAB).T) ** 3 @ np.linalg.inv(_LMS).T, 0.0, 1.0)
+    return np.where(lin <= 0.0031308, 12.92 * lin, 1.055 * lin ** (1 / 2.4) - 0.055)
+
+
+def delta_e(lab1, lab2):
+    """CIEDE2000 differences between CIELAB colors along the last axis, the measure print is judged by: about 1 is the
+    least a viewer notices side by side, and 2 to 3 what a press proof is held to."""
+    (L1, a1, b1), (L2, a2, b2) = (np.moveaxis(np.asarray(v, dtype = float), -1, 0) for v in (lab1, lab2))
+    cb7 = ((np.hypot(a1, b1) + np.hypot(a2, b2)) / 2) ** 7
+    g = 1.5 - 0.5 * np.sqrt(cb7 / (cb7 + 25.0 ** 7))
+    c1, c2 = np.hypot(a1 * g, b1), np.hypot(a2 * g, b2)
+    h1, h2 = np.degrees(np.arctan2(b1, a1 * g)) % 360, np.degrees(np.arctan2(b2, a2 * g)) % 360
+    flat = c1 * c2 == 0
+    dh = np.where(flat, 0.0, (h2 - h1 + 180) % 360 - 180)
+    hb = np.where(flat, h1 + h2, np.where(np.abs(h1 - h2) <= 180, (h1 + h2) / 2,
+                                          np.where(h1 + h2 < 360, (h1 + h2 + 360) / 2, (h1 + h2 - 360) / 2)))
+    t = (1 - 0.17 * np.cos(np.radians(hb - 30)) + 0.24 * np.cos(np.radians(2 * hb))
+         + 0.32 * np.cos(np.radians(3 * hb + 6)) - 0.20 * np.cos(np.radians(4 * hb - 63)))
+    lb, cb = (L1 + L2) / 2 - 50, (c1 + c2) / 2
+    dl = (L2 - L1) / (1 + 0.015 * lb ** 2 / np.sqrt(20 + lb ** 2))
+    dc = (c2 - c1) / (1 + 0.045 * cb)
+    dH = 2 * np.sqrt(c1 * c2) * np.sin(np.radians(dh) / 2) / (1 + 0.015 * cb * t)
+    rt = -np.sin(np.radians(60 * np.exp(-((hb - 275) / 25) ** 2))) * 2 * np.sqrt(cb ** 7 / (cb ** 7 + 25.0 ** 7))
+    return np.sqrt(dl ** 2 + dc ** 2 + dH ** 2 + rt * dc * dH)
+
+
+def _icc_table(data, at):
+    """An ICC table of 8 or 16 bits (lut8, lut16) at an offset: its input curves, grid, and output curves in [0, 1],
+    and whether it has 16 bits, which sets how it writes CIELAB."""
+    kind, nin, nout, g = data[at:at + 4], data[at + 8], data[at + 9], data[at + 10]
+    if kind not in (b'mft1', b'mft2'):
+        raise ValueError(f'viscose reads the 8- and 16-bit tables (lut8, lut16) that version 2 print profiles hold, '
+                         f'not {kind.decode("latin-1")!r}')
+    wide = kind == b'mft2'
+    n, m = struct.unpack('>HH', data[at + 48:at + 52]) if wide else (256, 256)
+    unit, p, parts = np.dtype('>u2' if wide else 'u1'), at + (52 if wide else 48), []
+    for count in (nin * n, g ** nin * nout, nout * m):
+        parts.append(np.frombuffer(data, unit, count, p).astype(float) / (65535.0 if wide else 255.0))
+        p += count * unit.itemsize
+    return parts[0].reshape(nin, n), parts[1].reshape((g,) * nin + (nout,)), parts[2].reshape(nout, m), wide
+
+
+def _icc_apply(table, x, slope = False):
+    """An ICC table at points `x` of shape (N, inputs) in [0, 1], by multilinear interpolation on its grid, and with
+    `slope` also its derivatives, of shape (N, outputs, inputs), through its curves as well."""
+    curves, grid, out, _ = table
+    nin, g, n, m = x.shape[1], grid.shape[0], curves.shape[1], out.shape[1]
+    u = np.stack([np.interp(x[:, i], np.linspace(0, 1, n), curves[i]) for i in range(nin)], 1) * (g - 1)
+    lo = np.minimum(u.astype(int), g - 2)
+    # Every corner of each point's cell at once, weighted by the point's place in it
+    f, strides = u - lo, g ** np.arange(nin - 1, -1, -1)
+    corners = np.array(list(itertools.product((0, 1), repeat = nin)))
+    parts = np.where(corners, f[:, None, :], 1 - f[:, None, :])
+    found = grid.reshape(-1, grid.shape[-1])[(lo @ strides)[:, None] + corners @ strides]
+    y = np.einsum('nk,nkc->nc', parts.prod(axis = 2), found)
+    result = np.stack([np.interp(y[:, k], np.linspace(0, 1, m), out[k]) for k in range(y.shape[1])], 1)
+    if not slope:
+        return result
+    # Each piecewise linear curve's slope where it is read, and the grid's by the weights' derivatives
+    step = lambda c, v, k: np.diff(c, axis = 1)[np.arange(len(c))[:, None], np.clip((v * (k - 1)).astype(int), 0,
+                                                                                    k - 2)].T * (k - 1)
+    grads = np.stack([np.prod(np.delete(parts, i, axis = 2), axis = 2) * np.where(corners[:, i], 1.0, -1.0)
+                      for i in range(nin)], axis = 2)
+    inner = np.einsum('nki,nkc->nci', grads, found) * (g - 1)
+    return result, step(out, y.T, m)[:, :, None] * inner * step(curves, x.T, n)[:, None, :]
+
+
+def _mft2(grid):
+    """A lut16 table, as ICC writes it, of a grid of values in [0, 1] whose last axis holds its outputs, with straight
+    curves around it."""
+    nin, nout, g = grid.ndim - 1, grid.shape[-1], grid.shape[0]
+    head = b'mft2' + bytes(4) + bytes((nin, nout, g, 0)) + struct.pack('>9i', 65536, 0, 0, 0, 65536, 0, 0, 0, 65536)
+    line = np.array([0, 65535], '>u2').tobytes()
+    clut = (np.clip(grid, 0.0, 1.0) * 65535.0 + 0.5).astype('>u2').tobytes()
+    return head + struct.pack('>HH', 2, 2) + line * nin + clut + line * nout
+
+
+class Press:
+    """A print condition, for PDF/X in CMYK and for soft proofs of how a figure prints. By default, U.S. web offset on
+    coated paper, CGATS TR 001 (SWOP), as Clinton Ingram's compact profile in the public domain (CC0) characterizes it,
+    with separations that viscose solves itself: black for neutrals and shadows, less of it as color grows, and at most
+    `ink_limit` of ink in all, 300% as SWOP asks. `profile` takes a printer's or a journal's own ICC output profile
+    instead, such as FOGRA39 or GRACoL, as a path or bytes, whose table from CMYK to CIELAB the separations are then
+    solved on; `condition` names its registered print condition, as the PDF/X's output intent does, and `info`
+    describes it. Colors a press cannot print keep their lightness and hue and give up only the chroma they must, so
+    that a palette's hues print as the same hues, and dark inks keep their steps above the press's own black."""
+    def __init__(self, profile = None, condition = None, info = None, ink_limit = INK_LIMIT,
+                 registry = 'http://www.color.org'):
+        own = profile is not None
+        data = (bytes(profile) if isinstance(profile, (bytes, bytearray)) else Path(profile).read_bytes()) if own else (
+            Path(__file__).parent / 'swop.icc').read_bytes()
+        if data[16:20] != b'CMYK' or data[20:24] != b'Lab ':
+            raise ValueError('A press needs an ICC profile of CMYK that connects through CIELAB')
+        count = struct.unpack('>I', data[128:132])[0]
+        tags = {sig: at for sig, at, _ in struct.iter_unpack('>4sII', data[132:132 + 12 * count])}
+        if b'A2B1' not in tags and b'A2B0' not in tags:
+            raise ValueError("A press's profile needs a table from CMYK to CIELAB (A2B1 or A2B0)")
+        self.forward = _icc_table(data, tags.get(b'A2B1', tags.get(b'A2B0')))
+        name, at = 'U.S. Web Coated (SWOP)', tags.get(b'desc')
+        if own:
+            name = data[at + 12:at + 12 + struct.unpack('>I', data[at + 8:at + 12])[0]].split(b'\0')[0].decode(
+                'latin-1') if at is not None and data[at:at + 4] == b'desc' else 'Custom'
+        self.condition = condition or ('CGATS TR 001' if not own else name)
+        self.info, self.registry, self.ink_limit = info or name, registry, ink_limit
+        self._data, self._own, self._seen, self._grid, self._icc = data, own, {}, None, None
+        # The press's own black, down to which black point compensation scales sRGB's
+        self.black = self.lab(np.array([[*[min(1.0, (ink_limit - 1.0) / 3.0)] * 3, 1.0]]))[0]
+
+    def lab(self, cmyk, slope = False):
+        """CIELAB of CMYK on this press, by its profile, and with `slope` its derivatives by each ink."""
+        found = _icc_apply(self.forward, np.asarray(cmyk, dtype = float), slope)
+        (v, d), k = found if slope else (found, None), 65535 / 65280 if self.forward[3] else 1.0
+        lab = np.column_stack([100 * k * v[:, 0], 255 * k * v[:, 1] - 128, 255 * k * v[:, 2] - 128])
+        return (lab, d * (np.array([100.0, 255.0, 255.0]) * k)[None, :, None]) if slope else lab
+
+    def _ink(self, lab, rgb = None, black = None):
+        """CMYK for CIELAB colors on this press, and how far each misses, solved on the profile's table from CMYK to
+        CIELAB, which characterizes the press: black from lightness, less of it as color grows, then cyan, magenta,
+        and yellow by damped Newton steps from the naive separation of `rgb` where given, trying more and less black
+        where the ink limit or the color asks for it, or only the `black` given. A profile's own table back from CIELAB
+        is a separation strategy of its maker's, which can pull dark colors to gray, as Windows' SWOP profile does by
+        13 CIEDE2000 on a dark red its own press prints."""
+        n, shifts = len(lab), np.array([0.0, -0.25, 0.25, 0.5] if black is None else [0.0])
+        chroma = np.hypot(lab[:, 1], lab[:, 2])
+        plan = (np.clip((75.0 - lab[:, 0]) / 75.0, 0.0, 1.0) ** 1.5 * np.clip(1.0 - chroma / 60.0, 0.0, 1.0)
+                if black is None else black)
+        # Each black tried for every color at once, its cyan, magenta, and yellow from the same start
+        k, target = np.clip(plan[None, :] + shifts[:, None], 0.0, 1.0).ravel(), np.tile(lab, (len(shifts), 1))
+        x = np.full((len(k), 3), 0.3) if rgb is None else np.clip((1.0 - np.tile(rgb, (len(shifts), 1)) - k[:, None])
+                                                                   / np.maximum(1.0 - k[:, None], 1e-3), 0.0, 1.0)
+        for _ in range(8 if rgb is not None else 12):
+            found, jac = self.lab(np.column_stack([x, k]), True)
+            f, jac = found - target, jac[:, :, :3]
+            jt = np.swapaxes(jac, 1, 2)
+            x = np.clip(x - np.linalg.solve(jt @ jac + 1e-2 * np.eye(3), jt @ f[..., None])[..., 0], 0.0, 1.0)
+        ink = np.column_stack([x, k])
+        off = delta_e(self.lab(ink), target).reshape(len(shifts), n)
+        # The separation that misses least wins, then the one that keeps to the ink limit and to the planned black
+        cost = off + 100.0 * np.maximum(ink.sum(1) - self.ink_limit, 0.0).reshape(len(shifts), n) + 0.5 * np.abs(
+            k.reshape(len(shifts), n) - plan)
+        pick = cost.argmin(0)
+        return ink.reshape(len(shifts), n, 4)[pick, np.arange(n)], off[pick, np.arange(n)]
+
+    def _within(self, rgb):
+        """CMYK of sRGB colors, each brought into the press's gamut first: black point compensation scales sRGB's
+        black down to the press's own, as Adobe's does in XYZ, and a color still out of reach keeps its OKLab lightness
+        and hue and gives up the least chroma, by bisection, that brings it within REACH."""
+        black = _lab_xyz(self.black)
+        within = lambda c: _xyz_lab(_lab_xyz(cielab(c)) * (1 - black / _D50) + black)
+        ink, miss = self._ink(within(rgb), rgb)
+        far = np.flatnonzero(miss > REACH)
+        if len(far):
+            ok = _oklab(rgb[far])
+            lo, hi, keep = np.zeros(len(far)), np.ones(len(far)), ink[far]
+            # With the black each color first took, which its chroma barely moves
+            for _ in range(6):
+                mid = (lo + hi) / 2
+                less = _oklab_srgb(np.column_stack([ok[:, 0], ok[:, 1:] * mid[:, None]]))
+                trial, off = self._ink(within(less), less, ink[far, 3])
+                fits = off <= REACH
+                lo, hi = np.where(fits, mid, lo), np.where(fits, hi, mid)
+                keep[fits] = trial[fits]
+            ink[far] = keep
+        # Less ink than the finest halftone dot prints as none
+        return np.where(ink < 0.002, 0.0, ink)
+
+    def separate(self, rgb):
+        """CMYK in [0, 1] for sRGB colors of shape (N, 3) in [0, 1], as `_within` brings them in: each color is worked
+        out once, and many at a time, as an image's, go through a grid of IMAGE_GRID steps per channel."""
+        rgb = np.asarray(rgb, dtype = float).reshape(-1, 3)
+        if len(rgb) > IMAGE_GRID ** 3 // 4:
+            if self._grid is None:
+                axis = np.linspace(0.0, 1.0, IMAGE_GRID)
+                nodes = np.stack(np.meshgrid(axis, axis, axis, indexing = 'ij'), -1).reshape(-1, 3)
+                self._grid = self._within(nodes).reshape(IMAGE_GRID, IMAGE_GRID, IMAGE_GRID, 4)
+            straight = np.tile(np.linspace(0.0, 1.0, 2), (4, 1))
+            return _icc_apply((straight[:3], self._grid, straight, True), np.clip(rgb, 0.0, 1.0))
+        keys = ((np.clip(rgb, 0.0, 1.0) * 1023 + 0.5).astype(np.int64) @ np.array([1 << 20, 1 << 10, 1])).tolist()
+        new = [k for k in dict.fromkeys(keys) if k not in self._seen]
+        if new:
+            found = np.array([[k >> 20, k >> 10 & 1023, k & 1023] for k in new]) / 1023.0
+            self._seen.update(zip(new, self._within(found)))
+        return np.array([self._seen[k] for k in keys])
+
+    def printed(self, rgb):
+        """sRGB of how colors print, for a soft proof on screen, with the paper as white."""
+        return _srgb(self.lab(self.separate(rgb)))
+
+    def gamut(self, palette = None):
+        """How each color of a palette prints: (name, screen, print, CIEDE2000 between them), the print as sRGB hex,
+        farthest first. Below about 2 the print holds the color; past that, the press has taken chroma away."""
+        pal = get_palette(palette)
+        names = [f'{h}{i}' for h in 'ab' for i in range(4)] + ['ink', 'muted', 'faint']
+        rgb = np.array([pal.color(n) for n in names])
+        out = self.printed(rgb)
+        far = delta_e(cielab(rgb), cielab(out))
+        rows = [(n, pal.css(n), '#%02X%02X%02X' % tuple(int(round(v * 255)) for v in o), round(float(d), 2))
+                for n, o, d in zip(names, out, far)]
+        return sorted(rows, key = lambda r: -r[3])
+
+    def icc(self):
+        """The ICC profile a PDF/X names in its output intent: the press's own, or for the default press a version 2
+        output profile around the public-domain table, with separations and a gamut on a grid of PROFILE_GRID steps
+        over CIELAB, solved as `separate` solves them."""
+        if self._own:
+            return self._data
+        if self._icc is not None:
+            return self._icc
+        axis = np.linspace(0.0, 1.0, PROFILE_GRID)
+        v = np.stack(np.meshgrid(axis, axis, axis, indexing = 'ij'), -1).reshape(-1, 3) * 65535 / 65280
+        lab = np.column_stack([v[:, 0] * 100, v[:, 1] * 255 - 128, v[:, 2] * 255 - 128])
+        ink, miss = self._ink(lab)
+        far = np.flatnonzero(miss > REACH)
+        # CIELAB the press cannot reach comes in by chroma, at its own lightness and hue
+        lo, hi, keep = np.zeros(len(far)), np.ones(len(far)), ink[far]
+        for _ in range(6):
+            mid = (lo + hi) / 2
+            trial, off = self._ink(np.column_stack([lab[far, 0], lab[far, 1:] * mid[:, None]]))
+            fits = off <= REACH
+            lo, hi = np.where(fits, mid, lo), np.where(fits, hi, mid)
+            keep[fits] = trial[fits]
+        ink[far] = keep
+        grid = (PROFILE_GRID,) * 3
+        b2a, gamt = _mft2(ink.reshape(*grid, 4)), _mft2((miss > REACH).astype(float).reshape(*grid, 1))
+        count = struct.unpack('>I', self._data[128:132])[0]
+        found = {sig: self._data[at:at + size] for sig, at, size in
+                 struct.iter_unpack('>4sII', self._data[132:132 + 12 * count])}
+        name = ('viscose ' + self.info).encode('latin-1')
+        desc = b'desc' + bytes(4) + struct.pack('>I', len(name) + 1) + name + b'\0' + bytes(78)
+        tags = [(b'desc', desc), (b'cprt', b'text' + bytes(4) + b'Public domain (CC0)\0'), (b'wtpt', found[b'wtpt']),
+                (b'A2B0', found[b'A2B0']), (b'A2B1', found[b'A2B0']), (b'A2B2', found[b'A2B0']), (b'B2A0', b2a),
+                (b'B2A1', b2a), (b'B2A2', b2a), (b'gamt', gamt)]
+        # Tags that share their data share its place, as ICC allows
+        body, table, where, start = b'', b'', {}, 132 + 12 * len(tags)
+        for sig, blob in tags:
+            if blob not in where:
+                where[blob] = start + len(body)
+                body += blob + bytes(-len(blob) % 4)
+            table += struct.pack('>4sII', sig, where[blob], len(blob))
+        head = (struct.pack('>I', start + len(body)) + bytes(4) + bytes((2, 0x10, 0, 0)) + b'prtrCMYKLab '
+                + struct.pack('>6H', 2026, 11, 12, 0, 0, 0) + b'acsp' + bytes(24) + struct.pack('>I', 1)
+                + struct.pack('>3i', 63190, 65536, 54061) + b'vscs' + bytes(44))
+        self._icc = head + struct.pack('>I', len(tags)) + table + body
+        return self._icc
+
+
+_presses = {}
+
+
+def press(given = True):
+    """A Press from what a figure's output was given: True for the default press, an ICC profile's path, or a Press,
+    which stays as it is. Presses from paths are made once."""
+    if isinstance(given, Press):
+        return given
+    key = 'swop' if given is True else str(given)
+    if key not in _presses:
+        _presses[key] = Press(None if given is True else given)
+    return _presses[key]

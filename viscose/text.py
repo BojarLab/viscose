@@ -80,11 +80,78 @@ def spaced(pal, text):
     return str(text).upper() if pal.caps else str(text)
 
 
-def width(text, size, bold = False, tracking = 0.0):
+# Characters set in a tabular figure's cell, and those of numbers whose kerning a tabular column leaves out
+FIGURES = '0123456789'
+NUMERIC = FIGURES + '.,-+−'
+# What a column of tick labels lines up on its decimal point: a sign, digits, and an optional fraction, with anything
+# after them, such as a unit
+_DECIMAL = re.compile(r'[-+−]?(?:\d[\d,]*)?(?:\.\d*)?')
+
+
+@functools.lru_cache(64)
+def _figures(name):
+    """The cell a tabular figure takes in a font, per point of type, or None where its figures are tabular already: all
+    of one width and never kerned, as Century Gothic's are."""
+    ttf = pdfmetrics.fonts[name].ttf
+    widths = {ttf.width(ttf.gid(ch)) for ch in FIGURES}
+    kerned = any(ttf.kern(ttf.gid(a), ttf.gid(b)) for a in NUMERIC for b in NUMERIC)
+    return max(widths) / 1000.0 if len(widths) > 1 or kerned else None
+
+
+@functools.lru_cache(4096)
+def _bearings(name, ch):
+    """A character's left and right side bearings in a font, per point of type: how far its ink stands in from the
+    edges of its advance. A character without ink, such as a space, has none."""
+    ttf = pdfmetrics.fonts[name].ttf
+    g = ttf.gid(ch)
+    xs = [a[i] for _, a in ttf.outline(g) for i in range(0, len(a), 2)]
+    if not xs:
+        return 0.0, 0.0
+    return min(xs) / ttf.units_per_em, ttf.width(g) / 1000.0 - max(xs) / ttf.units_per_em
+
+
+def _pieces(line, name, size, tracking, tabular):
+    """One line as (text, x, rise, scale) pieces from its start, its width, and how far its ink stands in from either
+    end. Tabular figures each take the same cell, centered in it and never kerned, which takes a piece per character
+    in a font whose figures differ."""
+    cell = _figures(name) if tabular else None
+    pieces, pen, ends = [], 0.0, []
+    for t, rise, k in runs(line):
+        if not t:
+            continue
+        if cell is None:
+            pieces.append((t, pen, rise, k))
+            start = pen + _bearings(name, t[0])[0] * size * k
+            pen += pdfmetrics.stringWidth(t, name, size * k) + tracking * len(t)
+            ends.append((start, pen - tracking - _bearings(name, t[-1])[1] * size * k))
+            continue
+        for ch in t:
+            adv = pdfmetrics.stringWidth(ch, name, size * k)
+            shift = (cell * size * k - adv) / 2 if ch in FIGURES else 0.0
+            pieces.append((ch, pen + shift, rise, k))
+            lsb, rsb = _bearings(name, ch)
+            ends.append((pen + shift + lsb * size * k, pen + shift + adv - rsb * size * k))
+            pen += (cell * size * k if ch in FIGURES else adv) + tracking
+    return pieces, pen, (ends[0][0], pen - ends[-1][1]) if ends else (0.0, 0.0)
+
+
+def width(text, size, bold = False, tracking = 0.0, tabular = False):
+    """How far a text runs, its longest line for several; `tabular` sets figures in cells of one width."""
     if '\n' in str(text):
-        return max(width(line, size, bold, tracking) for line in str(text).split('\n'))
+        return max(width(line, size, bold, tracking, tabular) for line in str(text).split('\n'))
     name = fonts()[1 if bold else 0]
+    if tabular and _figures(name) is not None:
+        return _pieces(str(text), name, size, tracking, True)[1]
     return sum(pdfmetrics.stringWidth(t, name, size * k) + tracking * len(t) for t, _, k in runs(text))
+
+
+def decimal(labels):
+    """Each label's part before its decimal point, or before what follows its digits, and from there on, for a column
+    of numbers that lines up on its decimal points; None for labels with a power of ten, or that are no numbers."""
+    found = [_DECIMAL.match(str(s)).group() for s in labels]
+    if not labels or any('^{' in str(s) or not any(ch.isdigit() for ch in m) for s, m in zip(labels, found)):
+        return None
+    return [(m.split('.')[0], str(s)[len(m.split('.')[0]):]) for s, m in zip(labels, found)]
 
 
 def outline(c, ttf, text, x, y, size, tracking = 0.0):
@@ -114,9 +181,11 @@ def outline(c, ttf, text, x, y, size, tracking = 0.0):
 
 
 def draw(c, x, y, text, size, color, bold = False, ha = 'left', va = 'baseline', rotation = 0.0, tracking = 0.0,
-         halo = 0.0, halo_color = (1.0, 1.0, 1.0), linespacing = 1.25):
+         halo = 0.0, halo_color = (1.0, 1.0, 1.0), linespacing = 1.25, tabular = False):
     """Draw text at (x, y) in page points; several lines, `linespacing` sizes apart, run downward as one block that
-    `va` places."""
+    `va` places. A line's ink, not its advance, lines up on x, by optical margin alignment, so that labels in a column
+    and a title over an axis line up by eye; `tabular` sets numbers in figures of one width, which line up by their
+    cells, as a table's columns do."""
     text = str(text)
     if not text:
         return
@@ -126,35 +195,32 @@ def draw(c, x, y, text, size, color, bold = False, ha = 'left', va = 'baseline',
         for i, part in enumerate(parts):
             drop = (i - lift) * size * linespacing
             draw(c, x + drop * math.sin(math.radians(rotation)), y - drop * math.cos(math.radians(rotation)), part,
-                 size, color, bold, ha, va, rotation, tracking, halo, halo_color)
+                 size, color, bold, ha, va, rotation, tracking, halo, halo_color, tabular = tabular)
         return
     name = fonts()[1 if bold else 0]
-    w = width(text, size, bold, tracking)
-    dx = {'left': 0.0, 'center': -w / 2, 'right': -w}[ha]
+    pieces, w, (lead, tail) = _pieces(text, name, size, tracking, tabular)
+    if tabular:
+        lead = tail = 0.0
+    dx = {'left': -lead, 'center': (tail - lead - w) / 2, 'right': tail - w}[ha]
     dy = {'baseline': 0.0, 'center': -CAP_HEIGHT * size / 2, 'top': -CAP_HEIGHT * size, 'bottom': 0.22 * size}[va]
     c.saveState()
     c.translate(x, y)
     if rotation:
         c.rotate(rotation)
-    pen = dx
-    pieces = runs(text)
     if halo:
         c.saveState()
         c.setStrokeColorRGB(*halo_color, alpha = 1.0)
         c.setLineWidth(halo)
         c.setLineCap(1)
         c.setLineJoin(1)
-        q = pen
-        for t, rise, k in pieces:
-            c.drawPath(outline(c, pdfmetrics.fonts[name].ttf, t, q, dy + rise * size, size * k, tracking), fill = 0,
-                       stroke = 1)
-            q += pdfmetrics.stringWidth(t, name, size * k) + tracking * len(t)
+        for t, at, rise, k in pieces:
+            c.drawPath(outline(c, pdfmetrics.fonts[name].ttf, t, dx + at, dy + rise * size, size * k, tracking),
+                       fill = 0, stroke = 1)
         c.restoreState()
     c.setFillColorRGB(*color, alpha = 1.0)
-    for t, rise, k in pieces:
+    for t, at, rise, k in pieces:
         c.setFont(name, size * k)
-        c.drawString(pen, dy + rise * size, t, charSpace = tracking)
-        pen += pdfmetrics.stringWidth(t, name, size * k) + tracking * len(t)
+        c.drawString(dx + at, dy + rise * size, t, charSpace = tracking)
     c.restoreState()
 
 

@@ -409,6 +409,8 @@ class Axes:
         self._glyph_spots, self._gcols, self._full = (None, {}), 1, {'x': ([], []), 'y': ([], [])}
         self._xscale, self._yscale = 'linear', 'linear'
         self._xwarp, self._ywarp = WARPS['linear'], WARPS['linear']
+        # Whether an axis's tick labels are numbers, set in tabular figures and lined up on their decimal points
+        self._numbers = {'x': False, 'y': False}
         self._xinv, self._yinv = False, False
         self._cycle = 0
         self._cats = {'x': {}, 'y': {}}
@@ -500,14 +502,16 @@ class Axes:
     def scatter(self, x, y, s = 30, color = None, c = None, label = None, alpha = 1.0, cmap = 'sequential', vmin = None,
                 vmax = None, z = 3, marker = 'o', edge = None, gid = None, hue = None, style = None, size = None,
                 sizes = (20.0, 160.0), colors = None, markers = None, hue_label = None, style_label = None,
-                size_label = None, legend = 'right', names = None, rasterized = False):
+                size_label = None, legend = 'right', names = None, rasterized = False, density = True):
         """Points, as in seaborn's scatterplot. `hue`, `style`, and `size` hold one value per point and map to color,
         marker shape, and area, with a legend. Numeric `hue` with many values, or `c`, maps through a palette scale;
         call `colorbar` to show it. `colors` and `markers` are lists or {value: name} dicts. `edge` is (color, width),
         which with color = 'none' draws hollow rings. `names` holds one label per point, which draws nothing but tells a
         viewer such as slate what the point under the mouse is. `rasterized` makes all the points one image in PDF and
         SVG, at 300 dpi for True or at the dpi given, which keeps tens of thousands of points light, while axes and text
-        stay vector.
+        stay vector. Where points pile up past telling them apart, a map of their density takes over from them, in bands
+        of their color's shades set apart by hairlines of the page, while points stay wherever the data are sparse;
+        `density = False` keeps every point, as does a color scale from `c`, whose colors are data.
         """
         x, y = np.atleast_1d(self._pos(x, 'x')), np.atleast_1d(self._pos(y, 'y'))
         _check_lengths(x, y)
@@ -521,10 +525,12 @@ class Axes:
         raster = (300.0 if rasterized is True else float(rasterized), len(self.artists)) if rasterized else None
         if hue is not None and _numeric(hue) and len(np.unique(hue)) > 8:
             c, hue = hue, None
+        # The call's first artist, which lays the fields of where its points pile up under all of them
+        crowd = len(self.artists) if density and c is None else None
         if hue is None and style is None and size is None and c is None:
             rgb = self._next_color(color)
             self._add('points', z, x = x, y = y, s = s, rgb = rgb, alpha = alpha, marker = marker, edge = edge,
-                      gid = gid, names = names, raster = raster)
+                      gid = gid, names = names, raster = raster, crowd = crowd)
             self._labeled(label, rgb, 'point', marker)
             return self
         n = len(x)
@@ -567,10 +573,11 @@ class Axes:
                 ticks = nice_ticks(float(low), float(high), 4)
                 size_key = [(name, float(scale(t))) for name, t in zip(tick_labels(ticks), ticks)]
             else:
-                names = list(dict.fromkeys(str(u) for u in size))
-                steps = np.linspace(sizes[0], sizes[1], max(len(names), 2))
-                area = np.array([steps[names.index(str(u))] for u in size], dtype = float)
-                size_key = [(k, float(steps[i])) for i, k in enumerate(names)]
+                # Not `names`, which holds the points' own labels
+                kinds = list(dict.fromkeys(str(u) for u in size))
+                steps = np.linspace(sizes[0], sizes[1], max(len(kinds), 2))
+                area = np.array([steps[kinds.index(str(u))] for u in size], dtype = float)
+                size_key = [(k, float(steps[i])) for i, k in enumerate(kinds)]
         for h in hue_levels:
             for st in style_levels:
                 m = (hues == h) & (styles == st)
@@ -582,7 +589,8 @@ class Axes:
                     if chosen.any():
                         self._add('points', z, x = x[chosen], y = y[chosen], s = area[chosen], rgb = rgb, alpha = alpha,
                                   marker = style_marker[st], edge = edge, gid = gid,
-                                  names = None if names is None else names[chosen], raster = raster)
+                                  names = None if names is None else names[chosen], raster = raster, crowd = crowd,
+                                  mapped = c is not None)
         sections = (hue is not None) + (style is not None) + (size is not None)
         plain = self.pal.color(self.pal.muted) if hue is not None else hue_rgb['']
         if hue is not None:
@@ -674,43 +682,9 @@ class Axes:
         known = np.isfinite(m)
         if np.ndim(levels) == 0:
             levels = np.linspace(m[known].min(), m[known].max(), int(levels) + 2)[1:-1] if known.any() else []
-        lines = []
-        for level in levels:
-            above = m >= level
-            across = (above[:, :-1] != above[:, 1:]) & known[:, :-1] & known[:, 1:]
-            up = (above[:-1] != above[1:]) & known[:-1] & known[1:]
-            # The level crosses each of these grid edges once, where a straight line between its two ends says
-            spots = {}
-            for r, j in np.argwhere(across):
-                spots['h', r, j] = x[j] + (level - m[r, j]) / (m[r, j + 1] - m[r, j]) * (x[j + 1] - x[j]), y[r]
-            for r, j in np.argwhere(up):
-                spots['v', r, j] = x[j], y[r] + (level - m[r, j]) / (m[r + 1, j] - m[r, j]) * (y[r + 1] - y[r])
-            links = {k: [] for k in spots}
-            for r, j in np.argwhere(across[:-1] | across[1:] | up[:, :-1] | up[:, 1:]):
-                low, high, left, right = ('h', r, j), ('h', r + 1, j), ('v', r, j), ('v', r, j + 1)
-                ends = [k for k in (low, high, left, right) if k in spots]
-                if len(ends) == 2:
-                    pairs = [ends]
-                elif len(ends) == 4:
-                    # A saddle: the cell's center says which two corners stay joined
-                    center = m[r:r + 2, j:j + 2].mean() >= level
-                    pairs = [(low, right), (left, high)] if above[r, j] == center else [(left, low), (high, right)]
-                else:
-                    continue
-                for a, b in pairs:
-                    links[a].append(b)
-                    links[b].append(a)
-            # One line per stretch, so that transparency and dashes run along it: open ones from an end, then the loops
-            for start in [k for k, v in links.items() if len(v) == 1] + list(links):
-                if not links[start]:
-                    continue
-                chain, at = [start], start
-                while links[at]:
-                    step = links[at].pop()
-                    links[step].remove(at)
-                    chain.append(step)
-                    at = step
-                lines.append(tuple(np.array(v) for v in zip(*[spots[k] for k in chain])))
+        # Grid units to data along each axis, where a straight line between grid points says
+        lines = [(np.interp(u, np.arange(len(x)), x), np.interp(v, np.arange(len(y)), y)) for level in levels
+                 for u, v in marks.isolines(m, level)]
         rgb = self.pal.color(color)
         self._add('contour', z, x = x, y = y, lines = lines, rgb = rgb, lw = lw, alpha = alpha, dash = dash)
         self._labeled(label, rgb, 'line', dash)
@@ -1654,6 +1628,7 @@ class Axes:
         if self._tick_opts[axis].get('labels', True) is False or self._outer[axis]:
             labels = []
         setattr(self, axis + 'labels', _minus(self.pal, labels) if numbers else labels)
+        self._numbers[axis] = numbers
         # All of them, as fitting may leave some out, while the page grows for all
         self._full[axis] = (getattr(self, axis + 'ticks'), getattr(self, axis + 'labels'))
 
@@ -1808,7 +1783,7 @@ class Axes:
     def _ytick_width(self, s, size):
         g = self._tick_glyph('y', s)
         if g is None:
-            return text.width(s, size, self.pal.tick_bold)
+            return text.width(s, size, self.pal.tick_bold, tabular = self._numbers['y'])
         left, _, right, _ = self._glyph_extent('y', g)
         return right - left
 
@@ -1816,12 +1791,25 @@ class Axes:
         """How wide the y tick labels run from their pad, and where each starts past it, in label order: all at once
         in one column, or, staggered, every other label down the axis a column farther out, so that tall glyphs need
         clear only the next label but one."""
+        split = self._decimals(self.ylabels, size)
+        if split:
+            return max(a for a, _ in split) + max(b for _, b in split), [0.0] * len(split)
         widths = [self._ytick_width(s, size) for s in self.ylabels]
         if self._gcols == 1 or len(widths) < 2:
             return max(widths, default = 0.0), [0.0] * len(widths)
         rank = np.argsort(np.argsort(self._ty(self.yticks), kind = 'stable'), kind = 'stable') % 2
         near, far = (max((w for w, r in zip(widths, rank) if r == side), default = 0.0) for side in (0, 1))
         return near + 0.5 * size + far, [near + 0.5 * size if r else 0.0 for r in rank]
+
+    def _decimals(self, labels, size, numbers = None):
+        """For y tick labels, or with `numbers` True any column of numbers, that line up on their decimal points: each
+        one's width before that point and from it on, in tabular figures, else None."""
+        split = text.decimal(labels) if (self._numbers['y'] if numbers is None else numbers) else None
+        if not split or self._tick_opts['y'].get('glyphs'):
+            return None
+        bold = [s in self._yemph or self.pal.tick_bold for s in labels]
+        return [(text.width(a, size, b, tabular = True), text.width(rest, size, b, tabular = True))
+                for (a, rest), b in zip(split, bold)]
 
     def _tick_need(self, axis):
         """How long an axis must be for all its tick labels to show, glyphs at their least size: the plot's length as it
@@ -1922,7 +1910,8 @@ class Axes:
                 return tall
         if self.xrot:
             sin = abs(math.sin(math.radians(self.xrot)))
-            return max(tall, max((text.width(s, sx, self.pal.tick_bold) for s in labels), default = 0.0) * sin
+            return max(tall, max((text.width(s, sx, self.pal.tick_bold, tabular = self._numbers['x']) for s in labels),
+                                 default = 0.0) * sin
                        + sx * 0.4)
         return max(tall, sx * (1.0 + 1.25 * max(map(_extra_lines, labels), default = 0)))
 
@@ -1952,7 +1941,10 @@ class Axes:
         ticks = nice_ticks(source._scale['lo'], source._scale['hi'], 5)
         label = self.pal.label_size * 1.6 if self._cbar['label'] else 0.0
         k = self.pal.spacing
-        widest = max(text.width(s, 8.4 * k) for s in _minus(self.pal, tick_labels(ticks)))
+        labels = _minus(self.pal, tick_labels(ticks))
+        split = self._decimals(labels, 8.4 * k, True)
+        widest = (max(a for a, _ in split) + max(b for _, b in split) if split else
+                  max(text.width(s, 8.4 * k, tabular = True) for s in labels))
         return 12.0 * k + COLORBAR_WIDTH * k + 5.0 * k + widest + label
 
     def _margins(self):
@@ -2084,7 +2076,8 @@ class Axes:
             changed = self._fit_glyphs(axis) or changed
         if len(self.xticks) > 1 and self.xlabels and self._tick_opts['x'].get('fit', True) and not glyphs['x']:
             gap = _gap(self._tx(self.xticks))
-            if not self.xrot and max(text.width(s, sx, pal.tick_bold) for s in self.xlabels) + 6.0 * pal.spacing > gap:
+            widest = max(text.width(s, sx, pal.tick_bold, tabular = self._numbers['x']) for s in self.xlabels)
+            if not self.xrot and widest + 6.0 * pal.spacing > gap:
                 self.xrot = 90.0
                 changed = True
             if self.xrot and gap < sx * 1.05 and not self.show_all[0]:
@@ -2342,8 +2335,12 @@ class Axes:
         group = [b for b in self.artists if b['kind'] == 'points' and b.get('raster') == spec] if spec else [a]
         if group[0] is not a:
             return
-        drawn = []
-        for b in group:
+        # Where a call's points pile up, its first artist lays a field for each color under all of them
+        crowd = a.get('crowd')
+        call = ([b for b in self.artists if b['kind'] == 'points' and b.get('crowd') == crowd] if crowd is not None
+                else [])
+        drawn, kept = [], {}
+        for b in call if call and call[0] is a else group:
             mask = np.isfinite(b['x']) & np.isfinite(b['y'])
             # A point beyond the limits is not drawn, while one at the edge is drawn whole, which the clip's margin
             # allows
@@ -2352,28 +2349,47 @@ class Axes:
                 mask &= (v >= lo - slack) & (v <= hi + slack)
             drawn.append((self._tx(b['x'][mask]), self._ty(b['y'][mask]),
                           b['s'] if np.ndim(b['s']) == 0 else np.asarray(b['s'])[mask], b))
-        if not spec:
-            for px, py, s, b in drawn:
-                marks.points(c, self.pal, px, py, s, b['rgb'], b['alpha'], b['marker'], b['edge'])
-            return
-        xs, ys = np.concatenate([d[0] for d in drawn]), np.concatenate([d[1] for d in drawn])
-        if not len(xs):
-            return
-        sc = spec[0] / 72.0
-        (bx, by, bw, bh) = c.state['clip'][0][0] if c.state['clip'] else (0.0, 0.0, c.width, c.height)
-        # The pixels the points can reach within the clip, on a grid of the image's own resolution
-        reach = 1.4 * math.sqrt(max(float(np.max(d[2])) for d in drawn) * self.pal.point_scale) / 2 + 9.0
-        px0, py0 = math.floor(max(bx, xs.min() - reach) * sc), math.floor(max(by, ys.min() - reach) * sc)
-        nx = math.ceil(min(bx + bw, xs.max() + reach) * sc) - px0
-        ny = math.ceil(min(by + bh, ys.max() + reach) * sc) - py0
-        if nx <= 0 or ny <= 0:
-            return
-        ox, oy = px0 / sc, py0 / sc
-        layer = pdfwrite.Canvas(BytesIO(), pagesize = (nx / sc, ny / sc))
-        layer.stamp_dpi = spec[0]
-        layer.state['clip'] = [((bx - ox, by - oy, bw, bh), layer.state['ctm'])]
+        layer, (bx, by, bw, bh) = c, c.state['clip'][0][0] if c.state['clip'] else (0.0, 0.0, c.width, c.height)
+        if spec:
+            xs, ys = np.concatenate([d[0] for d in drawn]), np.concatenate([d[1] for d in drawn])
+            if not len(xs):
+                return
+            sc = spec[0] / 72.0
+            # The pixels the points can reach within the clip, on a grid of the image's own resolution
+            reach = 1.4 * math.sqrt(max(float(np.max(d[2])) for d in drawn) * self.pal.point_scale) / 2 + 9.0
+            px0, py0 = math.floor(max(bx, xs.min() - reach) * sc), math.floor(max(by, ys.min() - reach) * sc)
+            nx = math.ceil(min(bx + bw, xs.max() + reach) * sc) - px0
+            ny = math.ceil(min(by + bh, ys.max() + reach) * sc) - py0
+            if nx <= 0 or ny <= 0:
+                return
+            ox, oy = px0 / sc, py0 / sc
+            layer = pdfwrite.Canvas(BytesIO(), pagesize = (nx / sc, ny / sc))
+            layer.stamp_dpi = spec[0]
+            layer.state['clip'] = [((bx - ox, by - oy, bw, bh), layer.state['ctm'])]
+            drawn = [(px - ox, py - oy, s, b) for px, py, s, b in drawn]
+            bx, by = bx - ox, by - oy
+        if call and call[0] is a:
+            # Hollow rings pile up in their edge's color
+            colored = [(d, d[3]['rgb'] if d[3]['rgb'] is not None else d[3]['edge'][0]) for d in drawn
+                       if d[3]['rgb'] is not None or d[3]['edge']]
+            parts = [(px, py, np.sqrt(np.maximum(np.asarray(s, dtype = float), 0.0) * self.pal.point_scale) / 2.0, rgb)
+                     for (px, py, s, _), rgb in colored]
+            for (bands, keep), ((_, _, _, b), _) in zip(marks.crowd(self.pal, parts, (bx, by, bw, bh)), colored):
+                kept[id(b)] = keep
+                if bands is not None:
+                    marks.crowd_op(layer, self.pal, bands)
+            c.crowd = getattr(c, 'crowd', {})
+            c.crowd.update(kept)
+            drawn = [d for d in drawn if d[3] is a or spec]
+        elif call:
+            kept = getattr(c, 'crowd', {})
         for px, py, s, b in drawn:
-            marks.points(layer, self.pal, px - ox, py - oy, s, b['rgb'], b['alpha'], b['marker'], b['edge'])
+            keep = kept.get(id(b))
+            if keep is not None and not keep.all():
+                px, py, s = px[keep], py[keep], s if np.ndim(s) == 0 else s[keep]
+            marks.points(layer, self.pal, px, py, s, b['rgb'], b['alpha'], b['marker'], b['edge'])
+        if not spec:
+            return
         if len(layer.ops) == 1 and layer.ops[0]['kind'] == 'image':
             # Stamped, it is an image already
             op = layer.ops[0]
@@ -2755,19 +2771,26 @@ class Axes:
                 continue
             rgb, bold = ((pal.color(self._xemph[s]), True) if s in self._xemph else
                          (ink if heat and self.xrot else tick_rgb, pal.tick_bold))
+            figures = self._numbers['x']
             if self.xrot and above:
                 # The label starts at its tick and runs up and away from the axes
                 text.draw(c, x - small * 0.36 * math.sin(math.radians(self.xrot)), rise, s, small, rgb, bold,
-                          ha = 'left' if self.xrot > 0 else 'right', rotation = self.xrot, va = 'baseline')
+                          ha = 'left' if self.xrot > 0 else 'right', rotation = self.xrot, va = 'baseline',
+                          tabular = figures)
             elif self.xrot:
                 # The label's end sits at its tick, and it hangs below the axis either way
                 text.draw(c, x + small * 0.36 * math.sin(math.radians(self.xrot)), y0 - pad, s, small, rgb, bold,
-                          ha = 'right' if self.xrot > 0 else 'left', rotation = self.xrot, va = 'baseline')
+                          ha = 'right' if self.xrot > 0 else 'left', rotation = self.xrot, va = 'baseline',
+                          tabular = figures)
             else:
                 text.draw(c, x, rise if above else y0 - pad, s, small, rgb, bold, ha = 'center',
-                          va = 'bottom' if above else 'top')
+                          va = 'bottom' if above else 'top', tabular = figures)
         yw, offsets = self._ytick_columns(ytext)
-        for v, s, o in zip(self.yticks, self.ylabels, offsets):
+        # Numbers line up on their decimal points, the column's widest fraction in from its edge away from the plot
+        split = self._decimals(self.ylabels, ytext)
+        point = (yw - max(b for _, b in split) if self._yright else max(b for _, b in split)) if split else 0.0
+        split = split or [None] * len(self.ylabels)
+        for v, s, o, part in zip(self.yticks, self.ylabels, offsets, split):
             y = float(self._ty(v))
             # Where the label's column starts, from the axes outward
             start = x0 + w + ypad - 2.0 * pal.spacing + o if self._yright else x0 - ypad - o
@@ -2785,10 +2808,13 @@ class Axes:
                 continue
             rgb, bold = ((pal.color(self._yemph[s]), True) if s in self._yemph else
                          (ink if heat else tick_rgb, pal.tick_bold))
-            if self._yright:
-                text.draw(c, start, y, s, ytext, rgb, bold, ha = 'left', va = 'center')
+            if part is not None:
+                text.draw(c, (start + point if self._yright else start - point) - part[0], y, s, ytext, rgb, bold,
+                          ha = 'left', va = 'center', tabular = True)
+            elif self._yright:
+                text.draw(c, start, y, s, ytext, rgb, bold, ha = 'left', va = 'center', tabular = self._numbers['y'])
             else:
-                text.draw(c, start, y, s, ytext, rgb, bold, ha = 'right', va = 'center')
+                text.draw(c, start, y, s, ytext, rgb, bold, ha = 'right', va = 'center', tabular = self._numbers['y'])
         label_rgb = pal.color(pal.label_color or pal.ink)
         track = 0.9 if pal.caps else 0.0
         # Long axis names shrink to stay within their cell, centered on the axes
@@ -2921,7 +2947,7 @@ class Axes:
                           ((x0, by, x0 + bw, by), stops))
             for t, s in zip(ticks, _minus(pal, tick_labels(ticks))):
                 tx = x0 + (t - lo) / span * bw
-                text.draw(c, tx, by - 3.0 * k, s, 7.4 * k, ink, ha = 'center', va = 'top')
+                text.draw(c, tx, by - 3.0 * k, s, 7.4 * k, ink, ha = 'center', va = 'top', tabular = True)
             if label:
                 text.draw(c, x0, by + bh + 4.0 * k, text.spaced(pal, label), (7.8 if pal.caps else 8.6) * k, ink,
                           ha = 'left')
@@ -2932,10 +2958,15 @@ class Axes:
         by = y0 + h - bh
         marks.polygon(c, [bx, bx + bar, bx + bar, bx], [by, by, by + bh, by + bh], None, 1.0,
                       ((bx, by, bx, by + bh), stops))
-        widest = 0.0
-        for t, s in zip(ticks, _minus(pal, tick_labels(ticks))):
-            text.draw(c, bx + bar + 5.0 * k, by + (t - lo) / span * bh, s, 8.4 * k, ink, va = 'center')
-            widest = max(widest, text.width(s, 8.4 * k))
+        labels = _minus(pal, tick_labels(ticks))
+        # Numbers line up on their decimal points
+        split = self._decimals(labels, 8.4 * k, True)
+        point = max(a for a, _ in split) if split else 0.0
+        widest = point + max(b for _, b in split) if split else 0.0
+        for i, (t, s) in enumerate(zip(ticks, labels)):
+            text.draw(c, bx + bar + 5.0 * k + (point - split[i][0] if split else 0.0), by + (t - lo) / span * bh, s,
+                      8.4 * k, ink, va = 'center', tabular = True)
+            widest = max(widest, text.width(s, 8.4 * k, tabular = True))
         if label:
             text.draw(c, bx + bar + 5.0 * k + widest + pal.label_size * 1.3, by + bh / 2,
                       text.spaced(pal, label), pal.label_size, pal.color(pal.label_color or pal.ink), pal.label_bold,
