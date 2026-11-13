@@ -2460,8 +2460,12 @@ class Axes:
                 continue
             tw = self._note_size(a)[0]
             px, gap = float(self._tx(a['x'])), abs(a['dx']) + 3.0
-            over_right, over_left = px + gap + tw - (page - 3.0), tw + gap - (px - 3.0)
             natural_right = a['ha'] == 'left'
+            # On its own side a label reaches as far as its offset takes it, which may point back across its point (a part of a
+            # label laid out beside another, such as a loss written right of a drawing): measured from the offset's size, such a
+            # label read as running past the page and was turned over onto what lies left of it
+            over_right = px + (a['dx'] + 3.0 if natural_right else gap) + tw - (page - 3.0)
+            over_left = tw + (3.0 - a['dx'] if not natural_right else gap) - (px - 3.0)
             # The label's own side if it fits, else the other side if that fits, else whichever side overflows less. A
             # glycan drawing always grows rightward from its label's anchor, so such a label stays and the page grows,
             # as does text placed with `text`, where its caller put it.

@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import viscose as vc
+from viscose.palettes import CVD
 import gallery
 
 OUT = Path(__file__).parent / 'readme'
@@ -341,7 +342,7 @@ def morph_video(deck, name, width = 960, fps = 15):
                  method = 6)
 
 
-# The trailer: 40.6 seconds at 30 frames per second, each frame viscose figures of 12.8 by 7.2 inches drawn at 150 dpi,
+# The trailer: 40.5 seconds at 30 frames per second, each frame viscose figures of 12.8 by 7.2 inches drawn at 150 dpi,
 # so 1920 by 1080 pixels, blended by fades, diagonal wipes, and an iris where a dark page meets a light one; only the
 # matplotlib figure it starts from and PowerPoint's Morph of viscose's own slides come from elsewhere
 FPS, PAGE, SIZE = 30, (12.8, 7.2), (1920, 1080)
@@ -352,8 +353,7 @@ SHIMMER = 0.016
 TOP = 175
 WALL, TILE = ['volcano', 'heatmap', 'ridges', 'spectrum', 'embedding', 'groups'], (610, 430)
 # Each feature card shows for this many seconds
-CARD = 1.0
-INKS = [(0, 174, 239), (236, 0, 140), (255, 242, 0), (35, 31, 32)]
+CARD = 2.0
 
 
 def ease(t):
@@ -444,31 +444,57 @@ def feature_card(i):
     make, title, subtitle = CARDS[i]
     if make == 'themes':
         # One SVG holds the light page and its dark twin; here they meet on a diagonal
-        light, dark = (render(gallery.trial(p, PAGE).suptitle(title, subtitle)) for p in ('poster', 'poster-dark'))
-        yy, xx = np.mgrid[0:SIZE[1], 0:SIZE[0]] / SIZE[1]
-        return np.where(((xx + .45 * yy) / (SIZE[0] / SIZE[1] + .45) > .5)[..., None], dark, light)
-    if make == 'print':
-        # The figure beside its four printing plates, each in its ink, as separated for U.S. web offset
-        img, art = header('poster', title, subtitle), render(gallery.ridges('poster', 0.0, (7.0, 6.2)), (1000, 886))
-        img[TOP:TOP + 886, 20:1020] = art
-        plates = vc.Press().separate(art.reshape(-1, 3) / 255.0).reshape(*art.shape[:2], 4)
-        for k, ink in enumerate(INKS):
-            plate = 255 - plates[..., k:k + 1] * (255 - np.array(ink, float))
-            small = np.asarray(Image.fromarray(np.round(plate).astype(np.uint8)).resize((420, 372), Image.LANCZOS))
-            x, y = 1050 + k % 2 * 440, TOP + 40 + k // 2 * 400
-            img[y:y + 372, x:x + 420] = small
-        return img
-    if make == 'open':
-        # Saved in Lumen, and brought back from the file alone in Couture's dark version
-        size = (7.2, 7.2 * 880 / 930)
-        with tempfile.TemporaryDirectory() as tmp:
-            gallery.volcano('lumen', size).save(Path(tmp) / 'volcano.pdf')
-            back = vc.open(Path(tmp) / 'volcano.pdf', palette = 'couture-dark')
-        img = header('lumen', title, subtitle)
-        img[TOP:TOP + 880, 20:950] = render(gallery.volcano('lumen', size), (930, 880))
-        img[TOP:TOP + 880, 970:1900] = render(back, (930, 880))
+        return diagonal(*(render(gallery.trial(p, PAGE).suptitle(title, subtitle)) for p in ('poster', 'poster-dark')))
+    if make == 'legible':
+        # matplotlib's blue, orange, green, and red, as a protanope sees them: drawn as given, and as viscose draws them
+        rng = np.random.default_rng(11)
+        centers = {'Plasma': (-3, 1), 'Liver': (2, 4), 'Colon': (3, -2), 'Brain': (-1, -4)}
+        xy = np.concatenate([rng.normal(c, 0.9, (90, 2)) for c in centers.values()])
+        img = header('poster', title, subtitle)
+        for k, legible in enumerate((False, True)):
+            fig, ax = vc.subplots(figsize = (7.2, 7.2 * 880 / 930), palette = 'poster')
+            fig.suptitle('As viscose draws them' if legible else 'Colors as given', 'Seen with protanopia')
+            fig.legible = legible
+            ax.scatter(*xy.T, hue = np.repeat(list(centers), 90), colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728'],
+                       s = 30)
+            px = render(fig, (930, 880)) / 255.0
+            lin = np.where(px <= 0.04045, px / 12.92, ((px + 0.055) / 1.055) ** 2.4) @ CVD['protan'].T
+            lin = np.clip(lin, 0.0, 1.0)
+            img[TOP:TOP + 880, 20 + 950 * k:950 + 950 * k] = np.round(255 * np.where(
+                lin <= 0.0031308, lin * 12.92, 1.055 * lin ** (1 / 2.4) - 0.055))
         return img
     return render(make().suptitle(title, subtitle))
+
+
+def diagonal(left, right):
+    """Two frames meeting on a diagonal, the first above and to the left."""
+    yy, xx = np.mgrid[0:SIZE[1], 0:SIZE[0]] / SIZE[1]
+    return np.where(((xx + .45 * yy) / (SIZE[0] / SIZE[1] + .45) > .5)[..., None], right, left)
+
+
+def recolored(tmp):
+    """One of viscose's slides as PowerPoint renders it, in the palette's own theme and then with two of Office's pairs
+    of accents 1 and 2, as its Design tab sets them, keyed for the PowerPoint scene."""
+    import win32com.client
+    fig = gallery.volcano('aura', PAGE).suptitle('Yours to edit in PowerPoint',
+                                                 "Every color a theme color: Office's Design tab recolors it all")
+    vc.deck([fig], Path(tmp) / 'theme.pptx', morph = False)
+    app = win32com.client.DispatchEx('PowerPoint.Application')
+    pres = app.Presentations.Open(str((Path(tmp) / 'theme.pptx').resolve()), True, False, False)
+    shots = {}
+    try:
+        # Theme colors are 0xBBGGRR, and accents 1 and 2 are the scheme's fifth and sixth: as drawn, then Office's
+        # blue and orange, then its green and gold
+        for i, accents in enumerate(((), (0xC47244, 0x317DED), (0x47AD70, 0x00C0FF))):
+            for k, bgr in zip((5, 6), accents):
+                pres.SlideMaster.Theme.ThemeColorScheme(k).RGB = bgr
+            shot = str(Path(tmp) / f'theme{i}.png')
+            pres.Slides(1).Export(shot, 'PNG', *SIZE)
+            shots[('theme', i)] = np.asarray(Image.open(shot).convert('RGB').resize(SIZE, Image.LANCZOS))
+    finally:
+        pres.Close()
+        app.Quit()
+    return shots
 
 
 def still(key):
@@ -487,6 +513,17 @@ def still(key):
     if kind == 'erupt':
         return render(glycan_volcano(PAGE, *args).suptitle('Glycans as glyphs',
                                                            'Real SNFG drawings find open room beside their points'))
+    if kind == 'focus':
+        return render(linked(list(args[0]) if args[0] else None, 'aura', (16, 9), 'abd;cbd', (1, 1.5, 1.15)).suptitle(
+            'Focus in shades', 'Highlight anything, and every panel follows, live in interactive SVG'))
+    if kind == 'remember':
+        # Saved in Lumen, and brought back from the file alone in Aura's dark version
+        if not args[0]:
+            return render(gallery.volcano('lumen', PAGE).suptitle('Figures that remember', "fig.save('volcano.pdf')"))
+        with tempfile.TemporaryDirectory() as tmp:
+            gallery.volcano('lumen', PAGE).save(Path(tmp) / 'volcano.pdf')
+            back = vc.open(Path(tmp) / 'volcano.pdf', palette = 'aura-dark')
+        return render(back.suptitle('Figures that remember', "vc.open('volcano.pdf', palette = 'aura-dark')"))
     if kind == 'crowd':
         return render(crowd(True, PAGE, args[0]).suptitle(
             f'{round(args[0] * 100000):,} points', "Their density takes over where they pile up. As PDF in 0.13 s, "
@@ -504,18 +541,11 @@ def word_scene(palette, colors, span, caption, at):
     return scene
 
 
-def box_scene(u, s):
-    """matplotlib's and seaborn's defaults, wiped into viscose's."""
-    share = ease((u - 1.5) / .7)
-    return [(('box', 'seaborn'), None)] if share <= 0 else [(('box', 'viscose'), None)] if share >= 1 else [
-        (('box', 'seaborn'), None), (('box', 'viscose'), ('wipe', float(share)))]
-
-
 def wall_scene(u, s):
     """The wall through every palette, each wiping in over the last, and then into the night."""
     seq = [*vc.palettes, 'aura-dark']
-    k = int(np.clip(u // 1.2, 0, 4))
-    now, share = ('wall', seq[k], round(s, 4)), (u - 1.2 * k) / (.6 if k == 4 else .35)
+    k = int(np.clip(u // 1.1, 0, 4))
+    now, share = ('wall', seq[k], round(s, 4)), (u - 1.1 * k) / (.6 if k == 4 else .35)
     return [(('wall', seq[k - 1], round(s, 4)), None), (now, ('iris' if k == 4 else 'wipe', float(ease(share))))] if (
         k and share < 1) else [(now, None)]
 
@@ -538,40 +568,43 @@ def morph_scene(u, s):
     return [(('ppt', round(u * FPS)), None)]
 
 
+def steps(keys, at, how = 'fade', span = .25):
+    """A scene that shows `keys` in turn, each coming in over the last at its time in `at`, by `how` over `span`
+    seconds."""
+    def scene(u, s):
+        i = sum(u >= t for t in at)
+        share = ease((u - at[i - 1]) / span) if i else 1.0
+        return [(keys[i], None)] if share >= 1 else [(keys[i - 1], None), (keys[i], (how, float(share)))]
+    return scene
+
+
 def cards_scene(u, s):
     """Feature after feature, each fading in over the last."""
     i = min(int(u // CARD), len(CARDS) - 1)
-    share = ease((u - i * CARD) / .12)
+    share = ease((u - i * CARD) / .25)
     return [(('card', i), None)] if not i or share >= 1 else [(('card', i - 1), None),
                                                               (('card', i), ('fade', float(share)))]
 
 
 CARDS = [(lambda: labels('lumen', PAGE), 'Labels where the data are',
           'Every series named in its own color, with no legend to decode'),
-         (lambda: gallery.groups('lumen', PAGE), 'Every sample, every bracket',
-          'Boxes, violins, and p-values that stack themselves'),
-         (lambda: gallery.subgroups('couture'), 'Swarms and subgroups', 'Straight from a tidy table, side by side'),
-         (lambda: markers(PAGE), 'Hue, style, and size', 'Mapped as in seaborn, each group named where it lies'),
-         (lambda: gallery.spectrum('couture', PAGE), 'Mirror spectra',
-          'Observed against library, every fragment annotated'),
-         (lambda: gallery.trial('aura', PAGE), 'Panels, bands, and points', 'Response and benchmark on one page'),
-         (lambda: gallery.stacked('poster', PAGE), 'Stacked bars', 'Shares by tissue in shades of two hues'),
-         (lambda: glycan_bars(PAGE), 'Glycans as ticks', 'Real SNFG drawings, scaled to fit their rows'),
-         (lambda: gallery.heatmap('lumen', PAGE), 'Clustermaps',
-          'The exact optimal leaf order, a 300 × 100 PDF in 0.02 s where seaborn takes 1.57 s'),
-         (lambda: linked(True, 'aura', (16, 9), 'abd;cbd', (1, 1.5, 1.15)), 'Focus in shades',
-          'Highlight anything, and every panel follows, live in interactive SVG'),
-         ('themes', 'One SVG, both themes', "It follows the reader's light or dark mode"),
-         ('print', 'Ready for print', 'PDF/X-4 in CMYK, separated for the press'),
-         ('open', 'Figures that remember', 'Every file carries its source: reopen it in any palette')]
+         ('legible', 'Legible for every reader',
+          'Colors that would merge for color-blind readers move apart by themselves'),
+         ('themes', 'One SVG, both themes', "It follows the reader's light or dark mode")]
 # (start, end, scene, entry) in seconds, where each scene comes in over the last for FADE seconds, by a fade, or by an
 # iris where a dark page meets a light one, which a fade would pass through gray; so each scene ends FADE seconds after
 # the next one starts
 FADE = 0.4
-SCRIPT = [(0.0, 5.0, word_scene('aura-dark', ('a1', ), 3.0, TAGLINE, 3.2), None), (4.6, 8.2, box_scene, 'iris'),
-          (7.8, 14.4, wall_scene, 'fade'), (14.0, 18.0, erupt_scene, 'iris'), (17.6, 20.6, crowd_scene, 'fade'),
-          (20.2, 23.2, morph_scene, 'fade'), (22.8, 36.2, cards_scene, 'fade'),
-          (35.8, 40.6, word_scene('poster', ('a1', 'b1'), 2.0, 'pip install viscose', 2.3), 'fade')]
+SCRIPT = [(0.0, 5.0, word_scene('aura-dark', ('a1', ), 3.0, TAGLINE, 3.2), None),
+          (4.6, 8.1, steps([('box', 'seaborn'), ('box', 'viscose')], [1.5], 'wipe', .7), 'iris'),
+          (7.7, 13.7, wall_scene, 'fade'), (13.3, 17.3, erupt_scene, 'iris'), (16.9, 19.9, crowd_scene, 'fade'),
+          (19.5, 22.5, morph_scene, 'fade'),
+          (22.1, 24.9, steps([('theme', 0), ('theme', 1), ('theme', 2)], [.8, 1.7], span = .35), 'fade'),
+          (24.5, 30.9, cards_scene, 'fade'),
+          (30.5, 33.5, steps([('focus', None), ('focus', ('T3', )), ('focus', ('C3', )), ('focus', (0, )),
+                              ('focus', ('Tumor', ))], [.5, 1.05, 1.6, 2.15], span = .2), 'fade'),
+          (33.1, 36.1, steps([('remember', False), ('remember', True)], [1.0], 'wipe', .6), 'fade'),
+          (35.7, 40.5, word_scene('poster', ('a1', 'b1'), 2.0, 'pip install viscose', 2.3), 'fade')]
 # Morph starts this many seconds into its scene
 MORPH_LEAD = 0.5
 
@@ -640,10 +673,11 @@ def trailer(name = 'trailer.mp4', bitrate = 8_000_000):
     print(len(frames), 'frames from', len(keys), 'stills')
     workers = max(1, (os.cpu_count() or 4) - 2)
     with tempfile.TemporaryDirectory() as tmp, ProcessPoolExecutor(workers) as pool:
-        images = morphed(tmp)
+        # PowerPoint's own pictures are made here, before the workers draw the rest
+        images = morphed(tmp) | recolored(tmp)
         raw = str(Path(tmp) / 'raw.mp4')
         writer = cv2.VideoWriter(raw, cv2.CAP_MSMF, cv2.VideoWriter_fourcc(*'H264'), FPS, SIZE)
-        order, futures = iter(k for k in keys if k[0] != 'ppt'), {}
+        order, futures = iter(k for k in keys if k not in images), {}
         for i, layers in enumerate(frames):
             # Stills are drawn ahead in the order frames first need them, and dropped once no frame needs them
             while len(futures) < 3 * workers and (key := next(order, None)) is not None:
