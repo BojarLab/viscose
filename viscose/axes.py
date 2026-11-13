@@ -1,4 +1,5 @@
 """Axes: records what to draw, then lays it out and draws it once the figure is rendered."""
+import dataclasses
 import functools
 import math
 import numbers
@@ -2461,9 +2462,9 @@ class Axes:
             tw = self._note_size(a)[0]
             px, gap = float(self._tx(a['x'])), abs(a['dx']) + 3.0
             natural_right = a['ha'] == 'left'
-            # On its own side a label reaches as far as its offset takes it, which may point back across its point (a part of a
-            # label laid out beside another, such as a loss written right of a drawing): measured from the offset's size, such a
-            # label read as running past the page and was turned over onto what lies left of it
+            # On its own side a label reaches as far as its offset takes it, which may point back across its point (a
+            # part of a label laid out beside another, such as a loss written right of a drawing): measured from the
+            # offset's size, such a label read as running past the page and was turned over onto what lies left of it
             over_right = px + (a['dx'] + 3.0 if natural_right else gap) + tw - (page - 3.0)
             over_left = tw + (3.0 - a['dx'] if not natural_right else gap) - (px - 3.0)
             # The label's own side if it fits, else the other side if that fits, else whichever side overflows less. A
@@ -2749,7 +2750,7 @@ class Axes:
                     op['gid'] = gid
                     # What recedes casts no shadow
                     if (k not in ('hline', 'vline', 'vspan', 'hspan', 'image', 'contour', 'aline', 'rect', 'bracket')
-                            and not (done == 'context' and k in FOCUS_KINDS)):
+                            and not (done == 'context' and k in FOCUS_KINDS) and not op.get('grain')):
                         op['mark'] = True
                 marks.tag(c, n, artist = names.get(id(a)), **({'series': series[id(a)]} if id(a) in series else {}))
         c.passing = None
@@ -2854,7 +2855,7 @@ class Axes:
                       / 2.0, b['rgb'] if b['rgb'] is not None else b['edge'][0]) for b, m in zip(call, masks)]
             x0, y0, w, h = self.rect
             found = {}
-            for b, m, (_, keep) in zip(call, masks, marks.crowd(self.pal, parts, (x0 - 9.0, y0 - 9.0, w + 18.0,
+            for b, m, (_, keep, _) in zip(call, masks, marks.crowd(self.pal, parts, (x0 - 9.0, y0 - 9.0, w + 18.0,
                                                                                   h + 18.0))):
                 out = np.zeros(len(b['x']), dtype = bool)
                 out[np.flatnonzero(m)[~np.asarray(keep, dtype = bool)]] = True
@@ -2879,34 +2880,40 @@ class Axes:
             mask = self._visible(b)
             drawn.append((self._tx(b['x'][mask]), self._ty(b['y'][mask]),
                           b['s'] if np.ndim(b['s']) == 0 else np.asarray(b['s'])[mask], b, mask))
-        layer, (bx, by, bw, bh) = c, c.state['clip'][0][0] if c.state['clip'] else (0.0, 0.0, c.width, c.height)
+        layer, clip = c, c.state['clip'][0][0] if c.state['clip'] else (0.0, 0.0, c.width, c.height)
         if spec:
-            xs, ys = np.concatenate([d[0] for d in drawn]), np.concatenate([d[1] for d in drawn])
-            if not len(xs):
+            found = self._layer(drawn, spec[0], clip)
+            if found is None:
                 return
-            sc = spec[0] / 72.0
-            # The pixels the points can reach within the clip, on a grid of the image's own resolution
-            reach = 1.4 * math.sqrt(max(float(np.max(d[2])) for d in drawn) * self.pal.point_scale) / 2 + 9.0
-            px0, py0 = math.floor(max(bx, xs.min() - reach) * sc), math.floor(max(by, ys.min() - reach) * sc)
-            nx = math.ceil(min(bx + bw, xs.max() + reach) * sc) - px0
-            ny = math.ceil(min(by + bh, ys.max() + reach) * sc) - py0
-            if nx <= 0 or ny <= 0:
-                return
-            ox, oy = px0 / sc, py0 / sc
-            layer = pdfwrite.Canvas(BytesIO(), pagesize = (nx / sc, ny / sc))
-            layer.stamp_dpi = spec[0]
-            layer.state['clip'] = [((bx - ox, by - oy, bw, bh), layer.state['ctm'])]
-            drawn = [(px - ox, py - oy, s, b, mask) for px, py, s, b, mask in drawn]
-            bx, by = bx - ox, by - oy
+            layer, drawn, place = found
         if lays:
             # Hollow rings pile up in their edge's color, and what a highlight leaves as context recedes
             colored = [(d, d[3]['rgb'] if d[3]['rgb'] is not None else d[3]['edge'][0]) for d in drawn
                        if d[3]['rgb'] is not None or d[3]['edge']]
-            colored = [(d, self.pal.recede(rgb) if c.passing == 'context' and not self._focused(
-                d[3], len(d[3]['x'])).all() else rgb) for d, rgb in colored]
-            parts = [(px, py, np.sqrt(np.maximum(np.asarray(s, dtype = float), 0.0) * self.pal.point_scale) / 2.0, rgb)
-                     for (px, py, s, _, _), rgb in colored]
-            for (bands, keep), ((_, _, _, b, _), _) in zip(marks.crowd(self.pal, parts, (bx, by, bw, bh)), colored):
+            colored = [(d, rgb, c.passing == 'context' and not self._focused(d[3], len(d[3]['x'])).all())
+                       for d, rgb in colored]
+            parts = [(px, py, np.sqrt(np.maximum(np.asarray(s, dtype = float), 0.0) * self.pal.point_scale) / 2.0,
+                      self.pal.recede(rgb) if back else rgb) for (px, py, s, _, _), rgb, back in colored]
+            fields = marks.crowd(self.pal, parts, layer.state['clip'][0][0] if spec else clip)
+            # The points a field holds lie under it, where its paler bands let them show through, drawn as pixels: on
+            # the page in raster output, else as one image of their own. Flat in their field's color, they build up to
+            # a solid ground where they are many, which costs nothing to store, and to a grain where they thin out
+            # Under the veil they cast no shadow, and a window leaves them out while a gesture runs
+            under = [] if getattr(c, 'shadow', False) or getattr(self.figure, '_draft', False) else [
+                (px[veiled], py[veiled], s if np.ndim(s) == 0 else np.asarray(s)[veiled], b, rgb)
+                for ((px, py, s, b, _), _, _), (_, _, _, rgb), (_, _, veiled) in zip(colored, parts, fields)
+                if veiled.any()]
+            beneath = (self._layer(under, marks.CROWD_DPI, clip) if under and not spec
+                       and not getattr(c, 'stamp_dpi', None) else (layer, under, None))
+            flat = self.pal
+            n = len(c.ops)
+            for px, py, s, b, rgb in beneath[1] if beneath else []:
+                marks.points(beneath[0], flat, px, py, s, rgb, b['alpha'], b['marker'])
+            if beneath and beneath[2] is not None:
+                self._image(c, *beneath[::2])
+            for op in c.ops[n:]:
+                op['grain'] = True
+            for (bands, keep, _), ((_, _, _, b, _), _, _) in zip(fields, colored):
                 kept[id(b)] = keep
                 if bands is not None:
                     marks.crowd_op(layer, self.pal, bands)
@@ -2942,8 +2949,33 @@ class Axes:
             rgb = None if rgb is None else self._paint(c, b, rgb, back)
             edge = None if edge is None else (self._paint(c, b, edge[0], back), edge[1])
             marks.points(layer, self.pal, px, py, s, rgb, b['alpha'], b['marker'], edge, ids, hovers)
-        if not spec:
-            return
+        if spec:
+            self._image(c, layer, place)
+
+    def _layer(self, drawn, dpi, clip):
+        """A canvas of its own for points that become one image, on a grid of `dpi` over the pixels that they can reach
+        within the clip, as (canvas, `drawn` with each (x, y, area, ...) moved onto it, its place), or None where they
+        reach no pixel."""
+        xs, ys = np.concatenate([d[0] for d in drawn]), np.concatenate([d[1] for d in drawn])
+        if not len(xs):
+            return None
+        bx, by, bw, bh = clip
+        sc = dpi / 72.0
+        reach = 1.4 * math.sqrt(max(float(np.max(d[2], initial = 0.0)) for d in drawn) * self.pal.point_scale) / 2 + 9.0
+        px0, py0 = math.floor(max(bx, xs.min() - reach) * sc), math.floor(max(by, ys.min() - reach) * sc)
+        nx = math.ceil(min(bx + bw, xs.max() + reach) * sc) - px0
+        ny = math.ceil(min(by + bh, ys.max() + reach) * sc) - py0
+        if nx <= 0 or ny <= 0:
+            return None
+        ox, oy = px0 / sc, py0 / sc
+        layer = pdfwrite.Canvas(BytesIO(), pagesize = (nx / sc, ny / sc))
+        layer.stamp_dpi = dpi
+        layer.state['clip'] = [((bx - ox, by - oy, bw, bh), layer.state['ctm'])]
+        return layer, [(px - ox, py - oy) + tuple(rest) for px, py, *rest in drawn], (nx, ny, sc, ox, oy)
+
+    def _image(self, c, layer, place):
+        """What a canvas from _layer drew, as one image op on the page."""
+        nx, ny, sc, ox, oy = place
         if len(layer.ops) == 1 and layer.ops[0]['kind'] == 'image':
             # Stamped, it is an image already
             op = layer.ops[0]

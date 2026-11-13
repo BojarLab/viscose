@@ -46,6 +46,14 @@ GLOW = ((4.2, 0.06), (2.7, 0.1), (1.6, 0.2))
 # points at least, which keeps the bands' edges smooth where the marks are few enough to count
 CROWD, CROWD_EDGE, CROWD_BANDS, CROWD_GAP = 4.0, 1.2, 5, 0.5
 CROWD_CELL, CROWD_SPREAD, CROWD_SMOOTH = 1.0, 4.0, 3.0
+# Outlines keep only the vertices that hold them within this many points of the curve the grid traced, which is far
+# smoother than its cells
+CROWD_TOL = 0.1
+# The outer bands' opacity, from the edge in, over a grain of the points they hold, thinned to cover the page
+# CROWD_GRAIN deep, about as sparse as the points left around the field, which so dissolve into it, while the bands
+# further in are opaque in their exact shades; vector output draws the grain as one image of CROWD_DPI, as under the
+# field it is texture, not marks to zoom into
+CROWD_VEIL, CROWD_GRAIN, CROWD_DPI = (0.5, 0.75), 0.4, 100
 
 
 def isolines(m, level):
@@ -117,7 +125,8 @@ def tones(pal, rgb):
 def crowd(pal, parts, box):
     """Where a scatter's marks pile up past telling them apart. `parts` are (xs, ys, radii, rgb) per color in page
     points, and `box` the (x, y, width, height) they may reach. Gives per part its bands, or None where its marks never
-    pile up CROWD deep, and which of its marks stay drawn: those outside the field. Depth is the marks' area per cell,
+    pile up CROWD deep, which of its marks stay drawn, those outside the field, and which of the others lie under its
+    translucent outer bands (CROWD_VEIL), where they show through. Depth is the marks' area per cell,
     spread over CROWD_SPREAD mark radii, so that a depth of one covers the page once. The field holds what lies
     CROWD_EDGE deep or more, cut into CROWD_BANDS bands on a log scale up to nearly the deepest, each the outline of
     where the depth reaches its level, as (color, outlines in page points), from the faintest of its hue's shades
@@ -128,7 +137,7 @@ def crowd(pal, parts, box):
     for xs, ys, rs, rgb in parts:
         rs = np.broadcast_to(np.asarray(rs, dtype = float), np.shape(xs))
         if not len(xs):
-            out.append((None, np.ones(0, bool)))
+            out.append((None, np.ones(0, bool), np.zeros(0, bool)))
             continue
         ix = np.clip(((xs - bx) / CROWD_CELL).astype(int), 0, gw - 1)
         iy = np.clip(((by + bh - ys) / CROWD_CELL).astype(int), 0, gh - 1)
@@ -136,7 +145,7 @@ def crowd(pal, parts, box):
                             minlength = gw * gh).reshape(gh, gw).astype(np.float32)
         depth = raster._box_blur(depth, max(CROWD_SMOOTH, CROWD_SPREAD * float(np.median(rs))) / CROWD_CELL)
         if depth.max() < CROWD:
-            out.append((None, np.ones(len(xs), bool)))
+            out.append((None, np.ones(len(xs), bool), np.zeros(len(xs), bool)))
             continue
         # Band levels from the edge to nearly the deepest, so that the strongest band holds a core, not a speck
         top = max(float(np.percentile(depth[depth >= CROWD_EDGE], 99.5)), CROWD_EDGE * 1.5)
@@ -144,26 +153,54 @@ def crowd(pal, parts, box):
         # Bordered below the edge, so that every outline closes on itself
         grid = np.pad(level, 1, constant_values = -1.0)
         shades = ramp(tones(pal, rgb), (np.arange(CROWD_BANDS) + 0.5) / CROWD_BANDS)
-        bands = [(tuple(float(v) for v in shades[k]),
-                  [(bx + (u - 0.5) * CROWD_CELL, by + bh - (v - 0.5) * CROWD_CELL) for u, v in isolines(grid, k)])
-                 for k in range(CROWD_BANDS)]
-        out.append(([b for b in bands if b[1]], level[iy, ix] < 0.0))
+        bands = []
+        for k in range(CROWD_BANDS):
+            loops = []
+            for u, v in isolines(grid, k):
+                xs_, ys_ = bx + (u - 0.5) * CROWD_CELL, by + bh - (v - 0.5) * CROWD_CELL
+                # Douglas and Peucker's thinning, where a closed outline's first span measures from its start
+                keep, todo = np.zeros(len(xs_), dtype = bool), [(0, len(xs_) - 1)]
+                keep[[0, -1]] = True
+                while todo:
+                    i, j = todo.pop()
+                    if j - i < 2:
+                        continue
+                    dx, dy = xs_[j] - xs_[i], ys_[j] - ys_[i]
+                    span = math.hypot(dx, dy)
+                    d = (np.abs(dx * (ys_[i + 1:j] - ys_[i]) - dy * (xs_[i + 1:j] - xs_[i])) / span if span > 1e-9
+                         else np.hypot(xs_[i + 1:j] - xs_[i], ys_[i + 1:j] - ys_[i]))
+                    m = int(np.argmax(d))
+                    if d[m] > CROWD_TOL:
+                        keep[i + 1 + m] = True
+                        todo += [(i, i + 1 + m), (i + 1 + m, j)]
+                loops.append((xs_[keep], ys_[keep]))
+            bands.append((tuple(float(v) for v in shades[k]), loops))
+        # A point within a quarter band of an opaque one reaches under its translucent neighbor. The grain thins out to
+        # CROWD_GRAIN deep by a golden-ratio sequence, which keeps every draw the same, as more points only pile up into
+        # noise under the veil, which costs bytes and time
+        at = level[iy, ix]
+        thin = (np.arange(len(xs)) * 0.6180339887498949) % 1.0 < CROWD_GRAIN / np.maximum(depth[iy, ix], CROWD_GRAIN)
+        out.append(([b for b in bands if b[1]], at < 0.0, (at >= 0.0) & (at < len(CROWD_VEIL) + 0.25) & thin))
     return out
 
 
 def crowd_op(c, pal, bands):
     """A field's bands from `crowd`, from the edge in, each filled in its shade and outlined by a hairline of the page,
-    so that the bands lie apart as the palette's marks and cells do. Outlines fill by the even-odd rule, as a band's
+    so that the bands lie apart as the palette's marks and cells do. The outer ones are rings, from their outline to the
+    next one in, at CROWD_VEIL's opacities, so that the points under them show through where they are fewest and the
+    field grows out of them; the others lie opaque over each other. Outlines fill by the even-odd rule, as a band's
     holes are outlines of their own."""
-    for rgb, outlines in bands:
+    inner = [outlines for _, outlines in bands[1:]] + [[]]
+    for k, (rgb, outlines) in enumerate(bands):
+        alpha = CROWD_VEIL[k] if k < len(CROWD_VEIL) else 1.0
         p = c.beginPath()
-        for xs, ys in outlines:
+        for xs, ys in outlines + (inner[k] if alpha < 1.0 else []):
             p.moveTo(xs[0], ys[0])
             for x, y in zip(xs[1:], ys[1:]):
                 p.lineTo(x, y)
             p.close()
         c.saveState()
-        _style(c, rgb, 1.0, pal.color('paper'), CROWD_GAP * pal.spacing, 1.0, join = 1)
+        _style(c, rgb, alpha, pal.color('paper'), CROWD_GAP * pal.spacing, alpha, join = 1)
         c.state['even_odd'] = True
         c.drawPath(p, fill = 1, stroke = 1)
         c.restoreState()

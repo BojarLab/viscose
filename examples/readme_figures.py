@@ -2,7 +2,9 @@
 Needs matplotlib and seaborn for the comparison, pillow for arranging the panels, glycowork for the glycan drawings and
 the talk's data, and PowerPoint with pywin32 and OpenCV for the animation of the talk.
 `python examples/readme_figures.py trailer` draws the 41-second trailer instead, built from viscose figures,
-which needs matplotlib, seaborn, glycowork, and OpenCV, and Windows with PowerPoint and pywin32 for Morph and H.264."""
+which needs matplotlib, seaborn, glycowork, and OpenCV, and Windows with PowerPoint and pywin32 for Morph and H.264.
+`python examples/readme_figures.py linkedin` draws the 4:5 announcement video `linkedin.mp4` into Downloads,
+which needs matplotlib, seaborn, glycowork, and OpenCV, and Windows for H.264."""
 import os
 import subprocess
 import sys
@@ -231,13 +233,13 @@ def labels(palette, figsize = (15, 4.6)):
     return fig
 
 
-def crowd(density, figsize = (6, 5), share = None):
+def crowd(density, figsize = (6, 5), share = None, palette = 'poster'):
     """100,000 cells from two populations, as points alone or with the field that takes over where they pile up, or
     the first `share` of them in a random order on fixed axes, for the trailer."""
     rng = np.random.default_rng(3)
     a = rng.normal(0, 1, (50000, 2)) @ [[1, .6], [0, .8]]
     b = rng.normal(0, .5, (50000, 2)) + [2.5, -1.5]
-    fig, ax = vc.subplots(figsize = figsize, palette = 'poster')
+    fig, ax = vc.subplots(figsize = figsize, palette = palette)
     fig.suptitle('100,000 cells', 'Where points pile up, their density' if density else 'Every point')
     cells = np.vstack([a, b])
     if share is not None:
@@ -365,9 +367,12 @@ def ease(t):
 @lru_cache(None)
 def letters(n = 24000):
     """Points spread over the ink of the word viscose set large, in page inches, and the letter each lies on."""
+    # Dark ink on white, also while dark mode is on
+    previous = vc.dark_mode(False)
     fig = vc.Figure(*PAGE, palette = 'aura')
     fig.text(0.5, 0.42, 'viscose', size = 190, bold = True, ha = 'center')
     ink = fig.to_rgba(40, background = 'white')[..., :3].mean(axis = 2) < 128
+    vc.dark_mode(*previous)
     rows, cols = np.nonzero(ink)
     rng = np.random.default_rng(1)
     k = rng.integers(0, rows.size, n)
@@ -402,14 +407,15 @@ def gathering(palette, t, caption, span, colors):
     return fig
 
 
-def render(fig, size = SIZE):
-    """A figure's pixels at the width given, and a page that grew for its labels fitted back in, on its own paper."""
+def render(fig, size = SIZE, top = False):
+    """A figure's pixels at the width given, and a page that grew for its labels fitted back in, on its own paper,
+    centered, or at the top with `top`, so that titles in a row line up."""
     img = fig.to_rgba(size[0] * 72 / fig.width)[..., :3]
     if img.shape[:2] != size[::-1]:
         small = Image.fromarray(img)
         small.thumbnail(size, Image.LANCZOS)
         frame = Image.new('RGB', size, tuple(int(v) for v in img[0, 0]))
-        frame.paste(small, ((size[0] - small.width) // 2, (size[1] - small.height) // 2))
+        frame.paste(small, ((size[0] - small.width) // 2, 0 if top else (size[1] - small.height) // 2))
         img = np.asarray(frame)
     return np.array(img)
 
@@ -467,9 +473,10 @@ def feature_card(i):
 
 
 def diagonal(left, right):
-    """Two frames meeting on a diagonal, the first above and to the left."""
-    yy, xx = np.mgrid[0:SIZE[1], 0:SIZE[0]] / SIZE[1]
-    return np.where(((xx + .45 * yy) / (SIZE[0] / SIZE[1] + .45) > .5)[..., None], right, left)
+    """Two frames of one size meeting on a diagonal, the first above and to the left."""
+    h, w = left.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w] / h
+    return np.where(((xx + .45 * yy) / (w / h + .45) > .5)[..., None], right, left)
 
 
 def recolored(tmp):
@@ -693,8 +700,157 @@ def trailer(name = 'trailer.mp4', bitrate = 8_000_000):
                 print('frame', i, flush = True)
         writer.release()
         subprocess.run(['powershell', '-NoProfile', '-Command', TRANSCODE.format(src = raw, out = OUT.resolve() / name,
-                                                                                  bitrate = bitrate)], check = True)
+                                                                                  bitrate = bitrate, width = SIZE[0],
+                                                                                  height = SIZE[1])], check = True)
     print(name, (OUT / name).stat().st_size // 1024, 'kB')
+
+
+# The announcement for LinkedIn: a 4:5 video of 9 by 11.25 inches at 120 dpi, so 1080 by 1350 pixels, put together from
+# viscose figures on Aura's dark page. Each feature is a tile: a caption of FEATURE_HEAD inches over a figure
+# FEATURE_HIGH inches high, a third or half of the page wide, all drawn at half size, as are the palettes' figures of
+# LOOK inches. A light page in a tile sits INSET pixels inside it, as a page on the dark one
+POSTER, POSTER_DPI, FEATURE_HEAD, FEATURE_HIGH, LOOK, INSET = (9.0, 11.25), 120, 0.95, 3.9, (4.5, 4.0), 20
+POSTER_EXTRAS = ('PowerPoint with Morph  ·  interactive SVG  ·  one SVG for light and dark',
+                 'PDF/X-4 for print  ·  figures that remember their data')
+# The ridges flow with a period of 2 pi / 2.2 seconds, so the loop is four of them and they never jump
+LOOP = 8 * np.pi / 2.2
+# When each tile starts to move, in seconds: the glycans' points rise, the cells pour in, matplotlib's default wipes
+# into viscose's, the Lumen file reopens in Aura by night, and the SVG turns dark, light, and dark again; each wipe
+# takes WIPE seconds
+RISE, POUR, DEFAULT, REOPEN, THEMES, WIPE = 0.6, 1.2, 3.6, 4.6, (5.6, 7.0, 8.2), 0.8
+
+
+def inset(img):
+    """A tile's figure INSET pixels inside Aura's dark page."""
+    out = np.empty((img.shape[0] + 2 * INSET, img.shape[1] + 2 * INSET, 3), np.uint8)
+    out[:] = np.asarray(Image.new('RGB', (1, 1), vc.get_palette('aura-dark').paper))[0, 0]
+    out[INSET:-INSET, INSET:-INSET] = img
+    return out
+
+
+@lru_cache(None)
+def poster_piece(key):
+    """One piece of the announcement as pixels, from its key, drawn once per process: light pages with dark mode off,
+    everything else on Aura's dark page."""
+    kind, *args = key
+    half = lambda inches: tuple(round(v * POSTER_DPI / 2) for v in inches)
+    room = lambda inches: tuple(v - 2 * INSET for v in half(inches))
+    third, wide = (2 * POSTER[0] / 3, FEATURE_HIGH), (POSTER[0], FEATURE_HIGH)
+    paper = vc.get_palette('aura-dark').paper
+    previous = vc.dark_mode(*((False, None) if kind in ('default', 'saved', 'light') else (True, paper)))
+    try:
+        if kind == 'word':
+            return render(gathering('aura', args[0], '', 3.0, ('a1', 'b1')),
+                          (round(POSTER[0] * POSTER_DPI), round(POSTER[0] * POSTER_DPI * PAGE[1] / PAGE[0])))
+        if kind == 'tagline':
+            return render(vc.Figure(POSTER[0], 0.5, palette = 'aura').text(0.5, 0.3, TAGLINE, size = 24, ha = 'center',
+                                                                           color = 'muted'),
+                          (round(POSTER[0] * POSTER_DPI), round(0.45 * POSTER_DPI)))
+        if kind == 'caption':
+            return render(vc.Figure(args[0], FEATURE_HEAD, palette = 'aura').suptitle(*args[1:]),
+                          half((args[0], FEATURE_HEAD)))
+        if kind == 'glycans':
+            return render(glycan_volcano(third, *args).suptitle(''), half(third), True)
+        if kind == 'crowd':
+            return render(crowd(True, third, args[0], 'aura').suptitle(''), half(third), True)
+        if kind == 'default':
+            return inset(np.asarray(seaborn_volcano(tuple(v - 4 * INSET / POSTER_DPI for v in third),
+                                                    POSTER_DPI / 2)))
+        if kind == 'box':
+            fig = gallery.volcano('aura', third).suptitle('')
+            return inset(render(fig.text(0.97, 0.04, 'viscose', size = 22, bold = True, ha = 'right', color = 'a1'),
+                                room(third), True))
+        if kind == 'saved':
+            return inset(render(gallery.trial('lumen', wide).suptitle(''), room(wide), True))
+        if kind == 'back':
+            # Saved in Lumen on a light page, and brought back from the file alone
+            vc.dark_mode(False)
+            with tempfile.TemporaryDirectory() as tmp:
+                gallery.trial('lumen', wide).suptitle('').save(Path(tmp) / 'trial.pdf')
+                vc.dark_mode(True, paper)
+                back = vc.open(Path(tmp) / 'trial.pdf', palette = 'aura-dark')
+            return inset(render(back, room(wide), True))
+        if kind in ('light', 'dark'):
+            return inset(render(labels('poster', wide), room(wide), True))
+        if kind == 'look':
+            return render(gallery.ridges(args[0], args[1], LOOK).suptitle(args[0].capitalize()), half(LOOK))
+        footer = vc.Figure(POSTER[0], 1.0, palette = 'aura')
+        footer.text(0.5, 0.6, 'pip install viscose', size = 26, bold = True, ha = 'center', color = 'a1')
+        for k, extras in enumerate(POSTER_EXTRAS):
+            footer.text(0.5, 0.3 - 0.24 * k, extras, size = 12.5, ha = 'center', color = 'muted')
+        return render(footer, (round(POSTER[0] * POSTER_DPI), POSTER_DPI))
+    finally:
+        vc.dark_mode(*previous)
+
+
+def swept(a, b, share):
+    """`b` wiping in over `a` along a soft diagonal edge, `share` of the way, as the trailer wipes."""
+    if share <= 0 or share >= 1:
+        return b if share >= 1 else a
+    h, w = a.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w] / h
+    m = np.clip((share * 1.2 - (xx + .45 * yy) / (w / h + .45)) / .2, 0, 1)[..., None]
+    return np.round(a * (1 - m) + b * m).astype(np.uint8)
+
+
+def poster_frame(s):
+    """The announcement `s` seconds in: the word gathering, its tagline fading in, and every tile on its own time,
+    from top to bottom with the room left spread evenly between them."""
+    piece = poster_piece
+    settled = piece(('word', 3.0))
+    paper = settled[0, 0]
+    inked = np.nonzero(np.abs(settled.astype(int) - paper).max(axis = (1, 2)) > 24)[0]
+    word = piece(('word', round(s, 4)))[max(inked[0] - 10, 0):inked[-1] + 10]
+    tagline = swept(np.full_like(piece(('tagline', )), paper), piece(('tagline', )), ease((s - 2.4) / .9))
+    u = s - RISE
+    erupted = piece(('glycans', round(float(np.clip(u / 2.0, 0, 1)), 4), False))
+    glycans = swept(erupted, piece(('glycans', 1.0, True)), ease((u - 2.1) / .5))
+    dark = ease((s - THEMES[0]) / WIPE) - ease((s - THEMES[1]) / WIPE) + ease((s - THEMES[2]) / WIPE)
+    third, wide = 2 * POSTER[0] / 3, POSTER[0]
+    features = [('Glycans as glyphs', 'Real SNFG drawings find their own room', glycans, third),
+                ('100,000 points', 'As PDF in 0.13 s, where matplotlib takes 1.64 s',
+                 piece(('crowd', round(float(.001 + .999 * ease((s - POUR) / 2.1)), 4))), third),
+                ('Beautiful by default', "matplotlib's and seaborn's default, then viscose's",
+                 swept(piece(('default', )), piece(('box', )), ease((s - DEFAULT) / WIPE)), third),
+                ('Figures that remember',
+                 "fig.save('trial.pdf') in Lumen, then vc.open('trial.pdf', palette = 'aura-dark')",
+                 swept(piece(('saved', )), piece(('back', )), ease((s - REOPEN) / WIPE)), wide),
+                ('One SVG, both themes', "It follows the reader's light or dark mode",
+                 swept(piece(('light', )), piece(('dark', )), dark), wide)]
+    tiles = [np.vstack([piece(('caption', width, title, subtitle)), shown]) for title, subtitle, shown, width in
+             features]
+    looks = [piece(('look', p, round(s % LOOP, 4))) for p in vc.palettes]
+    rows = [word, tagline, np.hstack(tiles[:3]), np.hstack(tiles[3:]),
+            piece(('caption', POSTER[0] * 2, 'One word, four palettes',
+                   "palette = 'lumen', 'couture', 'poster', or 'aura'")), np.hstack(looks), piece(('footer', ))]
+    w, h = round(POSTER[0] * POSTER_DPI), round(POSTER[1] * POSTER_DPI)
+    page = np.empty((h, w, 3), np.uint8)
+    page[:] = paper
+    gap, y = (h - sum(r.shape[0] for r in rows)) / (len(rows) + 1), 0.0
+    for r in rows:
+        y += gap
+        page[round(y):round(y) + r.shape[0], :r.shape[1]] = r
+        y += r.shape[0]
+    return page
+
+
+def poster(name = 'linkedin.mp4', bitrate = 8_000_000):
+    """The announcement as a loop of LOOP seconds, drawn on all but two cores, each taking a run of frames so that what
+    holds still is drawn once per process, written by Media Foundation as H.264 and encoded again at `bitrate` by
+    Windows' own transcoder, into Downloads."""
+    import cv2
+    out, size = Path.home() / 'Downloads' / name, (round(POSTER[0] * POSTER_DPI), round(POSTER[1] * POSTER_DPI))
+    times = [i / FPS for i in range(round(LOOP * FPS))]
+    workers = max(1, (os.cpu_count() or 4) - 2)
+    with tempfile.TemporaryDirectory() as tmp, ProcessPoolExecutor(workers) as pool:
+        raw = str(Path(tmp) / 'raw.mp4')
+        writer = cv2.VideoWriter(raw, cv2.CAP_MSMF, cv2.VideoWriter_fourcc(*'H264'), FPS, size)
+        for i, frame in enumerate(pool.map(poster_frame, times, chunksize = -(-len(times) // workers))):
+            writer.write(np.ascontiguousarray(frame[..., ::-1]))
+        writer.release()
+        subprocess.run(['powershell', '-NoProfile', '-Command', TRANSCODE.format(
+            src = raw, out = out, bitrate = bitrate, width = size[0], height = size[1])], check = True)
+    print(out, out.stat().st_size // 1024, 'kB')
 
 
 # Windows' MediaTranscoder through PowerShell, which reaches WinRT without any package
@@ -715,6 +871,8 @@ $dir = Await ($folder::GetFolderFromPathAsync((Split-Path '{out}'))) $folder
 $dst = Await ($dir.CreateFileAsync((Split-Path '{out}' -Leaf), 'ReplaceExisting')) $file
 $profile = $encoding::CreateMp4('HD1080p')
 $profile.Video.Bitrate = {bitrate}
+$profile.Video.Width = {width}
+$profile.Video.Height = {height}
 $profile.Audio = $null
 $transcoder = New-Object $coder
 $prep = Await ($transcoder.PrepareFileTranscodeAsync($src, $dst, $profile)) $ready
@@ -727,6 +885,9 @@ if __name__ == '__main__':
     OUT.mkdir(exist_ok = True)
     if sys.argv[1:] == ['trailer']:
         trailer()
+        sys.exit()
+    if sys.argv[1:] == ['linkedin']:
+        poster()
         sys.exit()
     # Real data as a talk, which the README links to as a deck and shows as PowerPoint plays it
     vc.deck(talk(), OUT / 'talk.pptx')

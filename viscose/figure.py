@@ -1008,11 +1008,13 @@ class Figure:
         return min(self.width, max(self.width - grown, self.width + needed))
 
     @_in_font
-    def _canvas(self, stamp_dpi = None, marker_forms = False, layout = True, shapes = False, hover = False):
+    def _canvas(self, stamp_dpi = None, marker_forms = False, layout = True, shapes = False, hover = False,
+                shadow = False):
         """Everything drawn onto a fresh display list; `stamp_dpi` names a raster output, where many discs become an
         image, `marker_forms` a PDF, where markers of one size can be one stored shape, `shapes` PowerPoint, where each
-        op notes what drew it, which names its shape, and `hover` an interactive SVG, where each mark also notes its
-        names and hover text."""
+        op notes what drew it, which names its shape, `hover` an interactive SVG, where each mark also notes its
+        names and hover text, and `shadow` the pass that the soft shadow is made from, which leaves out what casts
+        none."""
         if layout:
             self._layout()
         c = pdfwrite.Canvas(BytesIO(), pagesize = (self.width, self.height))
@@ -1020,6 +1022,7 @@ class Figure:
         c.marker_forms = marker_forms
         c.shapes = shapes or hover
         c.hover = hover
+        c.shadow = shadow
         pal = self.pal
         for i, ax in enumerate(self.axes):
             n = len(c.ops)
@@ -1070,7 +1073,7 @@ class Figure:
         if not self.pal.shadow:
             return None
         res = min(dpi, SHADOW_DPI)
-        c = self._canvas(stamp_dpi = res, layout = layout)
+        c = self._canvas(stamp_dpi = res, layout = layout, shadow = True)
         marks = [op for op in c.ops if op.get('mark')]
         if not marks:
             return None

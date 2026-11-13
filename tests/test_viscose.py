@@ -3687,7 +3687,7 @@ def _cloud(n = 20000, seed = 3):
 def test_points_that_pile_up_give_way_to_a_field_and_sparse_ones_stay():
     pal = get_palette('poster')
     xy = _cloud() * 40 + 200
-    (bands, keep), = marks.crowd(pal, [(xy[:, 0], xy[:, 1], 3.0, pal.color('a1'))], (0.0, 0.0, 400.0, 400.0))
+    (bands, keep, veiled), = marks.crowd(pal, [(xy[:, 0], xy[:, 1], 3.0, pal.color('a1'))], (0.0, 0.0, 400.0, 400.0))
     # The core is a map of bands in the hue's shades, faint outside to strong inside, and its points give way to it
     shades = [pal.color(s) for s in pal.a[::-1]]
     assert len(bands) == marks.CROWD_BANDS and keep[:20000].mean() < 0.3
@@ -3698,7 +3698,12 @@ def test_points_that_pile_up_give_way_to_a_field_and_sparse_ones_stay():
     far = np.hypot(*(xy[20000:] - 200).T) > 80
     assert far.sum() > 30 and keep[20000:][far].all()
     sparse = marks.crowd(pal, [(xy[20000:, 0], xy[20000:, 1], 3.0, pal.color('a1'))], (0.0, 0.0, 400.0, 400.0))
-    assert sparse[0][0] is None and sparse[0][1].all()
+    assert sparse[0][0] is None and sparse[0][1].all() and not sparse[0][2].any()
+    # Under the translucent outer bands lie some of the hidden points, thinned out, and none of those drawn
+    assert not (veiled & keep).any() and 0 < veiled.sum() < (~keep).sum() / 2
+    # Outlines keep far fewer vertices than the grid has cells along them, where marching squares sets one per cell
+    spans = np.concatenate([np.hypot(np.diff(xs), np.diff(ys)) for _, outlines in bands for xs, ys in outlines])
+    assert spans.mean() > 3 * marks.CROWD_CELL
 
 
 def test_a_field_lies_under_the_points_in_every_format_and_density_false_keeps_them():
@@ -3712,6 +3717,13 @@ def test_a_field_lies_under_the_points_in_every_format_and_density_false_keeps_t
     # Vector bands, each outlined by a hairline of the page, under the points
     assert len(bands) == marks.CROWD_BANDS and shapes and max(bands) < min(shapes)
     assert all(ops[i]['stroke_rgb'] == fig.pal.color('paper') for i in bands)
+    # The outer bands are translucent over a grain of the points they hold, one image that casts no shadow, and the
+    # bands further in are opaque
+    assert [ops[i]['fill_alpha'] for i in bands] == list(marks.CROWD_VEIL) + [1.0] * (
+        marks.CROWD_BANDS - len(marks.CROWD_VEIL))
+    grain = [i for i, op in enumerate(ops) if op.get('grain')]
+    assert len(grain) == 1 and ops[grain[0]]['kind'] == 'image' and grain[0] < min(bands)
+    assert not ops[grain[0]].get('mark') and fig.to_pdf() == fig.to_pdf()
     plain, ax = vc.subplots(figsize = (4, 4), palette = 'aura')
     ax.scatter(xy[:, 0], xy[:, 1], s = 12, density = False)
     assert not any(op.get('even_odd') for op in plain.display_list())

@@ -153,11 +153,13 @@ fig, heat = vc.clustermap(df, palette = 'aura', title = 'Glycan abundance by tis
 
 Where points pile up past telling them apart, viscose maps their density instead: smooth bands in their color's own
 shades, from the palest at the edge to the strongest at the core, each set apart by a hairline of the page, and every
-point kept where the data are sparse. 100,000 points read as a map of where the data lie, outliers stay in view, and the
-bands are true vector shapes, crisp at any zoom: 100,000 points take 45 kB of PDF, and a real LC-MS map of 152,000 peaks
-draws as PNG in 0.45 s where every point took 3.2 s. `density = False` keeps every point.
+point kept where the data are sparse. The outer bands are translucent veils over a fine grain of the points they hold,
+so the points dissolve into the field instead of stopping at a wall. 100,000 points read as a map of where the data lie,
+outliers stay in view, and the bands are true vector shapes, crisp at any zoom: 100,000 points take about 100 kB of
+PDF, and a real LC-MS map of 985,000 peaks draws as PNG in 0.8 s where every point takes 16 s. `density = False` keeps
+every point.
 
-<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/crowd.png" alt="100,000 points in Poster as a solid blob of points beside the same points as bands of density in Poster's greens, with the sparse points around them" width="100%"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/crowd.png" alt="100,000 points in Poster as a solid blob of points beside the same points as bands of density in Poster's greens, whose translucent outer bands let the sparse points around them dissolve into the field" width="100%"></p>
 
 Type is set as a typesetter would. Numbers on axes and color bars take tabular figures and line up on their decimal
 points, and every other line of text lines up by its ink rather than its letters' boxes, so a title stands flush with
@@ -262,7 +264,7 @@ matplotlib and seaborn, and its files can be far smaller. At 300 dpi, in Poster:
 | Clustermap, 300 x 100, SVG | 1.40 s, 5,943 kB | **0.02 s, 182 kB** |
 | Clustermap, 26 x 16, PDF | 0.11 s, 22 kB | **0.02 s**, 26 kB |
 | Three lines with a legend, PDF | 0.03 s, 12 kB | **under 0.01 s**, 13 kB |
-| Scatter, 100,000 points, PDF | 1.64 s, 1,523 kB | **0.13 s, 45 kB** |
+| Scatter, 100,000 points, PDF | 1.64 s, 1,523 kB | **0.14 s, 105 kB** |
 | Bars, PNG | 0.19 s, 43 kB | **0.20 s, 38 kB** |
 | Three lines with a legend, PNG | 0.27 s, 393 kB | 0.43 s, **370 kB** |
 | Scatter, 412 points, PNG | 0.23 s, 147 kB | 0.27 s, 180 kB |
