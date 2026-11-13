@@ -1026,12 +1026,16 @@ class Figure:
         pal = self.pal
         for i, ax in enumerate(self.axes):
             n = len(c.ops)
-            ax._draw_axes(c)
+            ax._draw_axes(c, True)
             marks.tag(c, n, scope = ('a%d' % i, 'frame'))
         for i, ax in enumerate(self.axes):
             n = len(c.ops)
             ax._draw_marks(c)
             marks.tag(c, n, scope = ('a%d' % i, 'marks'))
+        for i, ax in enumerate(self.axes):
+            n = len(c.ops)
+            ax._draw_axes(c, False)
+            marks.tag(c, n, scope = ('a%d' % i, 'frame'))
         if self._title:
             y = self.height - 38.0
             n = len(c.ops)

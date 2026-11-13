@@ -3385,16 +3385,19 @@ class Axes:
         for color, group in lines.items():
             marks.polylines(c, group, color, lw)
 
-    def _draw_axes(self, c):
+    def _draw_axes(self, c, grid):
+        """The grid, which lies under the marks, or the axis lines and their ticks, which lie over them, as a bar
+        or a point at the base would otherwise cover half of an axis line."""
         pal = self.pal
         x0, y0, w, h = self.rect
         ink = pal.color(pal.spine_color or pal.ink)
-        if self.grid_on and 'grid' not in self._hidden:
-            for j, v in enumerate(self.yticks):
+        if grid:
+            for j, v in enumerate(self.yticks if self.grid_on and 'grid' not in self._hidden else ()):
                 y = float(self._ty(v))
                 n = len(c.ops)
                 marks.polyline(c, [x0, x0 + w], [y, y], pal.color(pal.faint), 1.1, cap = 0)
                 marks.tag(c, n, name = 'grid %s' % (self.ylabels[j] if j < len(self.ylabels) else j))
+            return
         off = pal.spine_offset
         cap = 1 if pal.spine_round else 0
         spines = self._spines()
