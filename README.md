@@ -307,7 +307,9 @@ colors follow the reader's light or dark mode, on a website, on GitHub, or in do
 colors that differ are written twice, as CSS custom properties under a `prefers-color-scheme` rule: over the gallery,
 the file is 1 to 10% larger than one theme alone in Couture and Poster, and 5 to 70% in Lumen and Aura, whose
 gradients and shadows turn too. Rendered in Chromium, each theme is pixel for pixel the SVG of that theme alone, and an
-editor that reads no CSS sees the light page. `themes = '#0D1117'` sets the dark page to a site's own background. The figure
+editor that reads no CSS sees the light page. `themes = '#0D1117'` sets the dark page to a site's own background, and on
+a page with a theme switch of its own, `dark_when = 'body.quarto-dark'` (any CSS selector) makes a figure inline in it
+turn with that switch instead of the system: glycowork's docs and notebooks show their figures this way. The figure
 below is one such file: turn your system's dark mode on, and it turns with it.
 
 <p align="center"><img src="https://raw.githubusercontent.com/BojarLab/viscose/main/examples/readme/themes.svg" alt="Response curves, tissue clusters, and stacked bars in Poster, as one SVG that turns dark with the reader's dark mode" width="100%"></p>

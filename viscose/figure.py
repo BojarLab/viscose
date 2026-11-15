@@ -322,22 +322,32 @@ def _hovered(svg, ops):
     return svg[:start] + '\n'.join(out) + svg[end:], table
 
 
-def _hover_style(pal, dark = None):
+def _night(rules, dark_when = None):
+    """CSS of `rules`, a function of the drawing's scope, in force on a dark page: where the reader's system is dark,
+    or, for a page with a light and dark theme of its own, within the elements that the CSS selector `dark_when`
+    names, such as Quarto's body.quarto-dark, whatever the system says."""
+    if dark_when is None:
+        return '@media (prefers-color-scheme:dark){%s}' % rules('#' + THEME_PREFIX)
+    return rules(':is(%s) #%s' % (dark_when, THEME_PREFIX))
+
+
+def _hover_style(pal, dark = None, dark_when = None):
     """An interactive SVG's rules, scoped to the drawing's id: how the rest of a panel fades, with the soft shadow, and
-    the hover box in the page's colors, those of `dark` in a dark theme, and nothing of either in print."""
+    the hover box in the page's colors, those of `dark` in a dark theme (see _night), and nothing of either in
+    print."""
     scope = '#' + THEME_PREFIX
     family = ', '.join("'%s'" % f for f in dict.fromkeys(([pal.font[0]] if pal.font else []) + [
         'Century Gothic', 'CenturyGothic', 'Comfortaa'])) + ', sans-serif'
-    box = lambda p: ('{0} .vc-tip rect{{fill:{1};stroke:{2}}}{0} .vc-tip text{{fill:{3}}}'
-                     '{0} .vc-tip .vc-head{{fill:{4}}}'.format(scope, p.css('paper'), p.css('faint'), p.css('muted'),
-                                                               p.css('ink')))
+    box = lambda p, s = scope: ('{0} .vc-tip rect{{fill:{1};stroke:{2}}}{0} .vc-tip text{{fill:{3}}}'
+                                '{0} .vc-tip .vc-head{{fill:{4}}}'.format(s, p.css('paper'), p.css('faint'),
+                                                                          p.css('muted'), p.css('ink')))
     # A lit disc or line over marks drawn in groups, whose class sits on the element, or within it where a theme's class
     # was there first
     hit = '{0} .vc-hit.vc-on,{0} .vc-hit.vc-on *,{0} .vc-on .vc-hit'.format(scope)
     rules = ('{0} [data-h],{0} .vc-shadow{{transition:opacity .15s}}{0} .vc-off,{0}.vc-lit .vc-shadow{{opacity:{1}}}'
              '{3}{{fill-opacity:1;stroke-opacity:1}}{0} .vc-tip text{{font-family:{2}}}'
              '{0} .vc-tip .vc-head{{font-weight:bold}}'.format(scope, HOVER_FADE, family, hit))
-    night = '@media (prefers-color-scheme:dark){%s}' % box(dark) if dark else ''
+    night = _night(lambda s: box(dark, s), dark_when) if dark else ''
     paper = ('@media print{{{0} .vc-off,{0}.vc-lit .vc-shadow{{opacity:1}}{1}{{fill-opacity:0;stroke-opacity:0}}'
              '{0} .vc-tip{{display:none}}}}'.format(scope, hit))
     return '<style>%s%s%s%s</style>\n' % (rules, box(pal), night, paper)
@@ -412,13 +422,14 @@ class _Themes:
                 rule.append('%s-opacity:%s' % (prop, pdfwrite._fmt(new[1])))
         return self.rules.setdefault(';'.join(rule), 'k%d' % len(self.rules)) if rule else None
 
-    def style(self):
-        """The rules, scoped to the drawing's own id, as a page may hold several drawings inline."""
-        scope = '#' + THEME_PREFIX
+    def style(self, dark_when = None):
+        """The rules, scoped to the drawing's own id, as a page may hold several drawings inline, in force on a dark
+        page (see _night)."""
         props = ';'.join('%s:%s' % (name, color) for color, name in self.colors.items())
-        body = ''.join('%s .%s{%s}' % (scope, cls, rule) for rule, cls in self.rules.items())
-        return ('<style>@media (prefers-color-scheme:dark){%s{%s}%s%s .%s{display:none}%s .%s{display:inline}}'
-                '</style>\n' % (scope, props, body, scope, THEME_LIGHT, scope, THEME_DARK))
+        rules = lambda s: '%s{%s}%s%s .%s{display:none}%s .%s{display:inline}' % (
+            s, props, ''.join('%s .%s{%s}' % (s, cls, rule) for rule, cls in self.rules.items()), s, THEME_LIGHT, s,
+            THEME_DARK)
+        return '<style>%s</style>\n' % _night(rules, dark_when)
 
     def defs(self):
         return ''.join(_gradient_def(key, name) for key, name in self.grads.items())
@@ -1261,17 +1272,24 @@ class Figure:
             fig._stickers = True
         return pair
 
-    def to_svg(self, themes = False, interactive = False):
+    def to_svg(self, themes = False, interactive = False, dark_when = None):
         """SVG text on the palette's page, with text as outlines and images embedded. themes = True writes the figure
         in its palette and that palette's dark version (Palette.dark) at once, as one drawing whose colors follow the
         reader's light or dark mode through CSS, on a website, on GitHub, or in docs alike; a color for `themes` is the
         dark page's, such as the site's own dark background. Whatever reads no CSS, as most editors, sees the light
-        page. interactive = True adds a few lines of script and style, with no library: the pointer over a point, bar,
-        box, cell, or line shows what it is and its values, and lights up everything of the same names in every panel,
-        a sample by its `names` across a PCA, a heatmap's column, and its points over boxes alike, a series or a
-        category by its label, and so in every other interactive figure on the same page, while the rest of each panel
-        that holds one fades. It works where the SVG runs as a document or inline in a page, not as an <img>, and the
-        page in print, in an editor, or in an <img> is the figure as drawn."""
+        page. A page with a theme switch of its own names its dark state in `dark_when`, a CSS selector such as
+        'body.quarto-dark' (several separated by commas), and the figure inline in it then follows that switch instead
+        of the reader's system. interactive = True adds a few lines of script and style, with no library: the pointer
+        over a point, bar, box, cell, or line shows what it is and its values, and lights up everything of the same
+        names in every panel, a sample by its `names` across a PCA, a heatmap's column, and its points over boxes
+        alike, a series or a category by its label, and so in every other interactive figure on the same page, while
+        the rest of each panel that holds one fades. It works where the SVG runs as a document or inline in a page,
+        not as an <img>, and the page in print, in an editor, or in an <img> is the figure as drawn."""
+        if dark_when is not None and not themes:
+            raise ValueError('dark_when names when the dark theme of an SVG in both themes shows, so it needs '
+                             'themes = True')
+        if dark_when is not None and re.search(r'[{}<&;@]', dark_when):
+            raise ValueError(f'dark_when has to be a CSS selector, such as body.quarto-dark, got {dark_when!r}')
         figure = self
         if themes:
             figure, dark = self._themes(themes)
@@ -1299,8 +1317,8 @@ class Figure:
         # Tells slate this is a figure, ahead of the gradients' long <defs> and through annotate_figure. It cannot be a
         # comment, as annotate_figure takes every comment and all that follows up to the next </g> for a label
         top = svg.index('\n', svg.index('<svg')) + 1
-        svg = (svg[:top] + '<metadata>viscose</metadata>\n' + (theme.style() if themes else '') +
-               (_hover_style(figure.pal, dark.pal if themes else None) if table else '') + svg[top:])
+        svg = (svg[:top] + '<metadata>viscose</metadata>\n' + (theme.style(dark_when) if themes else '') +
+               (_hover_style(figure.pal, dark.pal if themes else None, dark_when) if table else '') + svg[top:])
         if labels:
             svg = svg.replace('</svg>', _label_groups(c, labels, figure.height) + '\n</svg>')
         if table:
@@ -1323,7 +1341,7 @@ class Figure:
         return svg.replace(THEME_PREFIX, 'vc%08x' % zlib.crc32(svg.encode()))
 
     def save(self, path, dpi = 300.0, background = 'paper', press = None, source = None, themes = False,
-             interactive = False):
+             interactive = False, dark_when = None):
         """Write the file format that the path's suffix names: png, pdf, svg, or pptx, a slide of PowerPoint's own
         shapes whose text stays editable and which Morph carries into the next figure (see to_pptx and vc.deck). `dpi`
         and `background` are for PNG, as PDF, SVG, and PowerPoint are vector on the palette's page. `press` makes a PDF
@@ -1333,8 +1351,8 @@ class Figure:
         read its numbers. A figure's source takes a few kB, and is written while the page draws. source = False leaves
         it out, as a PDF/X does, which is the page alone for print; a source past 64 kB that is larger than the rest of
         the file, such as of 100,000 points, stays out with a warning, unless source = True. themes = True makes an SVG
-        follow its reader's light or dark mode, and interactive = True gives it hover text and linked highlighting
-        (see to_svg)."""
+        follow its reader's light or dark mode, or the theme switch of the page that `dark_when` names, and
+        interactive = True gives it hover text and linked highlighting (see to_svg)."""
         path = Path(path)
         suffix = path.suffix.lower()
         if themes and suffix != '.svg':
@@ -1366,7 +1384,7 @@ class Figure:
                     data = data[:-12] + struct.pack('>I', len(carried[1])) + chunk + struct.pack(
                         '>I', zlib.crc32(chunk)) + data[-12:]
             else:
-                data = self.to_svg(themes, interactive)
+                data = self.to_svg(themes, interactive, dark_when)
                 carried, why = _carried(made, force, lambda: len(data))
                 if carried:
                     end = data.rindex('</svg>')

@@ -3978,6 +3978,24 @@ def test_both_themes_take_an_svg_and_a_palette_that_has_a_light_one(tmp_path):
         vc.dark_mode(*previous)
 
 
+def test_both_themes_follow_a_pages_own_switch_where_dark_when_names_it():
+    fig, ax = vc.subplots(figsize = (3, 3), palette = 'aura')
+    ax.scatter([0, 1, 2], [1, 0, 2], names = ['a', 'b', 'c'])
+    system = fig.to_svg(themes = True, interactive = True)
+    site = fig.to_svg(themes = True, interactive = True, dark_when = 'body.quarto-dark, body.vscode-dark')
+    scope = re.search(r'<svg id="(vc[0-9a-f]{8})" ', site).group(1)
+    # Every dark rule, of the theme and of the hover box, moves from the system's setting to the page's switch
+    assert system.count('prefers-color-scheme') == 2 and 'prefers-color-scheme' not in site
+    assert site.count(':is(body.quarto-dark, body.vscode-dark) #%s' % scope) > 3
+    # The light page and everything drawn stay as they were
+    strip = lambda s: re.sub(r'<style>.*?</style>|vc[0-9a-f]{8}', '', s, flags = re.S)
+    assert strip(site) == strip(system)
+    with pytest.raises(ValueError, match = 'themes'):
+        fig.to_svg(dark_when = 'body.quarto-dark')
+    with pytest.raises(ValueError, match = 'selector'):
+        fig.to_svg(themes = True, dark_when = 'body{}')
+
+
 def test_another_palette_takes_the_shades_a_caller_took_from_this_one():
     def draw(name):
         fig, ax = vc.subplots(figsize = (4, 3), palette = name)
