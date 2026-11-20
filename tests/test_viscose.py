@@ -412,6 +412,14 @@ def test_a_canvas_answers_the_mouse_and_its_toolbar_keeps_views(qt):
     assert axes.get_xlim() == home
     bar.pan.setChecked(True)
     assert bar.mode == 'pan' and not bar.zoom.isChecked()
+    # The arrows take the palette's button text color, also after a switch to a dark theme (the style's are black)
+    from PySide6.QtGui import QPalette, QColor
+    palette = bar.palette()
+    palette.setColor(QPalette.ButtonText, QColor('#ebdff8'))
+    bar.setPalette(palette)
+    image = bar.arrows[0][1].icon().pixmap(16, 16).toImage()
+    inked = [image.pixelColor(x, y) for x in range(image.width()) for y in range(image.height()) if image.pixelColor(x, y).alpha() > 200]
+    assert inked and all(c.lightnessF() > 0.85 for c in inked)
     # A chart view's new figures keep its palette
     assert view.figure.pal.name == 'poster' and view.new_figure().pal.name == 'poster'
     assert view.canvas.figure is view.figure

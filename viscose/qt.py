@@ -5,9 +5,9 @@ from typing import NamedTuple
 import numpy as np
 from glycorender import pdfwrite
 try:
-    from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer, Signal
-    from PySide6.QtGui import (QAction, QBrush, QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
-                               QRadialGradient, QTransform)
+    from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, QTimer, Signal
+    from PySide6.QtGui import (QAction, QBrush, QColor, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QPalette,
+                               QPen, QRadialGradient, QTransform)
     from PySide6.QtWidgets import QStyle, QToolBar, QVBoxLayout, QWidget
 except ImportError as error:
     raise ImportError('viscose.qt needs PySide6, which comes with: pip install "viscose[qt]"') from error
@@ -321,19 +321,39 @@ class Toolbar(QToolBar):
         self.canvas, self.mode, self.views, self.position = canvas, '', [], -1
         canvas.toolbar = self
         self.setIconSize(QSize(16, 16))
-        style = self.style()
         self.addAction('Home', self.home).setToolTip('Show the whole plot')
+        self.arrows = []
         for icon, label, tip, action in ((QStyle.SP_ArrowBack, 'Back', 'The view before this one',
                                           lambda: self.move_by(-1)),
                                          (QStyle.SP_ArrowForward, 'Forward', 'The view after this one',
                                           lambda: self.move_by(1))):
-            self.addAction(style.standardIcon(icon), label, action).setToolTip(tip)
+            self.arrows.append((icon, self.addAction(label, action)))
+            self.arrows[-1][1].setToolTip(tip)
+        self.tint()
         self.pan = QAction('Pan', self, checkable = True, toolTip = 'Drag to move the plot')
         self.zoom = QAction('Zoom', self, checkable = True, toolTip = 'Drag a rectangle to zoom into it')
         self.pan.toggled.connect(lambda on: self.set_mode('pan', on))
         self.zoom.toggled.connect(lambda on: self.set_mode('zoom', on))
         self.addAction(self.pan)
         self.addAction(self.zoom)
+
+    def tint(self):
+        """The arrows in the palette's button text color, as the style's own are black whatever the palette, which
+        vanishes in a dark theme."""
+        color = self.palette().color(QPalette.ButtonText)
+        for icon, action in self.arrows:
+            pixmap = self.style().standardIcon(icon).pixmap(self.iconSize(), self.devicePixelRatioF())
+            painter = QPainter(pixmap)
+            painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+            painter.fillRect(pixmap.rect(), color)
+            painter.end()
+            action.setIcon(QIcon(pixmap))
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # A theme switched while the window is open
+        if event.type() in (QEvent.PaletteChange, QEvent.ApplicationPaletteChange, QEvent.StyleChange):
+            self.tint()
 
     def set_mode(self, mode, on):
         if on:
