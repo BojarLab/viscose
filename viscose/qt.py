@@ -6,8 +6,8 @@ import numpy as np
 from glycorender import pdfwrite
 try:
     from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, QTimer, Signal
-    from PySide6.QtGui import (QAction, QBrush, QColor, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QPalette,
-                               QPen, QRadialGradient, QTransform)
+    from PySide6.QtGui import (QAction, QBrush, QColor, QIcon, QImage, QLinearGradient, QPainter, QPainterPath,
+                               QPalette, QPen, QRadialGradient, QTransform)
     from PySide6.QtWidgets import QStyle, QToolBar, QVBoxLayout, QWidget
 except ImportError as error:
     raise ImportError('viscose.qt needs PySide6, which comes with: pip install "viscose[qt]"') from error
@@ -349,11 +349,14 @@ class Toolbar(QToolBar):
             painter.end()
             action.setIcon(QIcon(pixmap))
 
-    def changeEvent(self, event):
-        super().changeEvent(event)
-        # A theme switched while the window is open
-        if event.type() in (QEvent.PaletteChange, QEvent.ApplicationPaletteChange, QEvent.StyleChange):
+    def event(self, event):
+        done = super().event(event)
+        # A theme switched while the window is open, or the window moved to a screen of another pixel ratio, which
+        # reaches event but not changeEvent
+        if event.type() in (QEvent.PaletteChange, QEvent.ApplicationPaletteChange, QEvent.StyleChange,
+                            QEvent.DevicePixelRatioChange):
             self.tint()
+        return done
 
     def set_mode(self, mode, on):
         if on:

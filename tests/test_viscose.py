@@ -418,8 +418,16 @@ def test_a_canvas_answers_the_mouse_and_its_toolbar_keeps_views(qt):
     palette.setColor(QPalette.ButtonText, QColor('#ebdff8'))
     bar.setPalette(palette)
     image = bar.arrows[0][1].icon().pixmap(16, 16).toImage()
-    inked = [image.pixelColor(x, y) for x in range(image.width()) for y in range(image.height()) if image.pixelColor(x, y).alpha() > 200]
+    inked = [image.pixelColor(x, y) for x in range(image.width()) for y in range(image.height())
+             if image.pixelColor(x, y).alpha() > 200]
     assert inked and all(c.lightnessF() > 0.85 for c in inked)
+    # and are drawn again on a screen of another pixel ratio
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication
+    tinted, bar.tint = [], lambda: tinted.append(1)
+    QApplication.sendEvent(bar, QEvent(QEvent.DevicePixelRatioChange))
+    assert tinted
+    del bar.tint
     # A chart view's new figures keep its palette
     assert view.figure.pal.name == 'poster' and view.new_figure().pal.name == 'poster'
     assert view.canvas.figure is view.figure
