@@ -752,6 +752,21 @@ class Figure:
         self.axes.append(ax)
         return ax
 
+    def add_subplot(self, nrows = 1, ncols = 1, index = 1):
+        """Axes in cell `index` (from 1, row by row) of an nrows x ncols grid of the page, as in matplotlib, laid out
+        as `subplots` lays out its axes: its tick labels, names, title, and legend take exactly the room they need
+        and the plot keeps the rest. Every call on one figure names the same grid."""
+        if self._grid is not None and tuple(self._grid[:2]) != (nrows, ncols):
+            raise ValueError(f'This figure is a {self._grid[0]} x {self._grid[1]} grid, not {nrows} x {ncols}')
+        if not 1 <= index <= nrows * ncols:
+            raise ValueError(f'A {nrows} x {ncols} grid has cells 1 to {nrows * ncols}, got {index}')
+        if self._grid is None:
+            self._grid = (nrows, ncols, [1] * ncols, [1] * nrows)
+        ax = Axes(self, self.pal)
+        ax._cell = divmod(index - 1, ncols)
+        self.axes.append(ax)
+        return ax
+
     def text(self, x, y, s, size = None, color = 'ink', bold = None, ha = 'left', va = 'baseline', rotation = 0.0,
              unit = 'fraction', linespacing = 1.25):
         """Text on the page, outside any axes: at (x, y) in figure fractions from the lower left, or with unit = 'mm'

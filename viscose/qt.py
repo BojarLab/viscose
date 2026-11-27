@@ -409,7 +409,10 @@ class ChartView(QWidget):
         return self.canvas.figure
 
     def new_figure(self):
+        # Held to the widget's size, as a resize holds it: labels that would widen the page squeeze the plot instead,
+        # since a window has no room beyond its edge
         figure = Figure(self.figure.width / 72, self.figure.height / 72, self.palette)
+        figure.set_size(figure.width / 72, figure.height / 72)
         self.canvas.figure, self.canvas.span, self.canvas.rings = figure, None, []
         self.canvas.draw_idle()
         return figure

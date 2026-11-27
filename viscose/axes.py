@@ -1,5 +1,4 @@
 """Axes: records what to draw, then lays it out and draws it once the figure is rendered."""
-import dataclasses
 import functools
 import math
 import numbers
@@ -19,6 +18,8 @@ ARROW_GRIP = 9.0
 LEGEND_ROW = 16.0
 COLORBAR_WIDTH = 11.0
 LEGEND_SPOTS = ('direct', 'below', 'right', 'upper left', 'upper right', 'lower left', 'lower right')
+# A legend on the right takes at most this share of its cell's width, else it goes below the plot
+LEGEND_RIGHT_SHARE = 0.4
 # A group of points is named at its middle only where this share of its points lies nearer its own middle than any other
 # group's, as the middle of groups that mingle names no place of theirs
 DIRECT_OWN = 0.7
@@ -131,6 +132,23 @@ def _gap(positions):
 def _extra_lines(s):
     """How many lines a text has past its first."""
     return str(s).count('\n')
+
+
+def _wrap_words(s, size, bold, room):
+    """The text with each of its lines broken at spaces so that none runs wider than `room` points where its words
+    allow; a word wider than the room stays whole on its own line."""
+    out = []
+    for line in str(s).split('\n'):
+        current = ''
+        for word in line.split(' '):
+            trial = f'{current} {word}' if current else word
+            if current and text.width(trial, size, bold) > room:
+                out.append(current)
+                current = word
+            else:
+                current = trial
+        out.append(current)
+    return '\n'.join(out)
 
 
 def _check_cmap(cmap):
@@ -2326,6 +2344,8 @@ class Axes:
             bottom += size * (1.7 + lines) if gap is None else gap + size * (1.15 + lines)
             bottom += 0.0 if len(self.xticks) else off
         left += self._ridge_width()
+        # Text placed at an axes fraction above the plot, such as a note over it, takes its room as a title does
+        top += self._notes_above()
         if self.title_text:
             pad = 8.0 * k if self._title_pad is None else self._title_pad
             top += 13.0 * k + pad + 1.25 * self._title_size() * _extra_lines(self.title_text)
@@ -2340,6 +2360,20 @@ class Axes:
         if self._cbar and self._cbar['loc'] == 'right':
             right += self._colorbar_width()
         return left, right, bottom, top
+
+    def _notes_above(self):
+        """How far text placed at an axes fraction above the plot area (y above 1) reaches above it, in points; the
+        title goes over it. Before the axes are placed, the plot's height is taken as most of the page's."""
+        pal, room = self.pal, 0.0
+        h = self.rect[3] if self.rect[3] > 1.0 else 0.7 * self.figure.height
+        for a in self.artists:
+            if a['kind'] != 'text' or not a['frac'] or a['rotation'] or not a['y'] > 1.0 or a['va'] == 'top':
+                continue
+            size = a['size'] or pal.tick_size
+            lines = str(a['s']).count('\n') + 1
+            tall = (lines - 1) * a['linespacing'] * size + 1.2 * size
+            room = max(room, (a['y'] - 1.0) * h + (tall / 2 if a['va'] == 'center' else tall))
+        return room
 
     def _legend_entries(self, items = None):
         """Each item's text size, tracking, shown text, width, glyph or None, and how much taller than a row it is, in
@@ -2439,6 +2473,12 @@ class Axes:
                 changed = True
         if self._legend_keep and self._legend_loc:
             size = self._legend_grid()[1]
+            # A legend on the right that would take more than two fifths of its cell's width goes below the plot, where
+            # it wraps to the plot's width, rather than squeezing the plot to a sliver or running off the page
+            if (self._legend_loc == 'right' and self._fixed is None and
+                    size[0] + 18.0 * pal.spacing > LEGEND_RIGHT_SHARE * self._room[2]):
+                self._legend_loc, self._legend_size = 'below', None
+                size = self._legend_grid()[1]
             if self._legend_size is None or max(abs(u - v) for u, v in zip(size, self._legend_size)) > 0.5:
                 self._legend_size = size
                 changed = True
@@ -2449,6 +2489,18 @@ class Axes:
             self._direct_room = room
             changed = True
         page = self.figure.width
+        # A note at an axes fraction above the plot wraps at its words to the page's width, from its text as given
+        for a in self.artists:
+            if a['kind'] != 'text' or not a['frac'] or a['rotation'] or not a['y'] > 1.0:
+                continue
+            raw = a.setdefault('raw', a['s'])
+            px = self.rect[0] + a['x'] * self.rect[2]
+            room = {'left': page - 3.0 - px, 'right': px - 3.0}.get(a['ha'], 2.0 * min(px, page - px) - 6.0)
+            wrapped = _wrap_words(raw, a['size'] or pal.tick_size, pal.text_bold if a['bold'] is None else a['bold'],
+                                  room)
+            if wrapped != a['s']:
+                a['s'] = wrapped
+                changed = True
         over = [0.0, 0.0]
         # What the right side lacks for all but glycan labels, whose drawings replace them, for Figure._width_unlabeled
         self._over_plain = -math.inf
@@ -3535,7 +3587,7 @@ class Axes:
             lift = rise - y0 - h + self._xtick_height() if above and self.xlabels and len(self.xticks) else 0.0
             pad = 8.0 * pal.spacing if self._title_pad is None else self._title_pad
             n = len(c.ops)
-            text.draw(c, x0, y0 + h + lift + pad + 1.25 * title_size * _extra_lines(self.title_text),
+            text.draw(c, x0, y0 + h + lift + self._notes_above() + pad + 1.25 * title_size * _extra_lines(self.title_text),
                       self.title_text, title_size, pal.color(pal.title_color or pal.ink), pal.title_bold, ha = 'left')
             marks.tag(c, n, name = 'title')
         for a in self.artists:

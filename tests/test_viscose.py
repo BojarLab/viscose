@@ -2348,6 +2348,39 @@ def test_a_page_held_to_a_window_never_grows():
     assert (fig.width, fig.height) == (3 * 72.0, 2 * 72.0)
 
 
+def test_add_subplot_lays_out_a_window_page_so_nothing_leaves_it():
+    """Axes from add_subplot get the room their legend and notes take, as subplots' do: a legend on the right stays on
+    a page held to a window, moves below the plot where it would take most of the width, and a note above the plot sits
+    under the title and wraps to the page"""
+    classes = ['Oligomannose', 'Hybrid', 'Complex, fucosylated', 'Complex, sialylated and fucosylated']
+    def page(width, height):
+        fig = vc.Figure(width, height, 'lumen').set_size(width, height)
+        ax = fig.add_subplot()
+        ax.stacked_bar([10.0, 40.0, 80.0], np.ones((3, 4)), labels = classes)
+        ax.set_title('A protein')
+        ax.text(0.0, 1.02, 'A note over the plot that says how to read it, long enough to need two lines on a '
+                'narrow page', axes_fraction = True, va = 'bottom', size = 7.5)
+        ax.legend('right')
+        fig.layout()
+        return fig, ax
+    fig, ax = page(9, 3)
+    x, y, w, h = ax.rect
+    legend_w, legend_h = ax._legend_size
+    assert ax._legend_loc == 'right' and x + w + legend_w <= fig.width and w > 0.5 * fig.width
+    note = next(a for a in ax.artists if a['kind'] == 'text' and a['frac'])
+    assert '\n' not in note['s'] and y + h + ax._notes_above() < fig.height
+    fig, ax = page(4, 3)
+    assert ax._legend_loc == 'below' and ax.rect[2] > 0.6 * fig.width and ax._legend_size[0] <= ax.rect[2] + 1.0
+    note = next(a for a in ax.artists if a['kind'] == 'text' and a['frac'])
+    assert '\n' in note['s'] and note['s'].replace('\n', ' ') == note['raw']
+    assert max(width(line, 7.5) for line in note['s'].split('\n')) <= fig.width - ax.rect[0]
+    assert ax.rect[1] + ax.rect[3] + ax._notes_above() < fig.height
+    with pytest.raises(ValueError):
+        fig.add_subplot(2, 1, 1)
+    # A file of the same drawing copies it in another palette as laid out
+    assert fig.in_palette('couture').axes[0]._cell == (0, 0)
+
+
 def _paper_page(palette):
     """A journal page with every piece of the paper layer."""
     fig = vc.Figure(183, 90, palette = palette, unit = 'mm')
