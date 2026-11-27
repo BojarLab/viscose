@@ -25,6 +25,9 @@ LEGEND_RIGHT_SHARE = 0.4
 DIRECT_OWN = 0.7
 # Axis names shrink to fit their cell down to this size, and past it the page grows
 LABEL_MIN = 6.5
+# Tick labels of words on a page that cannot grow shrink down to this size, about the smallest type a journal prints,
+# before they stand turned past their room
+TICK_MIN = 5.0
 # Margins may take this share of an axes' cell before the figure grows
 PLOT_SHARE_MARGINS = 0.55
 # Brackets may stretch the y axis by up to this factor, which leaves the data at least this share of the height
@@ -134,7 +137,7 @@ def _extra_lines(s):
     return str(s).count('\n')
 
 
-def _wrap_words(s, size, bold, room):
+def _wrap_words(s, size, bold, room, tracking = 0.0):
     """The text with each of its lines broken at spaces so that none runs wider than `room` points where its words
     allow; a word wider than the room stays whole on its own line."""
     out = []
@@ -142,7 +145,7 @@ def _wrap_words(s, size, bold, room):
         current = ''
         for word in line.split(' '):
             trial = f'{current} {word}' if current else word
-            if current and text.width(trial, size, bold) > room:
+            if current and text.width(trial, size, bold, tracking) > room:
                 out.append(current)
                 current = word
             else:
@@ -436,6 +439,8 @@ class Axes:
         self.figure, self.pal = figure, pal
         self.artists, self.legend_items, self._legend_opts = [], [], None
         self._legend_size = None
+        # The plot's height that notes above the plot took their room from, None until a layout has placed the axes
+        self._note_h = None
         # The artists each legend entry names, by its index, for naming them directly; where the legend's entries go
         # once that is settled, those it still shows, and how far labels at line ends reach past the plot
         self._sources, self._legend_fallback = {}, 'below'
@@ -454,7 +459,7 @@ class Axes:
         self._tick_opts, self._spine_set = {'x': {}, 'y': {}}, {}
         self._xrot, self._yright = 0.0, False
         # How far glyph labels of each axis shrank to fit between their ticks, and what a legend's entries draw as
-        self._gscale, self._legend_glyphs = {'x': 1.0, 'y': 1.0}, None
+        self._gscale, self._legend_glyphs, self._tick_shrink = {'x': 1.0, 'y': 1.0}, None, 1.0
         # Glyph labels of y in one column, or staggered in two where neighbors would crowd
         self._glyph_spots, self._gcols, self._full = (None, {}), 1, {'x': ([], []), 'y': ([], [])}
         # The last placement of spread glyphs made in full: their notes, their points on the page, and their spots,
@@ -1717,16 +1722,17 @@ class Axes:
 
     def _limits(self):
         self._over = [0.0, 0.0]
-        self._legend_size = None
+        self._legend_size, self._note_h = None, None
         if self._cbar and self._cbar['source']._scale is None:
             raise ValueError('A colorbar shows the color scale of a heatmap or of scatter(c = ...), and these axes '
                              'have neither')
         # What fitting the labels turned or moved last time starts over, as limits or a size may have changed
         self.xrot = self._xrot
-        self._gscale, self._gcols = {'x': 1.0, 'y': 1.0}, 1
+        self._gscale, self._gcols, self._tick_shrink = {'x': 1.0, 'y': 1.0}, 1, 1.0
         for a in self.artists:
             if a['kind'] == 'text':
                 a['_ha'], a['_dx'] = a['ha'], a['dx']
+                a['s'] = a.get('raw', a['s'])
         self._range()
         self._ticks('x')
         self._ticks('y')
@@ -1884,7 +1890,8 @@ class Axes:
             sizes = 8.2 * self.pal.spacing, 8.0 * self.pal.spacing
         else:
             sizes = self.pal.tick_size, self.pal.tick_size
-        return tuple(self._tick_opts[axis].get('labelsize', v) for axis, v in zip('xy', sizes))
+        sizes = tuple(self._tick_opts[axis].get('labelsize', v) for axis, v in zip('xy', sizes))
+        return sizes[0] * self._tick_shrink, sizes[1]
 
     def _spines(self):
         """The axis lines drawn, by the palette's choice unless set_spines changed it."""
@@ -2363,9 +2370,10 @@ class Axes:
 
     def _notes_above(self):
         """How far text placed at an axes fraction above the plot area (y above 1) reaches above it, in points; the
-        title goes over it. Before the axes are placed, the plot's height is taken as most of the page's."""
+        title goes over it. The plot's height is the one the last pass placed (`_note_h`), and before the axes are
+        placed most of the page's, so that every layout starts from the same guess."""
         pal, room = self.pal, 0.0
-        h = self.rect[3] if self.rect[3] > 1.0 else 0.7 * self.figure.height
+        h = 0.7 * self.figure.height if self._note_h is None else self._note_h
         for a in self.artists:
             if a['kind'] != 'text' or not a['frac'] or a['rotation'] or not a['y'] > 1.0 or a['va'] == 'top':
                 continue
@@ -2375,9 +2383,10 @@ class Axes:
             room = max(room, (a['y'] - 1.0) * h + (tall / 2 if a['va'] == 'center' else tall))
         return room
 
-    def _legend_entries(self, items = None):
+    def _legend_entries(self, items = None, room = None):
         """Each item's text size, tracking, shown text, width, glyph or None, and how much taller than a row it is, in
-        legend order: of the items the legend shows, or of `items`."""
+        legend order: of the items the legend shows, or of `items`. A text wider than `room` points, where one is given,
+        wraps at its words."""
         pal = self.pal
         size = 7.4 * pal.spacing if pal.caps else pal.tick_size - 0.5 * pal.spacing
         track = 0.7 if pal.caps else 0.0
@@ -2388,8 +2397,11 @@ class Axes:
             header = kind == 'header'
             g = None if header or not self._legend_glyphs else text.glyph(self._legend_glyphs, s)
             if g is None:
-                out.append((shown, rgb, kind, marker, area, text.width(shown, size, pal.text_bold or header, track)
-                            + (0.0 if header else 18.0 * pal.spacing), None, 0.0))
+                bold, swatch = pal.text_bold or header, 0.0 if header else 18.0 * pal.spacing
+                if room is not None and text.width(shown, size, bold, track) + swatch > room:
+                    shown = _wrap_words(shown, size, bold, room - swatch, track)
+                out.append((shown, rgb, kind, marker, area, text.width(shown, size, bold, track) + swatch, None,
+                            1.25 * size * shown.count('\n')))
                 continue
             left, bottom, right, top = g.extent(size * text.GLYPH_SYMBOL, self._legend_cut() is not None or self._cut)
             out.append((shown, rgb, kind, marker, area, right - left + 18.0 * pal.spacing, g,
@@ -2403,6 +2415,11 @@ class Axes:
             return 1.0, 1.0, 1.0
         return None if self._legend_loc in ('right', 'below') else self.pal.color('paper')
 
+    def _legend_room(self):
+        """How wide a legend's entry may be below the plot, its axes' cell less the page's margin, once the axes are
+        placed; None elsewhere, where entries keep one line."""
+        return self._room[2] - 6.0 * self.pal.spacing if self._legend_loc == 'below' and self._room[2] > 1.0 else None
+
     def _legend_natural(self):
         """Legend size before the axes are placed: one row or one column."""
         _, _, entries = self._legend_entries()
@@ -2414,10 +2431,13 @@ class Axes:
         """Offsets of the legend's items from its top left to the middle of their rows, less half a row, wrapped to the
         axes, and the legend's total size."""
         _, _, w, h = self.rect
-        _, _, entries = self._legend_entries()
-        widths, k, extra = [e[5] for e in entries], self.pal.spacing, [e[7] for e in entries]
+        k = self.pal.spacing
+        _, _, entries = self._legend_entries(room = self._legend_room())
+        widths, extra = [e[5] for e in entries], [e[7] for e in entries]
         row = LEGEND_ROW * k
         if self._legend_loc == 'below':
+            # An entry wider than the plot takes the width of the axes' cell, within which the legend then stays
+            w = max(w, min(max(widths, default = 0.0), self._room[2] - 6.0 * k))
             spots, lines, x, y = [], [0.0], 0.0, 0.0
             for v, more in zip(widths, extra):
                 if x and x + v > w:
@@ -2460,6 +2480,28 @@ class Axes:
             if not self.xrot and widest + 6.0 * pal.spacing > gap:
                 self.xrot = 90.0
                 changed = True
+            # On a page that cannot grow, labels of words that would run past their room turned lie flat instead, in
+            # lines broken at their words, at a smaller size down to TICK_MIN where a word is wider than its place
+            if self.xrot == 90.0 and not self._xrot and self._xtick_height() > self._glyph_room('x'):
+                room = gap - 6.0 * pal.spacing
+                word = max(text.width(w, sx, pal.tick_bold) for s in self.xlabels for w in str(s).split())
+                size = sx if word <= room else max(min(TICK_MIN, sx), sx * room / word)
+                wrapped = [_wrap_words(s, size, pal.tick_bold, room) for s in self.xlabels]
+                # A size scaled to the widest word gives back the room within rounding
+                if max(text.width(s, size, pal.tick_bold) for s in wrapped) <= room + 1e-9:
+                    self.xlabels, self.xrot, self._tick_shrink = wrapped, 0.0, size / sx * self._tick_shrink
+                    changed = True
+                else:
+                    # Else they stay turned, broken at their words to the room the page leaves them, at the largest
+                    # size down to TICK_MIN at which their lines stand side by side between the ticks
+                    reach = self._glyph_room('x')
+                    for size in np.linspace(sx, min(TICK_MIN, sx), 9):
+                        wrapped = [_wrap_words(s, size, pal.tick_bold, reach - 0.4 * size) for s in self.xlabels]
+                        if (max(text.width(s, size, pal.tick_bold) for s in wrapped) <= reach - 0.4 * size and
+                                1.25 * size * max(_extra_lines(s) + 1 for s in wrapped) <= room):
+                            self.xlabels, self._tick_shrink = wrapped, size / sx * self._tick_shrink
+                            changed = True
+                            break
             if self.xrot and gap < sx * 1.05 and not self.show_all[0]:
                 k = int(math.ceil(sx * 1.05 / gap))
                 self.xticks, self.xlabels = self.xticks[::k], self.xlabels[::k]
@@ -2485,6 +2527,14 @@ class Axes:
         # Labels at line ends take the room they reach past the plot's right
         room = max([float(self._tx(a['x'])) + a['dx'] + self._note_size(a)[0] - self.rect[0] - self.rect[2]
                     for a in self.artists if a.get('direct') == 'end'] + [0.0])
+        # Where they would take more of the cell's width than a legend on the right may, as on a narrow window, the
+        # legend names their series instead
+        if room > LEGEND_RIGHT_SHARE * self._room[2] and self._fixed is None:
+            self.artists = [a for a in self.artists if not a.get('direct')]
+            self._legend_keep, self._legend_size = list(range(len(self.legend_items))), None
+            self._legend_loc = self._legend_fallback
+            room = 0.0
+            changed = True
         if abs(room - self._direct_room) > 0.5:
             self._direct_room = room
             changed = True
@@ -2501,6 +2551,11 @@ class Axes:
             if wrapped != a['s']:
                 a['s'] = wrapped
                 changed = True
+        # Notes above the plot take their room from its height, which their room changes, so the layout goes on until
+        # the height they were measured on holds
+        if self._notes_above() and (self._note_h is None or abs(self.rect[3] - self._note_h) > 0.05):
+            self._note_h = self.rect[3]
+            changed = True
         over = [0.0, 0.0]
         # What the right side lacks for all but glycan labels, whose drawings replace them, for Figure._width_unlabeled
         self._over_plain = -math.inf
@@ -3503,16 +3558,18 @@ class Axes:
                 rgb, bold = ((pal.color(self._xemph[s]), True) if s in self._xemph else
                              (ink if heat and self.xrot else tick_rgb, pal.tick_bold))
                 figures = self._numbers['x']
+                # The lines of a turned label stand side by side, centered on its tick
+                across = 0.625 * small * _extra_lines(s) * math.sin(math.radians(self.xrot))
                 if self.xrot and above:
                     # The label starts at its tick and runs up and away from the axes
-                    text.draw(c, x - small * 0.36 * math.sin(math.radians(self.xrot)), rise, s, small, rgb, bold,
-                              ha = 'left' if self.xrot > 0 else 'right', rotation = self.xrot, va = 'baseline',
+                    text.draw(c, x - small * 0.36 * math.sin(math.radians(self.xrot)) - across, rise, s, small, rgb,
+                              bold, ha = 'left' if self.xrot > 0 else 'right', rotation = self.xrot, va = 'baseline',
                               tabular = figures)
                 elif self.xrot:
                     # The label's end sits at its tick, and it hangs below the axis either way
-                    text.draw(c, x + small * 0.36 * math.sin(math.radians(self.xrot)), y0 - pad, s, small, rgb, bold,
-                              ha = 'right' if self.xrot > 0 else 'left', rotation = self.xrot, va = 'baseline',
-                              tabular = figures)
+                    text.draw(c, x + small * 0.36 * math.sin(math.radians(self.xrot)) - across, y0 - pad, s, small,
+                              rgb, bold, ha = 'right' if self.xrot > 0 else 'left', rotation = self.xrot,
+                              va = 'baseline', tabular = figures)
                 else:
                     text.draw(c, x, rise if above else y0 - pad, s, small, rgb, bold, ha = 'center',
                               va = 'bottom' if above else 'top', tabular = figures)
@@ -3587,8 +3644,9 @@ class Axes:
             lift = rise - y0 - h + self._xtick_height() if above and self.xlabels and len(self.xticks) else 0.0
             pad = 8.0 * pal.spacing if self._title_pad is None else self._title_pad
             n = len(c.ops)
-            text.draw(c, x0, y0 + h + lift + self._notes_above() + pad + 1.25 * title_size * _extra_lines(self.title_text),
-                      self.title_text, title_size, pal.color(pal.title_color or pal.ink), pal.title_bold, ha = 'left')
+            title_y = y0 + h + lift + self._notes_above() + pad + 1.25 * title_size * _extra_lines(self.title_text)
+            text.draw(c, x0, title_y, self.title_text, title_size, pal.color(pal.title_color or pal.ink),
+                      pal.title_bold, ha = 'left')
             marks.tag(c, n, name = 'title')
         for a in self.artists:
             if a['kind'] == 'ridges' and a['labels'] is not None:
@@ -3777,7 +3835,7 @@ class Axes:
             return
         u, row = pal.spacing, LEGEND_ROW * pal.spacing
         x0, y0, w, h = self.rect
-        size, track, entries = self._legend_entries()
+        size, track, entries = self._legend_entries(room = self._legend_room())
         spots, (tw, th) = self._legend_grid()
         loc = self._legend_loc
         # Swatches in focus step up with their marks
@@ -3785,7 +3843,8 @@ class Axes:
         if loc == 'right':
             left, top = x0 + w + right + 16.0 * u, y0 + h - 8.0 * u
         elif loc == 'below':
-            left = x0 if tw >= w else x0 + (w - tw) / 2
+            rx, _, rw, _ = self._room
+            left = max(rx + 3.0 * u, min(x0 if tw >= w else x0 + (w - tw) / 2, rx + rw - 3.0 * u - tw))
             top = (y0 - 40.0 * u if self._legend_y is None else self._legend_y) + (th - row)
         else:
             left = x0 + w - tw - 8.0 * u if 'right' in loc else x0 + 10.0 * u

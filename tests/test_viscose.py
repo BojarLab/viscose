@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import viscose as vc
 from viscose import marks
-from viscose.axes import fmt, nice_ticks, tick_labels
+from viscose.axes import TICK_MIN, fmt, nice_ticks, tick_labels
 from viscose.figure import SHADOW_DPI
 from viscose.palettes import _oklch, get_palette, ramp
 from viscose.text import runs, width
@@ -2379,6 +2379,57 @@ def test_add_subplot_lays_out_a_window_page_so_nothing_leaves_it():
         fig.add_subplot(2, 1, 1)
     # A file of the same drawing copies it in another palette as laid out
     assert fig.in_palette('couture').axes[0]._cell == (0, 0)
+    # Every layout starts from the same guess for the note's room, so a page saves the same twice and from its twin
+    def free():
+        fig = vc.Figure(4, 3, 'lumen')
+        ax = fig.add_subplot()
+        ax.plot([1, 2, 3], [1, 3, 2])
+        ax.set_title('A protein')
+        ax.text(0.0, 1.05, 'A note over the plot that says how to read it, long enough to need two lines',
+                axes_fraction = True)
+        return fig
+    fig = free()
+    first = fig.to_pdf()
+    assert fig.to_pdf() == first and free().in_palette('lumen').to_pdf() == first
+
+
+def test_a_narrow_window_keeps_its_labels_and_legend_on_the_page():
+    """On a page held to a narrow window, labels at line ends that would squeeze the plot give way to the legend, a
+    legend entry wider than its cell wraps at its words inside it, and category names lie flat in lines at a smaller
+    size where turned they would push the plot off the page"""
+    classes = ['Oligomannose', 'Hybrid', 'Complex, fucosylated', 'Complex, sialylated and fucosylated']
+    def lines(width, height):
+        fig = vc.Figure(width, height, 'aura').set_size(width, height)
+        ax = fig.add_subplot()
+        for i, n in enumerate(classes):
+            ax.plot(np.arange(5), np.arange(5) * (i + 1), label = n)
+        ax.legend()
+        fig.layout()
+        return fig, ax
+    fig, ax = lines(2.5, 4)
+    entries = ax._legend_entries(room = ax._legend_room())[2]
+    assert ax._legend_loc == 'below' and not any(a.get('direct') for a in ax.artists)
+    assert ax.rect[2] > 0.4 * fig.width and ax._legend_size[0] <= ax._room[2] - 6.0
+    assert any('\n' in e[0] for e in entries)
+    assert sum(bool(a.get('direct')) for a in lines(9, 4)[1].artists) == len(classes)
+    first = fig.to_pdf()
+    assert fig.to_pdf() == first and lines(2.5, 4)[0].to_pdf() == first
+    for palette in ('aura', 'couture', 'poster'):
+        fig = vc.Figure(4, 3, palette).set_size(4, 3)
+        ax = fig.add_subplot()
+        ax.bar(classes, [1, 2, 3, 4])
+        ax.set_title('A protein')
+        fig.layout()
+        assert ax.xrot == 0.0 and '\n' in ax.xlabels[3] and ax.rect[3] > 0.3 * fig.height
+        assert TICK_MIN <= ax._tick_sizes()[0] <= fig.pal.tick_size
+        # Where even flat lines cannot fit their words between the ticks, the labels stay turned, in lines
+        fig = vc.Figure(3.2, 3.0, palette).set_size(3.2, 3.0)
+        ax = fig.add_subplot()
+        ax.bar(classes + ['Complex, neither'], [1, 2, 3, 4, 5])
+        ax.set_title('A protein')
+        fig.layout()
+        assert ax.xrot == 90.0 and '\n' in ax.xlabels[3] and ax.rect[3] > 0.25 * fig.height
+        assert ax._xtick_height() <= ax._glyph_room('x') + 1e-9
 
 
 def _paper_page(palette):
